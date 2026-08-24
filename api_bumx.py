@@ -345,7 +345,7 @@ def profile_run_lock(profile_id):
         except OSError:
             if fd is not None:
                 os.close(fd)
-            raise ProfileInUseError(f"Profile Bumx {profile_id} đang được sử dụng ở phiên khác.")
+            raise ProfileInUseError(f"Profile TTC {profile_id} đang được sử dụng ở phiên khác.")
     try:
         yield
     finally:
@@ -459,7 +459,7 @@ def normalize_run_config(data=None):
 def _new_profile(name, auth_token="", fb_accounts=None):
     return {
         "profile_id": uuid.uuid4().hex,
-        "name": str(name).strip() or "Bumx",
+        "name": str(name).strip() or "TTC",
         "auth_token": str(auth_token or "").strip(),
         "fb_accounts": [_normalize_account(item) for item in (fb_accounts or [])],
         "run_config": normalize_run_config(),
@@ -474,19 +474,19 @@ def _validate_database(data):
     if not isinstance(data, dict) or data.get("version") != DATA_VERSION:
         raise ValueError("File dữ liệu Termux không đúng version")
     if not isinstance(data.get("profiles"), list):
-        raise ValueError("Danh sách Bumx profile không hợp lệ")
+        raise ValueError("Danh sách TTC profile không hợp lệ")
     normalized_profiles = []
     ids = set()
     for raw in data["profiles"]:
         if not isinstance(raw, dict):
-            raise ValueError("Bumx profile không hợp lệ")
+            raise ValueError("TTC profile không hợp lệ")
         profile_id = str(raw.get("profile_id", "")).strip()
         if not profile_id or profile_id in ids:
             raise ValueError("profile_id không hợp lệ hoặc bị trùng")
         ids.add(profile_id)
         name = str(raw.get("name", "")).strip()
         if not name:
-            raise ValueError("Tên Bumx profile không được trống")
+            raise ValueError("Tên TTC profile không được trống")
         normalized_profiles.append({
             "profile_id": profile_id,
             "name": name,
@@ -528,7 +528,7 @@ def _load_database_unlocked():
         legacy = _read_legacy_config()
         if legacy is not None:
             auth, accounts = legacy
-            profile = _new_profile("Bumx mặc định", auth, accounts)
+            profile = _new_profile("TTC mặc định", auth, accounts)
             data["profiles"].append(profile)
             data["active_profile_id"] = profile["profile_id"]
     return data
@@ -567,7 +567,7 @@ def save_profile(profile):
             if existing.get("profile_id") == profile_id:
                 data["profiles"][index] = profile
                 return profile
-        raise KeyError("Không tìm thấy Bumx profile")
+        raise KeyError("Không tìm thấy TTC profile")
     return mutate_database(_mutator)
 
 
@@ -581,7 +581,7 @@ def update_profile_auth_token(profile_id, token):
     try:
         return mutate_database(_mutator)
     except Exception as exc:
-        print_error(f"Token Bumx đã refresh trong phiên hiện tại nhưng không thể lưu dữ liệu do xung đột/IO: {exc}")
+        print_error(f"Token TTC đã refresh trong phiên hiện tại nhưng không thể lưu dữ liệu do xung đột/IO: {exc}")
         return False
 
 
@@ -593,7 +593,7 @@ def rename_profile(profile_id, new_name):
     def _mutator(data):
         profile = get_profile(data, profile_id)
         if profile is None:
-            raise KeyError("Không tìm thấy Bumx profile")
+            raise KeyError("Không tìm thấy TTC profile")
         profile["name"] = new_name
         return profile["name"]
 
@@ -607,7 +607,7 @@ def update_profile_auth_token_manual(profile_id, token):
     def _mutator(data):
         profile = get_profile(data, profile_id)
         if profile is None:
-            raise KeyError("Không tìm thấy Bumx profile")
+            raise KeyError("Không tìm thấy TTC profile")
         profile["auth_token"] = token
         return True
 
@@ -625,7 +625,7 @@ def delete_profile(profile_id):
                         data["profiles"][0]["profile_id"] if data["profiles"] else None
                     )
                 return deleted, data.get("active_profile_id")
-        raise KeyError("Không tìm thấy Bumx profile")
+        raise KeyError("Không tìm thấy TTC profile")
 
     with profile_run_lock(profile_id):
         return mutate_database(_mutator)
@@ -634,7 +634,7 @@ def delete_profile(profile_id):
 def select_profile_as_default(profile_id):
     def _mutator(data):
         if get_profile(data, profile_id) is None:
-            raise KeyError("Không tìm thấy Bumx profile")
+            raise KeyError("Không tìm thấy TTC profile")
         data["active_profile_id"] = profile_id
         return True
 
@@ -666,7 +666,7 @@ def save_config(auth_token, fb_accounts):
     def _mutator(data):
         profile = get_profile(data)
         if profile is None:
-            profile = _new_profile("Bumx mặc định", auth_token, fb_accounts)
+            profile = _new_profile("TTC mặc định", auth_token, fb_accounts)
             data["profiles"].append(profile)
             data["active_profile_id"] = profile["profile_id"]
         else:
@@ -2019,7 +2019,7 @@ def add_manual_account(profile_id, token):
             raise ValueError("Không tìm thấy profile")
         account = {"token": token, "email": "", "password": "", "secret": ""}
         if _is_duplicate_account(prof.get('fb_accounts', []), account):
-            raise ValueError("Facebook account/token đã tồn tại trong Bumx profile này.")
+            raise ValueError("Facebook account/token đã tồn tại trong TTC profile này.")
         prof.setdefault('fb_accounts', []).append(account)
         _include_new_account_in_explicit_selection(prof, account)
         return True
@@ -2054,7 +2054,7 @@ def add_login_account(profile_id, email, password, secret="", req_fb=None):
             print_warning("Không tìm thấy profile")
             return False
         if persist_status == "duplicate":
-            print_warning("Facebook account đã tồn tại trong Bumx profile này.")
+            print_warning("Facebook account đã tồn tại trong TTC profile này.")
             return False
         if persist_status == "success":
             print_success(f"Đã thêm Facebook account {email}.")
@@ -2086,7 +2086,7 @@ def batch_login_accounts(
             stop_batch = True
             break
         if not profile_exists:
-            print_error("Bumx profile không còn tồn tại. Dừng batch login.")
+            print_error("TTC profile không còn tồn tại. Dừng batch login.")
             results.append({"email": email, "status": "profile_missing"})
             stop_batch = True
             break
@@ -2105,7 +2105,7 @@ def batch_login_accounts(
             results.append({"email": email, "status": "login_failed"})
             try:
                 if get_profile(load_database(), profile_id) is None:
-                    print_error("Bumx profile không còn tồn tại. Dừng batch login.")
+                    print_error("TTC profile không còn tồn tại. Dừng batch login.")
                     stop_batch = True
             except Exception:
                 print_error("Không thể đọc dữ liệu profile mới nhất. Dừng batch login.")
@@ -2117,7 +2117,7 @@ def batch_login_accounts(
                 )
             except ProfileInUseError:
                 print_error(
-                    f"[{index}/{total}] Không thể thêm {email} vì Bumx profile đang được sử dụng."
+                    f"[{index}/{total}] Không thể thêm {email} vì TTC profile đang được sử dụng."
                 )
                 persist_status = "profile_busy"
             except Exception:
@@ -2130,7 +2130,7 @@ def batch_login_accounts(
             elif persist_status == "duplicate":
                 print_warning(f"[{index}/{total}] Facebook account {email} đã tồn tại.")
             elif persist_status == "profile_missing":
-                print_error("Bumx profile không còn tồn tại. Dừng batch login.")
+                print_error("TTC profile không còn tồn tại. Dừng batch login.")
                 stop_batch = True
             elif persist_status in {"profile_busy", "persistence_failed"}:
                 stop_batch = True
@@ -2180,7 +2180,7 @@ def batch_login_accounts(
 def view_accounts(profile):
     accounts = profile.get('fb_accounts', [])
     selected = set(selected_account_keys(profile))
-    print(f"\n{Fore.YELLOW}Facebook của Bumx: {profile['name']}{Style.RESET_ALL}")
+    print(f"\n{Fore.YELLOW}Facebook của TTC: {profile['name']}{Style.RESET_ALL}")
     if not accounts:
         print_info("Chưa có Facebook account.")
         return
@@ -2557,7 +2557,7 @@ def account_manager(profile_id):
             print_error(f"Không thể đọc dữ liệu mới nhất. {exc}")
             return
         if profile is None:
-            print_error("Bumx profile không còn tồn tại trong dữ liệu mới nhất.")
+            print_error("TTC profile không còn tồn tại trong dữ liệu mới nhất.")
             return
         print(f"\n{Fore.YELLOW}=== FACEBOOK — {profile['name']} ==={Style.RESET_ALL}")
         print("1. Xem danh sách")
@@ -2731,7 +2731,7 @@ def configure_run(profile):
 def list_profiles(data):
     profiles = data.get('profiles', [])
     if not profiles:
-        print_info("Chưa có Bumx profile.")
+        print_info("Chưa có TTC profile.")
         return
     active = SESSION_PROFILE_ID if SESSION_PROFILE_ID is not None else data.get('active_profile_id')
     for index, profile in enumerate(profiles, start=1):
@@ -2742,7 +2742,7 @@ def list_profiles(data):
 
 def _profile_index(data, prompt="Chọn profile để chạy: "):
     if not data.get('profiles'):
-        print_warning("Chưa có Bumx profile.")
+        print_warning("Chưa có TTC profile.")
         return None
     list_profiles(data)
     print()
@@ -2763,12 +2763,12 @@ def create_profile(data):
     if not name:
         print_error("Tên không được trống.")
         return None
-    print("Nhập Bumx token:")
+    print("Nhập TTC token:")
     token = input().strip()
 
     print(f"\n{Fore.YELLOW}=== XÁC NHẬN PROFILE ==={Style.RESET_ALL}")
     print(f"Tên:\n{name}")
-    print(f"\nBumx token:\n{token}")
+    print(f"\nTTC token:\n{token}")
     if input("\nTạo profile này? (y/n): ").strip().lower() not in ['y', 'yes']:
         print_info("Đã hủy.")
         return None
@@ -2804,7 +2804,7 @@ def view_bumx_token(data):
     profile_id = profile['profile_id']
     profile_name = profile['name']
     while True:
-        print(f"\n{Fore.YELLOW}=== BUMX TOKEN — {profile['name']} ==={Style.RESET_ALL}")
+        print(f"\n{Fore.YELLOW}=== TTC TOKEN — {profile['name']} ==={Style.RESET_ALL}")
         print("Token hiện tại:\n")
         print(profile.get('auth_token') or '(trống)')
         print("\n1. Giữ nguyên")
@@ -2814,14 +2814,14 @@ def view_bumx_token(data):
         if choice == '1':
             return
         elif choice == '2':
-            print("\nNhập Bumx token mới:")
+            print("\nNhập TTC token mới:")
             token = input().strip()
             print("\nToken vừa nhập:\n")
             print(token)
             if input("\nLưu token này? (y/n): ").strip().lower() in ['y', 'yes']:
                 try:
                     update_profile_auth_token_manual(profile_id, token)
-                    print_success("Đã cập nhật Bumx token.")
+                    print_success("Đã cập nhật TTC token.")
                 except ProfileInUseError:
                     print_error(
                         f'Không thể cập nhật token. Profile "{profile_name}" '
@@ -2973,7 +2973,7 @@ def profile_manager(data):
         except Exception as exc:
             print_error(f"Không thể đọc dữ liệu mới nhất. {exc}")
             return
-        print(f"\n{Fore.YELLOW}=== QUẢN LÝ BUMX PROFILE ==={Style.RESET_ALL}\n")
+        print(f"\n{Fore.YELLOW}=== QUẢN LÝ TTC PROFILE ==={Style.RESET_ALL}\n")
         active = SESSION_PROFILE_ID or data.get('active_profile_id')
         active_name = "CHƯA CHỌN"
         for p in data.get('profiles', []):
@@ -2985,7 +2985,7 @@ def profile_manager(data):
         print("1. Chọn profile để chạy")
         print("2. Tạo profile mới")
         print("3. Đổi tên profile")
-        print("4. Xem / cập nhật Bumx token")
+        print("4. Xem / cập nhật TTC token")
         print("5. Sao chép Facebook từ profile khác")
         print("6. Xóa profile")
         print("7. Quay lại")
@@ -3035,7 +3035,7 @@ def profile_manager(data):
                 print(f"\n=== XÁC NHẬN XÓA PROFILE ===")
                 print(f"Profile:\n{profile['name']}")
                 print(f"\nFacebook:\n{fb_count} account")
-                print(f"\nBumx token:\n{profile.get('auth_token') or '(trống)'}")
+                print(f"\nTTC token:\n{profile.get('auth_token') or '(trống)'}")
                 if input(f"\nXóa profile này? (y/n): ").strip().lower() in ['y', 'yes']:
                     deleted_id = profile['profile_id']
                     deleted_name = profile['name']
@@ -3043,7 +3043,7 @@ def profile_manager(data):
                         _, new_active_id = delete_profile(deleted_id)
                         if SESSION_PROFILE_ID == deleted_id:
                             SESSION_PROFILE_ID = new_active_id
-                        print_success("Đã xóa Bumx profile.")
+                        print_success("Đã xóa TTC profile.")
                     except ProfileInUseError:
                         print_error(
                             f'Không thể xóa. Profile "{deleted_name}" '
@@ -3296,7 +3296,7 @@ def run_active_profile(profile):
     auth_token = str(profile.get('auth_token') or '').strip()
     accounts = selected_accounts(profile)
     if not auth_token:
-        print_error("Bumx profile chưa có token.")
+        print_error("TTC profile chưa có token.")
         return
     if not accounts:
         print_warning("⚠️ Chưa có Facebook account nào được bật để chạy.")
@@ -3305,7 +3305,7 @@ def run_active_profile(profile):
     print_info(run_config_summary(config))
     try:
         with profile_run_lock(profile.get('profile_id')):
-            print_info(f"🔒 Đã khóa profile Bumx {profile['name']} cho phiên chạy này.")
+            print_info(f"🔒 Đã khóa profile TTC {profile['name']} cho phiên chạy này.")
             run_multi_tokens(
                 auth_token,
                 accounts,
@@ -3343,16 +3343,18 @@ def _first_selected_fb_token(profile):
 
 def check_balance(profile):
     auth_token = str(profile.get('auth_token') or '').strip()
-    fb_token = _first_selected_fb_token(profile)
-    if not auth_token or not fb_token:
-        print_error("Cần Bumx token và ít nhất một Facebook token.")
+    if not auth_token:
+        print_error("Cần TTC token.")
         return
     api = None
     try:
         with profile_run_lock(profile.get('profile_id')):
-            api = API_BUMX(auth_token, fb_token, profile_id=profile['profile_id'])
-            balance = api.get_info_account()
-            print_info(f"Số dư ví {profile['name']}: {Fore.YELLOW}{balance}{Fore.CYAN} xu")
+            worker_id = f"{profile.get('profile_id') or 'profile'}:balance"
+            api = API_TTC(auth_token, worker_id=worker_id)
+            api.login()
+            account_info = api.get_account_info()
+            balance = account_info['balance']
+            print_info(f"Số dư TTC {profile['name']}: {Fore.YELLOW}{balance}{Fore.CYAN} xu")
     except RuntimeError as e:
         print_error(str(e))
     except Exception as exc:
@@ -3366,17 +3368,42 @@ def show_jobs_for_profile(profile):
     auth_token = str(profile.get('auth_token') or '').strip()
     fb_token = _first_selected_fb_token(profile)
     if not auth_token or not fb_token:
-        print_error("Cần Bumx token và ít nhất một Facebook token.")
+        print_error("Cần TTC token và ít nhất một Facebook token.")
         return
     api = None
     try:
         with profile_run_lock(profile.get('profile_id')):
-            api = API_BUMX(auth_token, fb_token, profile_id=profile['profile_id'])
-            jobs = api.show_jobs()
+            worker_id = f"{profile.get('profile_id') or 'profile'}:preview"
+            api = API_TTC(auth_token, worker_id=worker_id)
+            api.login()
+            action = AUTO_Action()
+            uid, message = action.get_info(fb_token)
+            if not uid:
+                print_error(f"Không thể lấy UID Facebook: {message}")
+                return
+            api.set_facebook_uid(uid)
+
+            jobs = []
+            for group in ("like_facebook", "like_poster"):
+                result = api.fetch_jobs_for_legacy_type(group)
+                jobs.extend(result['jobs'])
             if jobs:
                 print_info(f"Tổng số jobs: {len(jobs)}")
                 for idx, job in enumerate(jobs, start=1):
-                    print(f"{idx}. {job['type']} - Buff ID: {job['buff_id']} - Object ID: {job['object_id']}")
+                    source = job.get('ttc_source') or job.get('type', 'unknown')
+                    action_group = job.get('action_group') or job.get('type', 'unknown')
+                    job_id = job.get('job_id') or job.get('buff_id', 'N/A')
+                    details = [
+                        f"{idx}. {action_group}",
+                        f"TTC: {source}",
+                        f"Job ID: {job_id}",
+                        f"Object ID: {job.get('object_id', 'N/A')}",
+                    ]
+                    if job.get('reaction_type'):
+                        details.append(f"Reaction: {job['reaction_type']}")
+                    if job.get('comment_text'):
+                        details.append(f"Comment: {job['comment_text']}")
+                    print(" | ".join(details))
             else:
                 print_info("Không có job nào.")
     except RuntimeError as e:
@@ -3390,7 +3417,7 @@ def show_jobs_for_profile(profile):
 
 def print_menu(profile):
     print("\n" + "=" * 42)
-    print(f"{Fore.MAGENTA}BUMX AUTO TOOL{Style.RESET_ALL}")
+    print(f"{Fore.MAGENTA}TTC AUTO TOOL{Style.RESET_ALL}")
     print("=" * 42)
     print()
     if profile:
@@ -3413,7 +3440,7 @@ def print_menu(profile):
     print("3. Xem jobs")
     print("4. Quản lý Facebook")
     print("5. Cấu hình delay / burst")
-    print("6. Quản lý Bumx profile")
+    print("6. Quản lý TTC profile")
     print("7. Thoát")
 
 
@@ -3427,7 +3454,7 @@ def main():
         return
 
     if not data['profiles']:
-        print_warning("Chưa có Bumx profile. Tạo profile đầu tiên.")
+        print_warning("Chưa có TTC profile. Tạo profile đầu tiên.")
         create_profile(data)
         data = load_database()
 
@@ -3443,27 +3470,27 @@ def main():
             if profile:
                 run_active_profile(profile)
             else:
-                print_error("Chưa có Bumx profile.")
+                print_error("Chưa có TTC profile.")
         elif choice == '2':
             if profile:
                 check_balance(profile)
             else:
-                print_error("Chưa có Bumx profile.")
+                print_error("Chưa có TTC profile.")
         elif choice == '3':
             if profile:
                 show_jobs_for_profile(profile)
             else:
-                print_error("Chưa có Bumx profile.")
+                print_error("Chưa có TTC profile.")
         elif choice == '4':
             if profile:
                 account_manager(profile['profile_id'])
             else:
-                print_error("Chưa có Bumx profile.")
+                print_error("Chưa có TTC profile.")
         elif choice == '5':
             if profile:
                 configure_run(profile)
             else:
-                print_error("Chưa có Bumx profile.")
+                print_error("Chưa có TTC profile.")
         elif choice == '6':
             profile_manager(data)
         elif choice == '7':

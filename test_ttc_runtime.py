@@ -460,8 +460,10 @@ class TTCCoreRuntimeTests(unittest.TestCase):
         self.assertIn("API_TTC(", multi_source)
         self.assertNotIn("API_BUMX(", multi_source)
         self.assertNotIn("countdown(20", multi_source)
-        self.assertIn("API_BUMX(", inspect.getsource(api_bumx.check_balance))
-        self.assertIn("API_BUMX(", inspect.getsource(api_bumx.show_jobs_for_profile))
+        self.assertNotIn("API_BUMX(", inspect.getsource(api_bumx.check_balance))
+        self.assertIn("API_TTC(", inspect.getsource(api_bumx.check_balance))
+        self.assertNotIn("API_BUMX(", inspect.getsource(api_bumx.show_jobs_for_profile))
+        self.assertIn("API_TTC(", inspect.getsource(api_bumx.show_jobs_for_profile))
         for forbidden in (
             "get_new_mission_jobs",
             "get_mission_jobs",

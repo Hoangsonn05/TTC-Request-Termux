@@ -755,7 +755,7 @@ class TTCClient:
         self._session = self._create_session()
         self._token = ""
         self._user = ""
-        self._initial_balance = 0
+        self._initial_balance = None
         self._authenticated = False
 
     # ------------------------------------------------------------------
@@ -791,6 +791,11 @@ class TTCClient:
             TTCResponseError: Response khÃ´ng parse Ä‘Æ°á»£c.
             TTCRateLimitError: Rate limit tá»« server.
         """
+        self._token = ""
+        self._user = ""
+        self._initial_balance = None
+        self._authenticated = False
+
         if not token or not str(token).strip():
             raise TTCAuthError("[TTC] Token rỗng, không thể đăng nhập.")
 
@@ -830,16 +835,29 @@ class TTCClient:
             )
 
         user = raw_data.get("user") or raw_data.get("username") or ""
-        sodu = raw_data.get("sodu")
         if not user:
             raise TTCAuthError(
                 f"[TTC] Response đăng nhập thiếu trường 'user'. Response: {str(raw_data)[:200]}"
             )
 
-        try:
-            balance = int(sodu or 0)
-        except (TypeError, ValueError):
-            balance = 0
+        if "sodu" not in raw_data or raw_data["sodu"] is None:
+            raise TTCResponseError(
+                "[TTC] Authentication response is missing required field 'sodu'."
+            )
+
+        sodu = raw_data["sodu"]
+        if isinstance(sodu, bool):
+            raise TTCResponseError(
+                "[TTC] Authentication response field 'sodu' is not a valid integer."
+            )
+        if isinstance(sodu, int):
+            balance = sodu
+        elif isinstance(sodu, str) and re.fullmatch(r"[+-]?\d+", sodu.strip()):
+            balance = int(sodu.strip())
+        else:
+            raise TTCResponseError(
+                "[TTC] Authentication response field 'sodu' is not a valid integer."
+            )
 
         self._user = str(user)
         self._initial_balance = balance
@@ -969,10 +987,10 @@ class TTCClient:
                 f"[TTC] HTTP {resp.status_code} khi láº¥y job {job_type}."
             )
 
-        # Parse response linh hoáº¡t
+        # Parse fetch responses using the endpoint's fail-closed contract.
         raw_text = (resp.text or "").strip()
         if not raw_text:
-            raise TTCNoJobAvailable(f"[TTC] Response rá»—ng tá»« {job_type}.", 0)
+            raise TTCResponseError(f"[TTC] Empty response from {job_type}.")
 
         try:
             data = resp.json()
@@ -992,32 +1010,55 @@ class TTCClient:
         if isinstance(data, list) and len(data) == 0:
             raise TTCNoJobAvailable(f"[TTC] KhÃ´ng cÃ³ job {job_type}.", 0)
 
-        # Case 3: Dict â€” phÃ¢n tÃ­ch thÃªm
+        # Case 3: Dict responses fail closed. Error semantics take precedence;
+        # countdown alone is not evidence that TTC has no jobs.
         if isinstance(data, dict):
             message = _extract_message(data)
-            countdown = _parse_countdown(data)
+            error_value = data.get("error")
+            has_explicit_error = (
+                "error" in data and error_value not in (None, "", False)
+            )
+            if isinstance(error_value, (str, int, float, bool)):
+                error_message = str(error_value)
+            else:
+                error_message = _extract_message(error_value)
 
-            # PhiÃªn háº¿t háº¡n
-            if any(kw in message.lower() for kw in ("đăng nhập", "login", "expired", "unauthorized")):
+            semantic_text = " ".join(
+                part for part in (message, error_message) if part
+            )
+            folded = _strip_accents(semantic_text).casefold()
+            display_message = _safe_display_message(semantic_text)
+
+            if any(
+                marker in folded
+                for marker in ("dang nhap", "login", "expired", "unauthorized")
+            ):
                 raise TTCAuthError(
-                    f"[TTC] Phiên đăng nhập hết hạn ({job_type}): {message}"
+                    f"[TTC] Authentication failure while fetching {job_type}: "
+                    f"{display_message or 'authentication error'}"
                 )
 
-            # CÃ³ countdown â†’ khÃ´ng cÃ³ job táº¡m thá»i
-            if countdown and countdown > 0:
-                raise TTCNoJobAvailable(
-                    f"[TTC] {message or 'ChÆ°a cÃ³ job'} (chá» {countdown}s)",
-                    countdown,
+            if (
+                re.search(r"\brate[\s_-]*limit(?:ed|ing)?\b", folded)
+                or "too many request" in folded
+            ):
+                raise TTCRateLimitError(
+                    f"[TTC] Rate limit while fetching {job_type}: "
+                    f"{display_message or 'rate limited'}"
                 )
 
-            # CÃ³ message thÃ´ng bÃ¡o khÃ´ng cÃ³ job
-            if message:
-                raise TTCNoJobAvailable(
-                    f"[TTC] {message}",
-                    0,
+            if has_explicit_error:
+                raise TTCResponseError(
+                    f"[TTC] API error while fetching {job_type}: "
+                    f"{_safe_display_message(error_message or message) or 'explicit error'}"
                 )
 
-            raise TTCNoJobAvailable(f"[TTC] KhÃ´ng cÃ³ job {job_type}.", 0)
+            _response_kind, response_keys = _response_kind_and_keys(data)
+            raise TTCResponseError(
+                f"[TTC] Unknown response dict from {job_type}. "
+                f"Keys={','.join(response_keys) or '-'}; "
+                f"Message={_safe_display_message(message) or '-'}"
+            )
 
         raise TTCResponseError(
             f"[TTC] Response format khÃ´ng xÃ¡c Ä‘á»‹nh tá»« {job_type}: {type(data).__name__}"

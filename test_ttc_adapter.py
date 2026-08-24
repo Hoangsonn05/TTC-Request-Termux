@@ -1,5 +1,6 @@
 import copy
 import inspect
+import json
 import time
 import unittest
 from unittest.mock import patch
@@ -7,12 +8,55 @@ from unittest.mock import patch
 import api_bumx
 from TTC_API import (
     TTCAuthError,
+    TTCClient,
     TTCJobType,
     TTCNoJobAvailable,
     TTCRateLimitError,
     TTCResponseError,
 )
 from ttc_adapter import API_TTC
+
+
+_MISSING = object()
+
+
+class FakeFetchResponse:
+    def __init__(self, payload=_MISSING, *, status_code=200, text=None):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = (
+            json.dumps(payload, ensure_ascii=False)
+            if text is None and payload is not _MISSING
+            else (text or "")
+        )
+
+    def json(self):
+        if self._payload is _MISSING:
+            raise ValueError("response is not valid JSON")
+        return self._payload
+
+
+class FakeFetchSession:
+    def __init__(self, response):
+        self.response = response
+        self.get_calls = []
+
+    def get(self, url, **kwargs):
+        self.get_calls.append((url, kwargs))
+        return self.response
+
+
+class FakeAuthSession:
+    def __init__(self, response):
+        self.response = response
+        self.post_calls = []
+
+    def post(self, url, **kwargs):
+        self.post_calls.append((url, kwargs))
+        return self.response
+
+    def close(self):
+        pass
 
 
 def make_job(job_type, suffix="1"):
@@ -29,6 +73,168 @@ def make_job(job_type, suffix="1"):
         "idpost": f"post-{suffix}",
         "raw_data": {"idpost": f"post-{suffix}"},
     }
+
+
+class TTCAuthenticationBalanceTests(unittest.TestCase):
+    def make_client(self, payload):
+        client = TTCClient(worker_id="auth-contract", log_fn=lambda *_args: None)
+        client._session.close()
+        client._session = FakeAuthSession(FakeFetchResponse(payload))
+        return client
+
+    def test_integer_balance_is_accepted(self):
+        client = self.make_client({"data": {"user": "tester", "sodu": 123}})
+
+        client.authenticate("valid-token")
+
+        self.assertEqual(client.get_account_info(), {
+            "user": "tester",
+            "balance": 123,
+            "authenticated": True,
+        })
+
+    def test_integer_like_string_balance_is_normalized(self):
+        client = self.make_client({"data": {"user": "tester", "sodu": "123"}})
+
+        client.authenticate("valid-token")
+
+        self.assertEqual(client.get_account_info(), {
+            "user": "tester",
+            "balance": 123,
+            "authenticated": True,
+        })
+
+    def test_invalid_required_balances_fail_without_account_state(self):
+        cases = (
+            ("malformed", {"user": "tester", "sodu": "not-a-number"}),
+            ("missing", {"user": "tester"}),
+            ("null", {"user": "tester", "sodu": None}),
+        )
+        for name, account_data in cases:
+            with self.subTest(name=name):
+                client = self.make_client({"data": account_data})
+
+                with self.assertRaises(TTCResponseError):
+                    client.authenticate("valid-token")
+
+                self.assertEqual(client.get_account_info(), {
+                    "user": "",
+                    "balance": None,
+                    "authenticated": False,
+                })
+
+    def test_failed_subsequent_login_clears_previous_account_state(self):
+        client = self.make_client({"data": {"user": "first-user", "sodu": 456}})
+        client.authenticate("first-token")
+        client._session.response = FakeFetchResponse({
+            "data": {"user": "second-user", "sodu": "not-a-number"}
+        })
+
+        with self.assertRaises(TTCResponseError):
+            client.authenticate("second-token")
+
+        self.assertEqual(client.get_account_info(), {
+            "user": "",
+            "balance": None,
+            "authenticated": False,
+        })
+
+
+class TTCFetchParserTests(unittest.TestCase):
+    def make_client(self, response):
+        client = TTCClient(worker_id="fetch-contract", log_fn=lambda *_args: None)
+        client._session.close()
+        client._session = FakeFetchSession(response)
+        client._authenticated = True
+        return client
+
+    def test_valid_jobs_are_normalized(self):
+        client = self.make_client(FakeFetchResponse([
+            {
+                "idpost": "post-1",
+                "link": "https://facebook.com/10001",
+                "nd": "hello TTC",
+            }
+        ]))
+
+        jobs = client.get_jobs(TTCJobType.COMMENT)
+
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["type"], TTCJobType.COMMENT.value)
+        self.assertEqual(jobs[0]["idpost"], "post-1")
+        self.assertEqual(jobs[0]["comment_text"], "hello TTC")
+
+    def test_empty_list_is_no_job(self):
+        client = self.make_client(FakeFetchResponse([]))
+
+        with self.assertRaises(TTCNoJobAvailable) as caught:
+            client.get_jobs(TTCJobType.COMMENT)
+
+        self.assertEqual(caught.exception.countdown, 0)
+
+    def test_semantic_auth_failure_is_auth_error(self):
+        client = self.make_client(FakeFetchResponse({"message": "Login expired"}))
+
+        with self.assertRaises(TTCAuthError):
+            client.get_jobs(TTCJobType.COMMENT)
+
+    def test_rate_limit_message_is_rate_limit_error(self):
+        client = self.make_client(FakeFetchResponse({"message": "Rate limit exceeded"}))
+
+        with self.assertRaises(TTCRateLimitError):
+            client.get_jobs(TTCJobType.COMMENT)
+
+    def test_rate_limit_countdown_does_not_become_no_job(self):
+        client = self.make_client(FakeFetchResponse({
+            "message": "Rate limit exceeded",
+            "countdown": 15,
+        }))
+
+        with self.assertRaises(TTCRateLimitError):
+            client.get_jobs(TTCJobType.COMMENT)
+
+    def test_internal_server_error_message_is_response_error(self):
+        client = self.make_client(FakeFetchResponse({"message": "Internal server error"}))
+
+        with self.assertRaises(TTCResponseError):
+            client.get_jobs(TTCJobType.COMMENT)
+
+    def test_explicit_error_field_is_response_error(self):
+        client = self.make_client(FakeFetchResponse({"error": "database unavailable"}))
+
+        with self.assertRaises(TTCResponseError):
+            client.get_jobs(TTCJobType.COMMENT)
+
+    def test_unknown_dict_is_response_error(self):
+        client = self.make_client(FakeFetchResponse({"unexpected": "value"}))
+
+        with self.assertRaises(TTCResponseError):
+            client.get_jobs(TTCJobType.COMMENT)
+
+    def test_non_json_and_empty_body_are_response_errors(self):
+        for text in ("<html>server error</html>", ""):
+            with self.subTest(text=text):
+                client = self.make_client(FakeFetchResponse(text=text))
+                with self.assertRaises(TTCResponseError):
+                    client.get_jobs(TTCJobType.COMMENT)
+
+    def test_http_status_error_precedence(self):
+        cases = (
+            (401, TTCAuthError),
+            (403, TTCAuthError),
+            (429, TTCRateLimitError),
+            (500, TTCResponseError),
+            (503, TTCResponseError),
+            (400, TTCResponseError),
+        )
+        for status_code, expected_error in cases:
+            with self.subTest(status_code=status_code):
+                client = self.make_client(FakeFetchResponse(
+                    {"message": "not a no-job response"},
+                    status_code=status_code,
+                ))
+                with self.assertRaises(expected_error):
+                    client.get_jobs(TTCJobType.COMMENT)
 
 
 class APITTCAdapterTests(unittest.TestCase):

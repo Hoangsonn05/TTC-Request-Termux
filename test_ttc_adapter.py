@@ -166,10 +166,10 @@ class APITTCAdapterTests(unittest.TestCase):
             self.api.fetch_jobs_for_legacy_type("follow")
         self.client.get_jobs.assert_not_called()
 
-    def test_main_runtime_still_constructs_api_bumx(self):
+    def test_main_runtime_constructs_api_ttc_after_core_cutover(self):
         source = inspect.getsource(api_bumx.run_multi_tokens)
-        self.assertIn("api = API_BUMX(", source)
-        self.assertNotIn("api = API_TTC(", source)
+        self.assertIn("api = API_TTC(", source)
+        self.assertNotIn("api = API_BUMX(", source)
         self.assertIs(api_bumx.API_TTC, API_TTC)
 
 

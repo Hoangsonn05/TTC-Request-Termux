@@ -3058,6 +3058,172 @@ def profile_manager(data):
 
 
 # ---------- Chạy đa Facebook account ----------
+def _ttc_no_job_wait_seconds(no_job_metadata):
+    positive_countdowns = []
+    for item in no_job_metadata:
+        if not isinstance(item, dict):
+            raise ValueError("TTC adapter returned invalid no-job metadata")
+        raw_countdown = item.get("countdown")
+        if raw_countdown in (None, ""):
+            continue
+        try:
+            seconds = int(raw_countdown)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("TTC adapter returned invalid countdown metadata") from exc
+        if seconds > 0:
+            positive_countdowns.append(seconds)
+    return max(positive_countdowns) if positive_countdowns else 10
+
+
+def _normalize_ttc_earned_coin(value):
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
+                 like_batch_limit=None, comment_batch_limit=None,
+                 like_batch_min=None, like_batch_max=None,
+                 comment_batch_min=None, comment_batch_max=None,
+                 like_delay_range=(10, 10), comment_delay_range=(10, 10),
+                 failed_delay_range=(10, 10)):
+    global total_coin
+    enabled_types = normalize_job_types(job_types)
+    do_job = AUTO_Action()
+    uid, msg = do_job.get_info(fb_token)
+    if uid:
+        print("UID:" + str(uid))
+    else:
+        print("ERROR:" + msg)
+        return 0
+
+    api.set_facebook_uid(uid)
+
+    while True:
+        fetched_jobs = []
+        no_job_metadata = []
+        for legacy_type in ("like_facebook", "like_poster"):
+            if legacy_type not in enabled_types:
+                continue
+            result = api.fetch_jobs_for_legacy_type(legacy_type)
+            if (not isinstance(result, dict)
+                    or not isinstance(result.get("jobs"), list)
+                    or not isinstance(result.get("no_job"), list)):
+                raise ValueError("TTC adapter returned an invalid fetch result")
+            fetched_jobs.extend(result["jobs"])
+            no_job_metadata.extend(result["no_job"])
+
+        if fetched_jobs:
+            break
+
+        wait_seconds = _ttc_no_job_wait_seconds(no_job_metadata)
+        print_info("No supported TTC job is currently available.")
+        countdown(wait_seconds, "Waiting before the next TTC fetch")
+
+    jobs = schedule_jobs_by_burst(
+        fetched_jobs,
+        enabled_types,
+        max_jobs,
+        like_batch_limit=like_batch_limit,
+        comment_batch_limit=comment_batch_limit,
+        like_batch_min=like_batch_min,
+        like_batch_max=like_batch_max,
+        comment_batch_min=comment_batch_min,
+        comment_batch_max=comment_batch_max,
+    )
+    if not jobs:
+        print_info("No supported TTC job was selected by the scheduler.")
+        return 0
+
+    print_info(f"Scheduler selected {len(jobs)} jobs with hard cap {max_jobs}.")
+    total_jobs = len(jobs)
+    total_done = 0
+
+    for idx, job in enumerate(jobs, start=1):
+        type_ = job.get("type")
+        original_job = job.get("_ttc_job")
+        job_succeeded = False
+        if not isinstance(original_job, dict):
+            raise ValueError("TTC scheduler wrapper is missing its original job")
+        else:
+            object_id = original_job.get("object_id")
+            if not object_id:
+                print_warning("TTC job is missing object_id; skipping.")
+            else:
+                job_type_display = "LIKE" if type_ == "like_facebook" else "CMT"
+                if type_ == "like_facebook":
+                    reaction = original_job.get("reaction_type")
+                    if not reaction:
+                        raise ValueError("TTC reaction job is missing reaction_type")
+                else:
+                    comment_text = original_job.get("comment_text")
+                    if not isinstance(comment_text, str) or not comment_text:
+                        raise ValueError("TTC comment job is missing comment_text")
+                print_info(
+                    f"[{idx}/{total_jobs}] Processing TTC job {type_} "
+                    f"(job_id: {original_job.get('job_id', '')})..."
+                )
+                action_succeeded = False
+                try:
+                    post_id = get_facebook_post_id(f"https://www.facebook.com/{object_id}")
+                    if int(post_id) > 0:
+                        if type_ == "like_facebook":
+                            print_info(f"   Executing {reaction} on Facebook object {object_id}")
+                            action_succeeded = do_job.auto_reaction(
+                                post_id, reaction, fb_token, uid
+                            )
+                        else:
+                            print_info(f"   Commenting on Facebook object {object_id}")
+                            action_succeeded = do_job.auto_cmt(
+                                post_id, comment_text, fb_token, uid
+                            )
+                        time.sleep(3)
+                    else:
+                        print_warning(
+                            f"[{idx}/{total_jobs}] {job_type_display} | Could not resolve "
+                            f"Facebook ID for {original_job.get('job_id', '')}"
+                        )
+                except Exception as exc:
+                    print_error(f"[{idx}/{total_jobs}] Facebook {type_} error: {exc}")
+
+                if action_succeeded:
+                    result = api.submit_job(original_job)
+                    if result.get("success") is True:
+                        earned = _normalize_ttc_earned_coin(result.get("earned_coin"))
+                        job_succeeded = True
+                        total_done += 1
+                        total_coin += earned
+                        result_message = result.get("message", "")
+                        print_success(
+                            f"[{idx}/{total_jobs}] {job_type_display} | +{earned} | "
+                            f"Total: {total_coin} | {result_message}"
+                        )
+                    else:
+                        print_warning(
+                            f"[{idx}/{total_jobs}] {job_type_display} | TTC submit failed: "
+                            f"{result.get('message', '')}"
+                        )
+                else:
+                    print_warning(
+                        f"[{idx}/{total_jobs}] {job_type_display} | Facebook action failed; "
+                        "TTC submit skipped."
+                    )
+
+        if idx < total_jobs:
+            if job_succeeded:
+                delay_range = like_delay_range if type_ == "like_facebook" else comment_delay_range
+            else:
+                delay_range = failed_delay_range
+            delay = random.randint(*delay_range)
+            countdown(delay, f"Waiting before job {idx+1}")
+
+    print_info(f"Completed {total_done}/{total_jobs} jobs. Total coin: {total_coin}")
+    return total_done
+
+
 def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_per_acc=30,
                      continuous=False, job_types=None, normal_delay_min=None,
                      normal_delay_max=None, failed_delay_min=None, failed_delay_max=None,
@@ -3093,24 +3259,21 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
             print_info(f"\n--- {identity} ({idx+1}/{len(fb_accounts)}) ---")
             api = None
             try:
-                api = API_BUMX(
-                    auth_token,
+                worker_id = f"{profile_id or 'profile'}:{idx+1}"
+                api = API_TTC(auth_token, worker_id=worker_id)
+                api.login()
+                done = run_ttc_jobs(
+                    api,
                     fb_token,
-                    like_delay_min=like_delay_range[0],
-                    like_delay_max=like_delay_range[1],
-                    comment_delay_min=comment_delay_range[0],
-                    comment_delay_max=comment_delay_range[1],
-                    failed_delay_min=failed_delay_range[0],
-                    failed_delay_max=failed_delay_range[1],
-                    profile_id=profile_id,
-                )
-                done = api.run_jobs(
                     max_jobs=max_jobs_per_acc,
                     job_types=enabled_types,
                     like_batch_min=like_batch_range[0],
                     like_batch_max=like_batch_range[1],
                     comment_batch_min=comment_batch_range[0],
                     comment_batch_max=comment_batch_range[1],
+                    like_delay_range=like_delay_range,
+                    comment_delay_range=comment_delay_range,
+                    failed_delay_range=failed_delay_range,
                 )
                 total_all += done
                 print_info(f"{identity} đã làm {done} job.")
@@ -3126,7 +3289,6 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
         print_info(f"Hoàn thành chu kỳ {cycle}, tổng job: {total_all}")
         if not continuous:
             break
-        countdown(20, "Chờ trước chu kỳ tiếp theo")
         cycle += 1
 
 

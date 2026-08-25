@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import MagicMock, call, patch
 
 import api_bumx
-from TTC_API import TTCAuthError, TTCRateLimitError, TTCResponseError
+from api_bumx import TTCAuthError, TTCRateLimitError, TTCResponseError
 
 
 def make_profile(*, with_facebook=True):
@@ -55,7 +55,6 @@ class TTCAuxiliaryRuntimeTests(unittest.TestCase):
 
         with (
             patch.object(api_bumx, "API_TTC", return_value=api) as ttc_class,
-            patch.object(api_bumx, "API_BUMX") as bumx_class,
             patch.object(api_bumx, "profile_run_lock", return_value=contextlib.nullcontext()),
             patch.object(api_bumx, "print_info") as print_info,
             patch.object(api_bumx, "print_error") as print_error,
@@ -63,7 +62,6 @@ class TTCAuxiliaryRuntimeTests(unittest.TestCase):
             api_bumx.check_balance(profile)
 
         ttc_class.assert_called_once_with("ttc-token", worker_id="profile-1:balance")
-        bumx_class.assert_not_called()
         api.login.assert_called_once_with()
         api.get_account_info.assert_called_once_with()
         api.close.assert_called_once_with()
@@ -82,14 +80,12 @@ class TTCAuxiliaryRuntimeTests(unittest.TestCase):
                 api.get_account_info.side_effect = error
                 with (
                     patch.object(api_bumx, "API_TTC", return_value=api),
-                    patch.object(api_bumx, "API_BUMX") as bumx_class,
                     patch.object(api_bumx, "profile_run_lock", return_value=contextlib.nullcontext()),
                     patch.object(api_bumx, "print_info") as print_info,
                     patch.object(api_bumx, "print_error") as print_error,
                 ):
                     api_bumx.check_balance(make_profile(with_facebook=False))
 
-                bumx_class.assert_not_called()
                 api.login.assert_called_once_with()
                 api.close.assert_called_once_with()
                 print_info.assert_not_called()
@@ -119,7 +115,6 @@ class TTCAuxiliaryRuntimeTests(unittest.TestCase):
 
         with (
             patch.object(api_bumx, "API_TTC", return_value=api) as ttc_class,
-            patch.object(api_bumx, "API_BUMX") as bumx_class,
             patch.object(api_bumx, "AUTO_Action", return_value=action),
             patch.object(api_bumx, "profile_run_lock", return_value=contextlib.nullcontext()),
             patch.object(api_bumx.time, "sleep") as sleep,
@@ -130,7 +125,6 @@ class TTCAuxiliaryRuntimeTests(unittest.TestCase):
             api_bumx.show_jobs_for_profile(profile)
 
         ttc_class.assert_called_once_with("ttc-token", worker_id="profile-1:preview")
-        bumx_class.assert_not_called()
         action.get_info.assert_called_once_with("facebook-token")
         api.set_facebook_uid.assert_called_once_with("998877")
         self.assertEqual(
@@ -211,7 +205,6 @@ class TTCAuxiliaryRuntimeTests(unittest.TestCase):
                 action.get_info.return_value = ("uid", "OK")
                 with (
                     patch.object(api_bumx, "API_TTC", return_value=api),
-                    patch.object(api_bumx, "API_BUMX") as bumx_class,
                     patch.object(api_bumx, "AUTO_Action", return_value=action),
                     patch.object(api_bumx, "profile_run_lock", return_value=contextlib.nullcontext()),
                     patch.object(api_bumx, "print_info") as print_info,
@@ -220,7 +213,6 @@ class TTCAuxiliaryRuntimeTests(unittest.TestCase):
                 ):
                     api_bumx.show_jobs_for_profile(make_profile())
 
-                bumx_class.assert_not_called()
                 api.close.assert_called_once_with()
                 self.assertFalse(
                     any("Không có job" in item.args[0] for item in print_info.call_args_list)

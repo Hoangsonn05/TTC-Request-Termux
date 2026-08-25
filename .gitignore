@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+
+.bumx_runtime/
+bumx_termux_data.json
+config_token.json
+
+.env
+.env.*

@@ -20,7 +20,7 @@ Module hiện hỗ trợ:
 - Đọc số xu nhận được và số dư mới nếu response có cung cấp.
 - Phân loại lỗi đăng nhập, hết job, rate limit, lỗi HTTP, response sai định dạng và lỗi claim.
 - Tạo một HTTP session riêng cho từng `TTCClient`, phù hợp với mô hình nhiều worker.
-- Che token trong log, tránh ghi access token đầy đủ ra console.
+- Che token trong log của `TTCClient`; giao diện profile tương tác vẫn hiển thị token TTC theo chính sách người dùng.
 
 > Module không tự động like, thả cảm xúc, comment, follow hoặc like page. Tool tích hợp phải tự thực hiện hành động trên Facebook, xác minh kết quả rồi mới gọi `submit_job()`.
 
@@ -199,7 +199,7 @@ Payload:
 ### 5.2. Cấu hình UID Facebook
 
 ```text
-GET https://tuongtaccheo.com/cauhinh/datnick.php
+POST https://tuongtaccheo.com/cauhinh/datnick.php
 ```
 
 Dữ liệu gửi theo mã nguồn gốc:
@@ -210,6 +210,9 @@ Dữ liệu gửi theo mã nguồn gốc:
     "loai": "fb"
 }
 ```
+
+Request dùng form data. TTC chỉ được xem là xác nhận thành công khi
+`response.text.strip() == "1"`; không có success body nào khác được suy diễn.
 
 ### 5.3. Endpoint job
 
@@ -509,7 +512,9 @@ def app_log(message, level):
 client = TTCClient(worker_id="1", log_fn=app_log)
 ```
 
-Token TTC không được log đầy đủ. Module chỉ hiển thị hash rút gọn của token.
+Token TTC không được log đầy đủ bởi `TTCClient`; module chỉ ghi hash rút gọn.
+Trong CLI quản lý profile, token TTC được nhập và hiển thị nguyên văn để người
+dùng tự đối chiếu. Password và 2FA secret vẫn dùng input ẩn.
 
 ## 15. Lưu ý khi tích hợp
 
@@ -517,6 +522,8 @@ Token TTC không được log đầy đủ. Module chỉ hiển thị hash rút 
 - Luôn submit chính object job được trả về bởi `get_jobs()`.
 - Với reaction job, giữ nguyên `reaction_type` để payload `loaicx` chính xác.
 - Với comment job, sử dụng `comment_text` thay vì tự đọc trường `nd` từ `raw_data`.
+  Parser chỉ decode HTML entity, trích wrapper dấu nháy và strip khoảng trắng;
+  nội dung dài không bị cắt ngầm.
 - Không request get job hoặc submit quá dày; cần cấu hình delay và backoff.
 - Khi gặp `TTCRateLimitError`, nên tăng delay trước lần thử tiếp theo.
 - Khi gặp `TTCAuthError`, cần đăng nhập lại hoặc yêu cầu token mới.

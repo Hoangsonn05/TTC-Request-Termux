@@ -1,6 +1,5 @@
 import requests
 import time
-import hmac
 import hashlib
 import json
 import os
@@ -13,8 +12,13 @@ import random
 import getpass
 import contextlib
 import re
-
-from ttc_adapter import API_TTC
+import unicodedata
+import math
+import html
+import logging
+from dataclasses import dataclass
+from enum import Enum
+from urllib.parse import unquote
 
 try:
     import fcntl
@@ -26,10 +30,1802 @@ try:
 except ImportError:
     msvcrt = None
 
+try:
+    import cloudscraper
+    _HAS_CLOUDSCRAPER = True
+except ImportError:
+    _HAS_CLOUDSCRAPER = False
+
 init(autoreset=True)
 
 total_coin = 0
 SUPPORTED_JOB_TYPES = frozenset({'like_facebook', 'like_poster'})
+
+# =====================================================================
+# TTC API implementation
+# =====================================================================
+
+TTC_BASE_URL = "https://tuongtaccheo.com"
+
+TTC_ENDPOINTS = {
+    # job_type_key -> (get_url, claim_url)
+    "ttc_like_post_vip_cheo": (
+        f"{TTC_BASE_URL}/kiemtien/likepostvipcheo/getpost.php",
+        f"{TTC_BASE_URL}/kiemtien/likepostvipcheo/nhantien.php",
+    ),
+    "ttc_like_post_vip_re": (
+        f"{TTC_BASE_URL}/kiemtien/likepostvipre/getpost.php",
+        f"{TTC_BASE_URL}/kiemtien/likepostvipre/nhantien.php",
+    ),
+    "ttc_reaction_vip_cheo": (
+        f"{TTC_BASE_URL}/kiemtien/camxucvipcheo/getpost.php",
+        f"{TTC_BASE_URL}/kiemtien/camxucvipcheo/nhantien.php",
+    ),
+    "ttc_reaction_vip_re": (
+        f"{TTC_BASE_URL}/kiemtien/camxucvipre/getpost.php",
+        f"{TTC_BASE_URL}/kiemtien/camxucvipre/nhantien.php",
+    ),
+    "ttc_comment": (
+        f"{TTC_BASE_URL}/kiemtien/cmtcheo/getpost.php",
+        f"{TTC_BASE_URL}/kiemtien/cmtcheo/nhantien.php",
+    ),
+    "ttc_follow": (
+        f"{TTC_BASE_URL}/kiemtien/subcheo/getpost.php",
+        f"{TTC_BASE_URL}/kiemtien/subcheo/nhantien.php",
+    ),
+    "ttc_like_page": (
+        f"{TTC_BASE_URL}/kiemtien/likepagecheo/getpost.php",
+        f"{TTC_BASE_URL}/kiemtien/likepagecheo/nhantien.php",
+    ),
+}
+
+TTC_AUTH_URL = f"{TTC_BASE_URL}/logintoken.php"
+TTC_SET_UID_URL = f"{TTC_BASE_URL}/cauhinh/datnick.php"
+
+# =====================================================================
+# Tất cả 7 loại job được hỗ trợ
+# =====================================================================
+
+ALL_JOB_TYPES = list(TTC_ENDPOINTS.keys())
+
+_APPLICATION_JOB_TYPES = {
+    "ttc_like_post_vip_cheo",
+    "ttc_like_post_vip_re",
+    "ttc_reaction_vip_cheo",
+    "ttc_reaction_vip_re",
+    "ttc_comment",
+}
+
+_VIP_JOB_TYPES = {
+    "ttc_like_post_vip_cheo",
+    "ttc_like_post_vip_re",
+    "ttc_reaction_vip_cheo",
+    "ttc_reaction_vip_re",
+}
+
+# =====================================================================
+# Nhóm action_group
+# =====================================================================
+
+ACTION_GROUP_MAP = {
+    "ttc_like_post_vip_cheo": "reaction",
+    "ttc_like_post_vip_re": "reaction",
+    "ttc_reaction_vip_cheo": "reaction",
+    "ttc_reaction_vip_re": "reaction",
+    "ttc_comment": "comment",
+    "ttc_follow": "follow",
+    "ttc_like_page": "page_like",
+}
+
+# Nhóm loại job theo action_group
+ACTION_GROUPS_BLOCKED_BY = {
+    # action_group -> list[job_type] bị ảnh hưởng khi group bị block
+    "reaction": [
+        "ttc_like_post_vip_cheo",
+        "ttc_like_post_vip_re",
+        "ttc_reaction_vip_cheo",
+        "ttc_reaction_vip_re",
+    ],
+    "comment": ["ttc_comment"],
+    "follow": ["ttc_follow"],
+    "page_like": ["ttc_like_page"],
+}
+
+# =====================================================================
+# Reaction type mapping TTC -> nội bộ
+# =====================================================================
+
+VALID_REACTIONS = {"LIKE", "LOVE", "CARE", "HAHA", "WOW", "SAD", "ANGRY"}
+
+
+def _strict_required_text(value, field_name: str) -> str:
+    """Validate one required external text field without scalar coercion."""
+    if not isinstance(value, str):
+        raise ValueError(f"invalid {field_name} type={type(value).__name__}")
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"missing {field_name}")
+    return normalized
+
+
+def normalize_reaction_type(raw: str) -> str:
+    """Chuẩn hóa reaction type từ dữ liệu TTC về dạng nội bộ.
+
+    TTC trả về loaicx như: LIKE, LOVE, CARE, HAHA, WOW, SAD, ANGRY.
+    Trả về chuỗi rỗng nếu giá trị không được hỗ trợ.
+    """
+    if not isinstance(raw, str):
+        return ""
+    value = raw.strip()
+    if not value:
+        return ""
+    upper = value.upper()
+    if upper in VALID_REACTIONS:
+        return upper
+    return ""
+
+
+# =====================================================================
+# Normalize job type
+# =====================================================================
+
+def normalize_job_type(job_type: str) -> str:
+    """Xác minh job_type hợp lệ, trả về chuỗi gốc nếu OK."""
+    if job_type in ALL_JOB_TYPES:
+        return job_type
+    return ""
+
+
+def get_action_group(job_type: str) -> str:
+    """Lấy action_group từ job_type nội bộ."""
+    return ACTION_GROUP_MAP.get(job_type, "unknown")
+
+
+def get_endpoint_urls(job_type: str):
+    """Lấy (get_url, claim_url) theo job_type.
+
+    Raises KeyError nếu job_type không hợp lệ.
+    """
+    return TTC_ENDPOINTS[job_type]
+
+
+# =====================================================================
+# Tạo job_key xác định, ổn định, không trùng giữa endpoint
+# =====================================================================
+
+def make_job_key(job_type: str, idpost: str, reaction_type: str = "") -> str:
+    """Tạo job key duy nhất.
+
+    Format: <job_type>:<idpost>[:<reaction_type>]
+    Không dùng riêng idpost vì hai endpoint có thể trả cùng id.
+    """
+    parts = [str(job_type), str(idpost or "")]
+    if reaction_type:
+        parts.append(str(reaction_type).upper())
+    return ":".join(parts)
+
+
+# =====================================================================
+# Parse comment text từ trường nd của TTC
+# =====================================================================
+
+_UNICODE_ESCAPE_RE = re.compile(r"(?:\\u[0-9a-fA-F]{4})+")
+_PERCENT_ESCAPE_RE = re.compile(r"%[0-9a-fA-F]{2}")
+
+
+def _unwrap_ttc_comment_container(value: str, max_depth=3) -> str:
+    """Unwrap only whole valid JSON string/array representations."""
+    current = value
+    for _ in range(max_depth):
+        if isinstance(current, list):
+            selected = next(
+                (
+                    item
+                    for item in current
+                    if isinstance(item, str) and item.strip()
+                ),
+                "",
+            )
+            current = selected
+            continue
+
+        if not isinstance(current, str):
+            return ""
+
+        try:
+            decoded = json.loads(current)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            break
+        if isinstance(decoded, (str, list)):
+            current = decoded
+            continue
+        break
+
+    return current if isinstance(current, str) else ""
+
+
+def _decode_literal_unicode_escapes(value: str) -> str:
+    def replace(match):
+        try:
+            return json.loads(f'"{match.group(0)}"')
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return match.group(0)
+
+    return _UNICODE_ESCAPE_RE.sub(replace, value)
+
+
+def parse_ttc_comment_text(nd: str) -> str:
+    """Decode TTC Comment wrappers/escapes without rewriting its semantics."""
+    if not isinstance(nd, str) or not nd:
+        return ""
+
+    text = _unwrap_ttc_comment_container(nd)
+    text = _repair_mojibake_if_needed(text)
+
+    for _ in range(2):
+        decoded = html.unescape(text)
+        if decoded == text:
+            break
+        text = decoded
+
+    text = _unwrap_ttc_comment_container(text)
+    text = _decode_literal_unicode_escapes(text)
+
+    if _PERCENT_ESCAPE_RE.search(text):
+        try:
+            text = unquote(text, encoding="utf-8", errors="strict")
+        except UnicodeDecodeError:
+            pass
+
+    return unicodedata.normalize("NFC", text).strip()
+
+
+# =====================================================================
+# Normalize raw TTC job -> schema nội bộ
+# =====================================================================
+
+def normalize_object_id(object_id):
+    """Chuẩn hóa ID Facebook từ URL hoặc ID thô."""
+    from urllib.parse import parse_qs, urlparse
+
+    if not isinstance(object_id, str):
+        return ""
+    value = object_id.strip()
+    if not value:
+        return ""
+
+    parsed = urlparse(value if "://" in value else "https://facebook.com/" + value.lstrip("/"))
+    query = parse_qs(parsed.query)
+    for key in ("story_fbid", "fbid", "v", "id"):
+        if query.get(key):
+            return str(query[key][0]).strip()
+
+    path = parsed.path.strip("/")
+    if not path:
+        return value
+
+    parts = [part for part in path.split("/") if part]
+    for marker in ("posts", "videos", "reel", "reels", "permalink"):
+        if marker in parts:
+            index = parts.index(marker)
+            if index + 1 < len(parts):
+                return parts[index + 1].split("?")[0].strip()
+
+    numbers = re.findall(r"\d{6,}", path)
+    if numbers:
+        return numbers[-1]
+    return path
+
+
+_normalize_object_id_impl = normalize_object_id
+
+
+def normalize_job(job_type: str, raw_data: dict) -> dict:
+    """Chuyển raw job TTC về schema nội bộ duy nhất.
+
+    Args:
+        job_type: Một trong ALL_JOB_TYPES.
+        raw_data: Dict thô từ API TTC.
+
+    Returns:
+        Dict schema nội bộ, luôn có đủ các key quan trọng.
+
+    Raises:
+        TypeError: Raw job không phải dictionary.
+        ValueError: Job thiếu dữ liệu cần để execute hoặc claim.
+    """
+    if not isinstance(raw_data, dict):
+        raise TypeError("job must be a dict")
+
+    application_job = job_type in _APPLICATION_JOB_TYPES
+    raw_idpost = raw_data.get("idpost")
+    raw_link = raw_data.get("link")
+    if application_job:
+        idpost = _strict_required_text(raw_idpost, "idpost")
+        if raw_link is None:
+            raise ValueError("missing object_id")
+        link = _strict_required_text(raw_link, "link")
+    else:
+        idpost = raw_idpost.strip() if isinstance(raw_idpost, str) else ""
+        link = raw_link.strip() if isinstance(raw_link, str) else ""
+    action_group = get_action_group(job_type)
+
+    # Supported application jobs keep claim ID and executor target independent.
+    object_id = _normalize_object_id_impl(link) if link else ""
+    if application_job and not object_id:
+        raise ValueError("missing object_id")
+    if not object_id:
+        object_id = idpost
+    if not object_id:
+        return {}
+
+    # Reaction type (chỉ dùng cho reaction group)
+    reaction_type = ""
+    if action_group == "reaction":
+        # LIKE_POST là hành động LIKE theo contract, không phụ thuộc loaicx.
+        if job_type in ("ttc_like_post_vip_cheo", "ttc_like_post_vip_re"):
+            reaction_type = "LIKE"
+        else:
+            reaction_type = normalize_reaction_type(raw_data.get("loaicx"))
+            if not reaction_type:
+                raise ValueError("missing/unsupported loaicx")
+
+    # Comment text
+    comment_text = ""
+    if action_group == "comment":
+        comment_text = parse_ttc_comment_text(raw_data.get("nd"))
+        if not comment_text:
+            raise ValueError("missing comment_text")
+
+    # job_key
+    job_key = make_job_key(job_type, idpost, reaction_type)
+
+    # buff_id dùng làm alias tương thích với JobQueue hiện có
+    buff_id = job_key
+
+    return {
+        "job_id": job_key,
+        "buff_id": buff_id,          # alias tương thích JobQueue
+        "type": job_type,
+        "action_group": action_group,
+        "object_id": object_id,
+        "link": link,
+        "reaction_type": reaction_type,
+        "comment_text": comment_text,
+        "ttc_source": job_type,
+        "idpost": idpost,            # giữ để gọi nhantien.php
+        "raw_data": dict(raw_data),  # debug only, không để GUI phụ thuộc
+    }
+
+
+def normalize_jobs_list(job_type: str, raw_list: list) -> list:
+    """Normalize danh sách raw jobs, fail closed nếu có job không hợp lệ."""
+    result = []
+    for index, raw in enumerate(raw_list):
+        try:
+            job = normalize_job(job_type, raw)
+        except (KeyError, TypeError, ValueError) as exc:
+            reason = str(exc).strip()
+            if reason == "missing/unsupported loaicx":
+                raise TTCResponseError(
+                    f"[TTC] Malformed TTC reaction job at index {index}: {reason}."
+                ) from exc
+            if not any(reason == allowed or reason.startswith(allowed + " type=") for allowed in {
+                "job must be a dict",
+                "missing idpost",
+                "invalid idpost",
+                "missing object_id",
+                "invalid object_id",
+                "missing link",
+                "invalid link",
+                "missing comment_text",
+            }):
+                reason = "invalid normalized fields"
+            type_name = getattr(job_type, "value", job_type)
+            raise TTCResponseError(
+                f"[TTC] Malformed TTC job at index {index} "
+                f"({type_name}): {reason}."
+            ) from exc
+        if not isinstance(job, dict) or not job:
+            raise TTCResponseError(f"[TTC] Malformed TTC job at index {index}.")
+        result.append(job)
+    return result
+
+
+def normalize_delay_range(min_delay, max_delay):
+    """Chuẩn hóa cặp delay (min, max) về giá trị hợp lệ."""
+    try:
+        min_delay = int(min_delay)
+        max_delay = int(max_delay)
+    except (TypeError, ValueError):
+        return 5, 15
+    if min_delay < 0 or max_delay < 0:
+        return 5, 15
+    if min_delay > max_delay:
+        min_delay, max_delay = max_delay, min_delay
+    min_delay = min(min_delay, 3600)
+    max_delay = min(max_delay, 3600)
+    return min_delay, max_delay
+
+@dataclass
+class TTCClaimResult:
+    success: bool
+    reason: str
+    message: str
+    earned_coin: int = 0
+    balance: int | None = None
+    http_status: int | None = None
+    retryable: bool = False
+    endpoint_key: str = ""
+    evidence: str = ""
+    response_kind: str = ""
+    response_keys: tuple[str, ...] = ()
+    raw_summary: str = ""
+    server_raw_text: str = ""
+    content_type: str = ""
+
+    def to_dict(self):
+        return {
+            "success": self.success,
+            "reason": self.reason,
+            "message": self.message,
+            "earned_coin": self.earned_coin,
+            "balance": self.balance,
+            "http_status": self.http_status,
+            "retryable": self.retryable,
+            "endpoint_key": self.endpoint_key,
+            "evidence": self.evidence,
+            "response_kind": self.response_kind,
+            "response_keys": self.response_keys,
+            "raw_summary": self.raw_summary,
+            "server_raw_text": self.server_raw_text,
+            "content_type": self.content_type,
+        }
+
+logger = logging.getLogger(__name__)
+
+# =====================================================================
+# Custom exceptions
+# =====================================================================
+
+
+class TTCError(Exception):
+    """Base TTC error with immutable response evidence when HTTP completed."""
+
+    def __init__(
+        self,
+        message="",
+        *,
+        job_type="",
+        endpoint="",
+        server_raw_text="",
+        server_text="",
+        http_status=None,
+        content_type="",
+    ):
+        super().__init__(message)
+        self.job_type = job_type
+        self.endpoint = endpoint
+        self.server_raw_text = server_raw_text
+        self.server_text = server_text
+        self.http_status = http_status
+        self.content_type = content_type
+
+
+class TTCAuthError(TTCError):
+    """Token TTC khÃ´ng há»£p lá»‡ hoáº·c Ä‘Ã£ háº¿t háº¡n."""
+
+
+class TTCNoJobAvailable(TTCError):
+    """Endpoint khÃ´ng cÃ³ job nÃ o phÃ¹ há»£p (khÃ´ng pháº£i lá»—i API tháº­t)."""
+
+    def __init__(self, message="", countdown=0, **metadata):
+        super().__init__(message, **metadata)
+        self.ttc_message = message
+        parsed_countdown = _parse_strict_integer(countdown)
+        self.countdown = max(0, parsed_countdown) if parsed_countdown is not None else 0
+
+
+class TTCRateLimitError(TTCError):
+    """Server TTC Ä‘ang rate limit request."""
+
+
+class TTCVipIneligibleError(TTCError):
+    """Facebook UID is not eligible for TTC VIP jobs."""
+
+
+class TTCResponseError(TTCError):
+    """Response khÃ´ng Ä‘Ãºng format hoáº·c HTTP lá»—i."""
+
+
+class TTCJobCooldown(TTCError):
+    """One exact TTC job endpoint must wait before it can be fetched again."""
+
+    def __init__(self, message="", retry_after=0, **metadata):
+        super().__init__(message, **metadata)
+        parsed = _parse_strict_integer(retry_after)
+        self.retry_after = max(0, parsed) if parsed is not None else 0
+
+
+# =====================================================================
+# Helpers ná»™i bá»™
+# =====================================================================
+
+_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/114.0.0.0 Safari/537.36"
+)
+
+_HEADERS_BASE = {
+    "User-Agent": _UA,
+    "x-requested-with": "XMLHttpRequest",
+    "content-type": "application/x-www-form-urlencoded",
+}
+
+
+def _mask_token(token: str) -> str:
+    """Che token, chá»‰ log hash ngáº¯n."""
+    if not token or len(token) < 8:
+        return "***"
+    h = hashlib.sha256(token.encode("utf-8")).hexdigest()[:8]
+    return f"***[hash:{h}]"
+
+
+_SENSITIVE_FIELD_RE = re.compile(
+    r"(?i)\b(access_token|authorization|cookie|session|token|password|pass|auth)\b\s*[:=]\s*"
+    r"(\"[^\"]*\"|'[^']*'|[^\s,;&<>]+)"
+)
+_MOJIBAKE_MARKERS = (
+    "Ãƒ", "Ã‚", "Ã„", "Ã¡Âº", "Ã¡Â»", "chÃƒ", "Ã„â€˜", "Ã†", "Ã",
+    "Â", "â€", "â€™", "â€œ", "â€�", "ðŸ", "ï¿½",
+)
+
+
+def _mask_sensitive_text(value: str) -> str:
+    text = str(value or "")
+    text = _SENSITIVE_FIELD_RE.sub(lambda m: f"{m.group(1)}=***", text)
+    text = re.sub(r"(?i)(access_token|cookie|session|token)=\S+", r"\1=***", text)
+    return text
+
+
+def _mojibake_score(text: str) -> int:
+    value = str(text or "")
+    marker_score = sum(value.count(marker) for marker in _MOJIBAKE_MARKERS)
+    replacement_score = value.count("\ufffd") * 4
+    control_score = sum(
+        2
+        for char in value
+        if unicodedata.category(char) == "Cc" and char not in "\n\r\t"
+    )
+    return marker_score + replacement_score + control_score
+
+
+def _repair_mojibake_if_needed(text: str) -> str:
+    current = str(text or "")
+    if _mojibake_score(current) <= 0:
+        return current
+    best = current
+    best_score = _mojibake_score(best)
+    for _ in range(2):
+        candidates = []
+        for source_encoding in ("latin-1", "cp1252"):
+            try:
+                candidates.append(best.encode(source_encoding).decode("utf-8"))
+            except UnicodeError:
+                continue
+        improved = False
+        for candidate in candidates:
+            score = _mojibake_score(candidate)
+            if score < best_score:
+                best = candidate
+                best_score = score
+                improved = True
+        if not improved:
+            break
+    return best
+
+
+def _charset_from_content_type(content_type: str) -> str:
+    match = re.search(r"charset\s*=\s*([^\s;]+)", str(content_type or ""), flags=re.I)
+    return match.group(1).strip("\"'") if match else ""
+
+
+def _decode_response_body(response):
+    """Decode TTC response bytes with UTF-8-first fallback and controlled mojibake repair."""
+    headers = getattr(response, "headers", {}) or {}
+    content_type = headers.get("content-type", "") or headers.get("Content-Type", "")
+    raw = getattr(response, "content", b"") or b""
+    if not isinstance(raw, (bytes, bytearray)):
+        raw = b""
+    if not raw and getattr(response, "text", None) is not None:
+        raw = str(response.text or "").encode("utf-8", errors="replace")
+
+    candidates = []
+    charset = _charset_from_content_type(content_type)
+    response_encoding = str(getattr(response, "encoding", "") or "")
+    apparent_encoding = str(getattr(response, "apparent_encoding", "") or "")
+    for enc in ("utf-8", charset, response_encoding, apparent_encoding, "latin-1"):
+        enc_norm = str(enc or "").strip()
+        if not enc_norm:
+            continue
+        if enc_norm.lower() == "iso-8859-1" and not charset:
+            continue
+        if enc_norm.lower() not in [item.lower() for item in candidates]:
+            candidates.append(enc_norm)
+
+    decoded = ""
+    best_score = None
+    best_encoding = ""
+    for enc in candidates or ["utf-8"]:
+        try:
+            text = bytes(raw).decode(enc, errors="replace")
+        except LookupError:
+            continue
+        repaired = _repair_mojibake_if_needed(text)
+        score = _mojibake_score(repaired)
+        if best_score is None or score < best_score:
+            decoded = repaired
+            best_score = score
+            best_encoding = enc
+        if score == 0 and enc.lower().replace("_", "-") == "utf-8":
+            break
+
+    if not decoded and getattr(response, "text", None) is not None:
+        decoded = _repair_mojibake_if_needed(response.text or "")
+        best_encoding = "response.text"
+
+    return decoded, {
+        "content_type": content_type,
+        "encoding": best_encoding,
+        "charset": charset,
+        "raw_size": len(raw),
+        "mojibake_score": _mojibake_score(decoded),
+    }
+
+
+def _safe_json(response, label="response", allow_plain_text=False):
+    """Parse JSON from decoded body; optionally return plain text for claim diagnostics."""
+    decoded_text, _meta = _decode_response_body(response)
+    try:
+        return json.loads(decoded_text)
+    except Exception as e:
+        if allow_plain_text:
+            return decoded_text
+        snippet = _safe_display_message(decoded_text, limit=200)
+        raise TTCResponseError(
+            f"[TTC] {label}: Không parse được JSON. "
+            f"Status={response.status_code}. Snippet: {snippet!r}"
+        ) from e
+
+
+def _parse_earned_coin(message: str) -> int:
+    """Parse sá»‘ xu kiáº¿m Ä‘Æ°á»£c tá»« message TTC.
+
+    Há»— trá»£ dáº¥u cháº¥m vÃ  dáº¥u pháº©y trong sá»‘ (vd: 1.000, 1,000).
+    """
+    if not message:
+        return 0
+    # TÃ¬m pattern "cá»™ng <sá»‘> xu" hoáº·c "cá»™ng <sá»‘>xu"
+    # Sá»‘ cÃ³ thá»ƒ chá»©a dáº¥u . hoáº·c , ngÄƒn cÃ¡ch hÃ ng nghÃ¬n
+    folded = _strip_accents(message).casefold()
+    match = re.search(r"cong\s+([\d.,]+)\s*xu", folded, flags=re.IGNORECASE | re.UNICODE)
+    if not match:
+        match = re.search(r"c\S*ng\s+([\d.,]+)\s*xu", str(message or "").lower(), flags=re.IGNORECASE | re.UNICODE)
+    if not match:
+        # Thá»­ tÃ¬m sá»‘ ngay sau "cá»™ng "
+        match = re.search(r"cong\s+([\d.,]+)", folded, flags=re.IGNORECASE | re.UNICODE)
+    if not match:
+        match = re.search(r"c\S*ng\s+([\d.,]+)", str(message or "").lower(), flags=re.IGNORECASE | re.UNICODE)
+    if not match:
+        return 0
+    raw_num = match.group(1).replace(",", "").replace(".", "")
+    try:
+        return int(raw_num)
+    except ValueError:
+        return 0
+
+
+def _parse_countdown(data) -> int:
+    """Láº¥y giÃ¡ trá»‹ countdown tá»« response dict."""
+    if not isinstance(data, dict):
+        return 0
+    for key in ("countdown", "time", "wait"):
+        if key in data:
+            parsed = _parse_strict_integer(data.get(key))
+            return max(0, parsed) if parsed is not None else 0
+    return 0
+
+
+def _parse_strict_integer(value):
+    """Return an integer only for int (not bool) or integer-like text."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
+        return int(value.strip())
+    return None
+
+
+def _extract_message(data) -> str:
+    """Extract only evidenced text message shapes from TTC responses."""
+    if isinstance(data, str):
+        return data.strip()
+    if not isinstance(data, dict):
+        return ""
+    for key in ("mess", "message", "msg", "notice", "status_text", "text"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    nested = data.get("data")
+    if isinstance(nested, (dict, str)):
+        message = _extract_message(nested)
+        if message:
+            return message
+    return ""
+
+
+def _strip_accents(value: str) -> str:
+    normalized = unicodedata.normalize("NFD", str(value or ""))
+    stripped = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+    return stripped.replace("đ", "d").replace("Đ", "D")
+
+
+def _safe_display_message(message: str, limit: int = 240) -> str:
+    text = html.unescape(_repair_mojibake_if_needed(str(message or "")))
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = _mask_sensitive_text(text)
+    text = " ".join(text.split())
+    if len(text) > limit:
+        text = text[: limit - 3] + "..."
+    return text
+
+
+def _is_vip_ineligible_message(message: str) -> bool:
+    normalized = " ".join(str(message or "").casefold().split())
+    return "chưa đủ điều kiện làm nhiệm vụ vip" in normalized
+
+
+def _job_cooldown_seconds(message: str) -> int:
+    """Match only the observed TTC 'Lấy nhiệm vụ sau <N> giây' contract."""
+    normalized = " ".join(_strip_accents(str(message or "")).casefold().split())
+    match = re.search(r"\blay nhiem vu sau\s+(\d+)\s+giay\b", normalized)
+    return int(match.group(1)) if match else 0
+
+
+def _server_evidence_message(summary, job_type, server_raw_text, classification):
+    return (
+        f"{summary}\n"
+        f"[TTC SERVER][{job_type}]\n{server_raw_text}\n"
+        f"[TTC CLASS]\n{classification}"
+    )
+
+
+def _fetch_semantic_text(data) -> str:
+    parts = [_extract_message(data)]
+    if isinstance(data, dict):
+        error_value = data.get("error")
+        if isinstance(error_value, str):
+            parts.append(error_value.strip())
+        elif isinstance(error_value, (dict, list)):
+            parts.append(_extract_message(error_value))
+    return " ".join(part for part in parts if part)
+
+
+def _response_kind_and_keys(data):
+    if isinstance(data, dict):
+        data_type = "dict"
+        keys = tuple(str(k) for k in list(data.keys())[:12])
+    elif isinstance(data, list):
+        data_type = "list"
+        keys = (f"len={len(data)}",)
+    elif isinstance(data, str):
+        stripped = data.strip()
+        data_type = "html" if stripped.startswith("<") and re.search(r"(?i)<\s*(html|!doctype|body)\b", stripped[:200]) else ("empty" if not stripped else "text")
+        keys = ()
+    else:
+        data_type = type(data).__name__
+        keys = ()
+    return data_type, keys
+
+
+def _summarize_claim_response(data, response_text="", http_status=None, content_type="", endpoint_key="", idpost="", loaicx="") -> str:
+    data_type, keys_tuple = _response_kind_and_keys(data)
+    keys = ",".join(keys_tuple)
+    snippet = _safe_display_message(response_text, limit=300)
+    return (
+        f"endpoint={endpoint_key or ''} | idpost={idpost or ''} | loaicx={loaicx or ''} "
+        f"| http={http_status} | content_type={content_type or ''} "
+        f"| response_kind={data_type} | keys={keys or '-'} | raw_summary={snippet or '-'}"
+    )
+
+
+def _dict_success_flag(data) -> bool:
+    if not isinstance(data, dict):
+        return False
+    for key in ("success", "status", "ok"):
+        value = data.get(key)
+        if value is True:
+            return True
+        if isinstance(value, str) and value.strip().casefold() in ("true", "ok", "success", "1"):
+            return True
+    nested = data.get("data")
+    return _dict_success_flag(nested) if isinstance(nested, dict) else False
+
+
+_SUCCESS_STATUS_VALUES = {"true", "ok", "success", "1"}
+_FAILURE_STATUS_VALUES = {"false", "fail", "failed", "error", "rejected", "0"}
+
+
+def _has_meaningful_error_value(value) -> bool:
+    if value is None or value is False:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().casefold() not in ("", "0", "false", "none", "null")
+    if isinstance(value, dict):
+        return any(_has_meaningful_error_value(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_has_meaningful_error_value(item) for item in value)
+    return True
+
+
+def _dict_failure_flag(data) -> bool:
+    """Detect explicit failure in any structured response branch."""
+    if isinstance(data, list):
+        return any(_dict_failure_flag(item) for item in data)
+    if not isinstance(data, dict):
+        return False
+
+    if "error" in data and _has_meaningful_error_value(data.get("error")):
+        return True
+
+    for key in ("success", "ok", "status"):
+        if key not in data:
+            continue
+        value = data.get(key)
+        if value is False:
+            return True
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value == 0:
+            return True
+        if isinstance(value, str) and value.strip().casefold() in _FAILURE_STATUS_VALUES:
+            return True
+
+    return any(
+        _dict_failure_flag(value)
+        for value in data.values()
+        if isinstance(value, (dict, list))
+    )
+
+
+def _dict_unknown_result_flag(data) -> bool:
+    """Reject structured result flags whose semantics are not recognized."""
+    if isinstance(data, list):
+        return any(_dict_unknown_result_flag(item) for item in data)
+    if not isinstance(data, dict):
+        return False
+
+    for key in ("success", "ok", "status"):
+        if key not in data:
+            continue
+        value = data.get(key)
+        if value is True or value is False:
+            continue
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value == 0:
+            continue
+        if isinstance(value, str):
+            folded = value.strip().casefold()
+            if folded in _SUCCESS_STATUS_VALUES or folded in _FAILURE_STATUS_VALUES:
+                continue
+        return True
+
+    return any(
+        _dict_unknown_result_flag(value)
+        for value in data.values()
+        if isinstance(value, (dict, list))
+    )
+
+
+def _classify_claim_response(
+    data,
+    message: str,
+    http_status=None,
+    endpoint_key="",
+    evidence="",
+    raw_summary="",
+    server_raw_text="",
+    content_type="",
+) -> TTCClaimResult:
+    clean_message = _safe_display_message(message)
+    folded = _strip_accents(clean_message).casefold()
+    response_kind, response_keys = _response_kind_and_keys(data)
+    success_flag = _dict_success_flag(data)
+    failure_flag = _dict_failure_flag(data)
+    unknown_result_flag = _dict_unknown_result_flag(data)
+    parsed_coin = _parse_earned_coin(clean_message)
+    has_success_text = "thanh cong" in folded or re.search(r"cong\s+[\d.,]+\s*xu", folded) or parsed_coin > 0
+    has_error_text = any(
+        marker in folded
+        for marker in (
+            "that bai", "loi", "khong thanh cong", "chua", "khong tim thay",
+            "het han", "dang nhap", "huy", "sai", "invalid",
+            "error", "failed", "failure", "rejected",
+        )
+    )
+    kwargs = {
+        "http_status": http_status,
+        "endpoint_key": endpoint_key,
+        "evidence": evidence,
+        "response_kind": response_kind,
+        "response_keys": response_keys,
+        "raw_summary": _safe_display_message(raw_summary or evidence, limit=300),
+        "server_raw_text": server_raw_text,
+        "content_type": content_type,
+    }
+    if response_kind == "html":
+        return TTCClaimResult(
+            False,
+            "INVALID_RESPONSE",
+            clean_message or "TTC trả về HTML thay vì dữ liệu claim",
+            retryable=False,
+            **kwargs,
+        )
+    if any(marker in folded for marker in ("chua lam", "chua tuong tac", "chua xac nhan", "chua thay", "not observed")):
+        return TTCClaimResult(False, "NOT_OBSERVED_YET", clean_message, retryable=True, **kwargs)
+    if any(marker in folded for marker in ("da nhan", "da duoc nhan", "already")):
+        return TTCClaimResult(False, "ALREADY_CLAIMED", clean_message, retryable=False, **kwargs)
+    if any(marker in folded for marker in ("dang nhap", "vui long dang nhap", "het han", "login", "unauthorized", "auth")):
+        return TTCClaimResult(False, "AUTH_EXPIRED", clean_message, retryable=False, **kwargs)
+    if any(marker in folded for marker in ("rate limit", "qua nhanh", "thu lai sau", "cho")):
+        return TTCClaimResult(False, "RATE_LIMITED", clean_message, retryable=True, **kwargs)
+    if any(marker in folded for marker in ("id", "job", "nhiem vu", "khong ton tai", "huy")):
+        return TTCClaimResult(False, "INVALID_JOB", clean_message, retryable=False, **kwargs)
+    if failure_flag or has_error_text:
+        return TTCClaimResult(
+            False,
+            "TTC_REJECTED",
+            clean_message or "TTC returned an explicit structured failure",
+            retryable=False,
+            **kwargs,
+        )
+    if unknown_result_flag:
+        return TTCClaimResult(
+            False,
+            "UNKNOWN_RESPONSE",
+            clean_message or "TTC returned an unknown structured result flag",
+            retryable=False,
+            **kwargs,
+        )
+    if success_flag or has_success_text:
+        return TTCClaimResult(True, "SUCCESS", clean_message, parsed_coin, **kwargs)
+    if not clean_message:
+        return TTCClaimResult(
+            False,
+            "UNKNOWN_RESPONSE",
+            "TTC không trả về thông báo nhận diện được",
+            retryable=False,
+            **kwargs,
+        )
+    return TTCClaimResult(False, "TTC_REJECTED", clean_message, retryable=False, **kwargs)
+
+
+# =====================================================================
+# TTCClient
+# =====================================================================
+
+
+class TTCClient:
+    """HTTP client TTC cho má»™t worker.
+
+    Má»—i worker táº¡o má»™t instance riÃªng â€” khÃ´ng chia sáº» session/cookie.
+    """
+
+    def __init__(self, worker_id="?", log_fn=None):
+        """
+        Args:
+            worker_id: ID worker dÃ¹ng Ä‘á»ƒ prefix log.
+            log_fn: callable(message, level) hoáº·c None (dÃ¹ng print).
+        """
+        self.worker_id = str(worker_id)
+        self._log_fn = log_fn
+        self._session = self._create_session()
+        self._token = ""
+        self._user = ""
+        self._initial_balance = None
+        self._authenticated = False
+        self._configured_facebook_uid = None
+
+    # ------------------------------------------------------------------
+    # Session management
+    # ------------------------------------------------------------------
+
+    def _create_session(self):
+        if _HAS_CLOUDSCRAPER:
+            return cloudscraper.create_scraper()
+        return requests.Session()
+
+    def _log(self, message: str, level: str = "api"):
+        if self._log_fn:
+            self._log_fn(message, level)
+        else:
+            print(f"[TTC Worker #{self.worker_id}] [{level.upper()}] {message}")
+
+    def _headers(self) -> dict:
+        return dict(_HEADERS_BASE)
+
+    # ------------------------------------------------------------------
+    # authenticate()
+    # ------------------------------------------------------------------
+
+    def authenticate(self, token: str) -> None:
+        """ÄÄƒng nháº­p TTC báº±ng access_token.
+
+        Args:
+            token: TTC token (khÃ´ng log Ä‘áº§y Ä‘á»§).
+
+        Raises:
+            TTCAuthError: Token sai hoáº·c response khÃ´ng há»£p lá»‡.
+            TTCResponseError: Response khÃ´ng parse Ä‘Æ°á»£c.
+            TTCRateLimitError: Rate limit tá»« server.
+        """
+        self._token = ""
+        self._user = ""
+        self._initial_balance = None
+        self._authenticated = False
+        self._configured_facebook_uid = None
+
+        cookies = getattr(self._session, "cookies", None)
+        clear_cookies = getattr(cookies, "clear", None)
+        if callable(clear_cookies):
+            try:
+                clear_cookies()
+            except Exception as exc:
+                raise TTCResponseError(
+                    "[TTC] Cannot clear stale session cookies before authentication."
+                ) from exc
+
+        if not token or not str(token).strip():
+            raise TTCAuthError("[TTC] Token rỗng, không thể đăng nhập.")
+
+        token_value = str(token).strip()
+        masked = _mask_token(token_value)
+        self._log(f"Đang đăng nhập TTC với token {masked}...", "auth")
+
+        try:
+            resp = self._session.post(
+                TTC_AUTH_URL,
+                data={"access_token": token_value},
+                headers=self._headers(),
+                timeout=15,
+            )
+        except requests.exceptions.Timeout as e:
+            raise TTCResponseError(f"[TTC] Timeout khi đăng nhập: {e}") from e
+        except requests.exceptions.RequestException as e:
+            raise TTCResponseError(f"[TTC] Lỗi mạng khi đăng nhập: {e}") from e
+
+        if resp.status_code == 429:
+            raise TTCRateLimitError("[TTC] Server TTC đang rate limit.")
+        if resp.status_code >= 500:
+            raise TTCResponseError(
+                f"[TTC] Server TTC lỗi {resp.status_code} khi đăng nhập."
+            )
+        if resp.status_code >= 400:
+            raise TTCAuthError(
+                f"[TTC] HTTP {resp.status_code} khi đăng nhập. Token có thể sai."
+            )
+
+        data = _safe_json(resp, "authenticate")
+
+        raw_data = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(raw_data, dict):
+            raise TTCAuthError(
+                f"[TTC] Authentication response field 'data' must be an object; "
+                f"received {type(raw_data).__name__}."
+            )
+
+        user_field = "user" if "user" in raw_data else "username"
+        try:
+            user = _strict_required_text(raw_data.get(user_field), user_field)
+        except ValueError as exc:
+            raise TTCAuthError(
+                f"[TTC] Authentication response field '{user_field}' must be non-empty text."
+            ) from exc
+
+        if "sodu" not in raw_data or raw_data["sodu"] is None:
+            raise TTCResponseError(
+                "[TTC] Authentication response is missing required field 'sodu'."
+            )
+
+        balance = _parse_strict_integer(raw_data["sodu"])
+        if balance is None:
+            raise TTCResponseError(
+                "[TTC] Authentication response field 'sodu' is not a valid integer."
+            )
+
+        self._token = token_value
+        self._user = user
+        self._initial_balance = balance
+        self._authenticated = True
+
+        self._log(
+            f"Đăng nhập TTC thành công. User: {self._user} | Số dư: {balance} xu",
+            "auth",
+        )
+
+    # ------------------------------------------------------------------
+    # configure_facebook_uid()
+    # ------------------------------------------------------------------
+
+    def configure_facebook_uid(self, uid: str) -> None:
+        """Äáº·t UID Facebook cho tÃ i khoáº£n TTC.
+
+        Chá»‰ gá»i sau khi authenticate() thÃ nh cÃ´ng.
+
+        Raises:
+            TTCAuthError: ChÆ°a Ä‘Äƒng nháº­p.
+            TTCResponseError: Request lá»—i hoáº·c server khÃ´ng xÃ¡c nháº­n.
+        """
+        if not self._authenticated:
+            raise TTCAuthError("[TTC] Chưa đăng nhập trước khi đặt UID.")
+
+        # A new configuration attempt invalidates the previous binding until
+        # TTC confirms this UID with the observed exact response contract.
+        self._configured_facebook_uid = None
+        try:
+            uid = _strict_required_text(uid, "Facebook UID")
+        except ValueError as exc:
+            raise ValueError("[TTC] UID Facebook phải là chuỗi không rỗng.") from exc
+        self._log(f"Đang đặt UID Facebook TTC: uid={uid}", "auth")
+
+        try:
+            resp = self._session.post(
+                TTC_SET_UID_URL,
+                headers=self._headers(),
+                data={
+                    "iddat[]": uid,
+                    "loai": "fb",
+                },
+                timeout=15,
+            )
+        except requests.exceptions.Timeout as e:
+            raise TTCResponseError(f"[TTC] Timeout khi đặt UID: {e}") from e
+        except requests.exceptions.RequestException as e:
+            raise TTCResponseError(f"[TTC] Lỗi mạng khi đặt UID: {e}") from e
+
+        if resp.status_code == 401 or resp.status_code == 403:
+            raise TTCAuthError(
+                f"[TTC] HTTP {resp.status_code}: Phiên đăng nhập có thể đã hết hạn khi đặt UID."
+            )
+        if resp.status_code == 429:
+            raise TTCRateLimitError("[TTC] Server TTC rate limit khi đặt UID Facebook.")
+        if resp.status_code >= 500:
+            raise TTCResponseError(
+                f"[TTC] Server TTC lỗi {resp.status_code} khi đặt UID Facebook."
+            )
+        if resp.status_code >= 400:
+            raise TTCResponseError(
+                f"[TTC] HTTP {resp.status_code} khi đặt UID Facebook."
+            )
+
+        body = (resp.text or "").strip()
+        if body != "1":
+            raise TTCResponseError(
+                f"[TTC] Server không xác nhận UID Facebook. Response: {body[:200]!r}"
+            )
+
+        self._configured_facebook_uid = uid
+        self._log(f"Đã đặt UID Facebook: uid={uid}.", "auth")
+
+    # ------------------------------------------------------------------
+    # get_account_info()
+    # ------------------------------------------------------------------
+
+    def get_account_info(self) -> dict:
+        """Láº¥y thÃ´ng tin user vÃ  sá»‘ dÆ° tá»« session hiá»‡n táº¡i."""
+        return {
+            "user": self._user,
+            "balance": self._initial_balance,
+            "authenticated": self._authenticated,
+        }
+
+    # ------------------------------------------------------------------
+    # fetch_jobs()
+    # ------------------------------------------------------------------
+
+    def fetch_jobs(self, job_type: str) -> list:
+        """Láº¥y danh sÃ¡ch job tá»« endpoint TTC.
+
+        Args:
+            job_type: Má»™t trong ALL_JOB_TYPES.
+
+        Returns:
+            List cÃ¡c job Ä‘Ã£ normalize, sáºµn sÃ ng Ä‘Æ°a vÃ o JobQueue.
+
+        Raises:
+            TTCNoJobAvailable: KhÃ´ng cÃ³ job (khÃ´ng pháº£i lá»—i API).
+            TTCAuthError: PhiÃªn Ä‘Ã£ háº¿t háº¡n.
+            TTCRateLimitError: Rate limit.
+            TTCResponseError: Lá»—i HTTP hoáº·c format.
+            ValueError: job_type khÃ´ng há»£p lá»‡.
+        """
+        if not self._authenticated:
+            raise TTCAuthError("[TTC] Chưa đăng nhập trước khi fetch_jobs.")
+        if self._configured_facebook_uid is None:
+            raise TTCResponseError(
+                "[TTC] Chưa có UID Facebook được server xác nhận trước khi fetch_jobs."
+            )
+        if job_type not in TTC_ENDPOINTS:
+            raise ValueError(f"[TTC] job_type khÃ´ng há»£p lá»‡: {job_type!r}")
+
+        get_url, _ = TTC_ENDPOINTS[job_type]
+        job_type_key = job_type.value if isinstance(job_type, Enum) else str(job_type)
+
+        try:
+            resp = self._session.get(
+                get_url,
+                headers=self._headers(),
+                timeout=15,
+            )
+        except requests.exceptions.Timeout as e:
+            raise TTCResponseError(
+                f"[TTC] Timeout khi láº¥y job {job_type}: {e}",
+                job_type=job_type_key,
+                endpoint=get_url,
+            ) from e
+        except requests.exceptions.RequestException as e:
+            raise TTCResponseError(
+                f"[TTC] Lá»—i máº¡ng khi láº¥y job {job_type}: {e}",
+                job_type=job_type_key,
+                endpoint=get_url,
+            ) from e
+
+        decoded_text, decode_meta = _decode_response_body(resp)
+        content_type = decode_meta.get("content_type", "")
+        response_metadata = {
+            "job_type": job_type_key,
+            "endpoint": get_url,
+            "server_raw_text": decoded_text,
+            "http_status": resp.status_code,
+            "content_type": content_type,
+        }
+        if resp.status_code == 429:
+            raise TTCRateLimitError(
+                _server_evidence_message(
+                    f"[TTC] Rate limit khi láº¥y job {job_type}.",
+                    job_type_key,
+                    decoded_text,
+                    "RATE_LIMIT",
+                ),
+                **response_metadata,
+            )
+        if resp.status_code == 401 or resp.status_code == 403:
+            raise TTCAuthError(
+                _server_evidence_message(
+                    f"[TTC] HTTP {resp.status_code}: Phiên đăng nhập có thể đã hết hạn.",
+                    job_type_key,
+                    decoded_text,
+                    "AUTH_ERROR",
+                ),
+                **response_metadata,
+            )
+        if resp.status_code >= 500:
+            raise TTCResponseError(
+                _server_evidence_message(
+                    f"[TTC] Server lá»—i {resp.status_code} khi láº¥y job {job_type}.",
+                    job_type_key,
+                    decoded_text,
+                    "RESPONSE_ERROR",
+                ),
+                **response_metadata,
+            )
+        if resp.status_code >= 400:
+            raise TTCResponseError(
+                _server_evidence_message(
+                    f"[TTC] HTTP {resp.status_code} khi láº¥y job {job_type}.",
+                    job_type_key,
+                    decoded_text,
+                    "RESPONSE_ERROR",
+                ),
+                **response_metadata,
+            )
+
+        # Parse fetch responses using the endpoint's fail-closed contract.
+        if not decoded_text.strip():
+            raise TTCResponseError(
+                _server_evidence_message(
+                    f"[TTC] Empty response from {job_type}.",
+                    job_type_key,
+                    decoded_text,
+                    "RESPONSE_ERROR",
+                ),
+                **response_metadata,
+            )
+
+        try:
+            data = json.loads(decoded_text)
+        except Exception:
+            # KhÃ´ng pháº£i JSON â€” cÃ³ thá»ƒ lÃ  HTML lá»—i hoáº·c empty
+            snippet = _safe_display_message(decoded_text, limit=200)
+            raise TTCResponseError(
+                _server_evidence_message(
+                    f"[TTC] Response khÃ´ng pháº£i JSON tá»« {job_type}. Snippet: {snippet!r}",
+                    job_type_key,
+                    decoded_text,
+                    "RESPONSE_ERROR",
+                ),
+                **response_metadata,
+            )
+
+        semantic_text = _fetch_semantic_text(data)
+        # Case 1: List cÃ³ job
+        if (
+            job_type in _VIP_JOB_TYPES
+            and _is_vip_ineligible_message(semantic_text)
+        ):
+            raise TTCVipIneligibleError(
+                _server_evidence_message(
+                    "[TTC] Facebook UID is not eligible for this VIP endpoint.",
+                    job_type_key,
+                    decoded_text,
+                    "VIP_INELIGIBLE",
+                ),
+                server_text=semantic_text,
+                **response_metadata,
+            )
+
+        retry_after = _job_cooldown_seconds(semantic_text)
+        if retry_after > 0:
+            raise TTCJobCooldown(
+                _server_evidence_message(
+                    f"[TTC] Endpoint cooldown while fetching {job_type}.",
+                    job_type_key,
+                    decoded_text,
+                    f"TEMP_COOLDOWN retry_after={retry_after}",
+                ),
+                retry_after=retry_after,
+                server_text=semantic_text,
+                **response_metadata,
+            )
+
+        if isinstance(data, list) and len(data) > 0:
+            jobs = normalize_jobs_list(job_type, data)
+            for job in jobs:
+                job["server_raw_text"] = decoded_text
+                job["http_status"] = resp.status_code
+                job["content_type"] = content_type
+            return jobs
+
+        # Case 2: List rá»—ng
+        if isinstance(data, list) and len(data) == 0:
+            raise TTCNoJobAvailable(
+                f"[TTC] KhÃ´ng cÃ³ job {job_type}.",
+                0,
+                **response_metadata,
+            )
+
+        # Case 3: Dict responses fail closed. Error semantics take precedence;
+        # countdown alone is not evidence that TTC has no jobs.
+        if isinstance(data, dict):
+            message = _extract_message(data)
+            error_value = data.get("error")
+            has_explicit_error = (
+                "error" in data and error_value not in (None, "", False)
+            )
+            if isinstance(error_value, str):
+                error_message = error_value.strip()
+            elif isinstance(error_value, (dict, list)):
+                error_message = _extract_message(error_value)
+            else:
+                error_message = ""
+
+            semantic_text = " ".join(
+                part for part in (message, error_message) if part
+            )
+            folded = _strip_accents(semantic_text).casefold()
+            display_message = _safe_display_message(semantic_text)
+
+            if any(
+                marker in folded
+                for marker in ("dang nhap", "login", "expired", "unauthorized")
+            ):
+                raise TTCAuthError(
+                    _server_evidence_message(
+                        f"[TTC] Authentication failure while fetching {job_type}: "
+                        f"{display_message or 'authentication error'}",
+                        job_type_key,
+                        decoded_text,
+                        "AUTH_ERROR",
+                    ),
+                    server_text=semantic_text,
+                    **response_metadata,
+                )
+
+            if (
+                re.search(r"\brate[\s_-]*limit(?:ed|ing)?\b", folded)
+                or "too many request" in folded
+            ):
+                raise TTCRateLimitError(
+                    _server_evidence_message(
+                        f"[TTC] Rate limit while fetching {job_type}: "
+                        f"{display_message or 'rate limited'}",
+                        job_type_key,
+                        decoded_text,
+                        "RATE_LIMIT",
+                    ),
+                    server_text=semantic_text,
+                    **response_metadata,
+                )
+
+            if has_explicit_error:
+                raise TTCResponseError(
+                    _server_evidence_message(
+                        f"[TTC] API error while fetching {job_type}: "
+                        f"{_safe_display_message(error_message or message) or 'explicit error'}",
+                        job_type_key,
+                        decoded_text,
+                        "RESPONSE_ERROR",
+                    ),
+                    server_text=semantic_text,
+                    **response_metadata,
+                )
+
+            _response_kind, response_keys = _response_kind_and_keys(data)
+            raise TTCResponseError(
+                _server_evidence_message(
+                    f"[TTC] Unknown response dict from {job_type}. "
+                    f"Keys={','.join(response_keys) or '-'}; "
+                    f"Message={_safe_display_message(message) or '-'}",
+                    job_type_key,
+                    decoded_text,
+                    "RESPONSE_ERROR",
+                ),
+                server_text=semantic_text,
+                **response_metadata,
+            )
+
+        raise TTCResponseError(
+            _server_evidence_message(
+                f"[TTC] Response format khÃ´ng xÃ¡c Ä‘á»‹nh tá»« {job_type}: {type(data).__name__}",
+                job_type_key,
+                decoded_text,
+                "RESPONSE_ERROR",
+            ),
+            **response_metadata,
+        )
+
+    # ------------------------------------------------------------------
+    # claim_reward()
+    # ------------------------------------------------------------------
+
+    def claim_reward(self, job: dict) -> dict:
+        """Nháº­n xu sau khi thao tÃ¡c Facebook thÃ nh cÃ´ng.
+
+        Chá»‰ gá»i hÃ m nÃ y sau khi xÃ¡c nháº­n Facebook action = True.
+
+        Args:
+            job: Dict job ná»™i bá»™ Ä‘Ã£ normalize.
+
+        Returns:
+            {
+                "success": bool,
+                "message": str,
+                "earned_coin": int,
+                "balance": int | None,
+            }
+
+        Raises:
+            TTCAuthError: PhiÃªn háº¿t háº¡n.
+            TTCResponseError: Lá»—i máº¡ng/HTTP.
+        """
+        if not self._authenticated:
+            raise TTCAuthError("[TTC] Chưa đăng nhập trước khi claim_reward.")
+
+        job_type = job.get("type", "")
+        if job_type not in TTC_ENDPOINTS:
+            raise ValueError(f"[TTC] job_type khÃ´ng há»£p lá»‡ khi claim: {job_type!r}")
+
+        _, claim_url = TTC_ENDPOINTS[job_type]
+        job_type_key = job_type.value if isinstance(job_type, Enum) else str(job_type)
+        try:
+            idpost = _strict_required_text(job.get("idpost"), "claim idpost")
+        except (AttributeError, ValueError) as exc:
+            raise ValueError("[TTC] claim idpost phải là chuỗi không rỗng.") from exc
+
+        # Payload theo loáº¡i job
+        payload = {"id": idpost}
+        if job_type in ("ttc_reaction_vip_cheo", "ttc_reaction_vip_re"):
+            reaction_type = job.get("reaction_type")
+            if not isinstance(reaction_type, str) or reaction_type not in VALID_REACTIONS:
+                raise ValueError("[TTC] claim reaction_type phải là canonical reaction string.")
+            payload["loaicx"] = reaction_type
+
+        try:
+            resp = self._session.post(
+                claim_url,
+                headers=self._headers(),
+                data=payload,
+                timeout=15,
+            )
+        except requests.exceptions.Timeout as e:
+            raise TTCResponseError(
+                f"[TTC] Timeout khi claim reward job_type={job_type}: {e}",
+                job_type=job_type_key,
+                endpoint=claim_url,
+            ) from e
+        except requests.exceptions.RequestException as e:
+            raise TTCResponseError(
+                f"[TTC] Lá»—i máº¡ng khi claim reward job_type={job_type}: {e}",
+                job_type=job_type_key,
+                endpoint=claim_url,
+            ) from e
+
+        decoded_text, decode_meta = _decode_response_body(resp)
+        content_type = decode_meta.get("content_type", "") or (
+            resp.headers.get("content-type", "")
+            if getattr(resp, "headers", None)
+            else ""
+        )
+        response_metadata = {
+            "job_type": job_type_key,
+            "endpoint": claim_url,
+            "server_raw_text": decoded_text,
+            "http_status": resp.status_code,
+            "content_type": content_type,
+        }
+        if resp.status_code == 401 or resp.status_code == 403:
+            raise TTCAuthError(
+                _server_evidence_message(
+                    f"[TTC] HTTP {resp.status_code}: Phiên đăng nhập hết hạn khi claim.",
+                    job_type_key,
+                    decoded_text,
+                    "AUTH_ERROR",
+                ),
+                **response_metadata,
+            )
+        if resp.status_code == 429:
+            raise TTCRateLimitError(
+                _server_evidence_message(
+                    f"[TTC] Rate limit khi claim reward job_type={job_type}.",
+                    job_type_key,
+                    decoded_text,
+                    "RATE_LIMIT",
+                ),
+                **response_metadata,
+            )
+        if resp.status_code >= 400:
+            raise TTCResponseError(
+                _server_evidence_message(
+                    f"[TTC] HTTP {resp.status_code} khi claim reward job_type={job_type}.",
+                    job_type_key,
+                    decoded_text,
+                    "CLAIM_REJECTED",
+                ),
+                **response_metadata,
+            )
+
+        data = _safe_json(resp, f"claim_reward({job_type})", allow_plain_text=True)
+        message = _extract_message(data)
+        evidence = _summarize_claim_response(
+            data,
+            response_text=decoded_text,
+            http_status=resp.status_code,
+            content_type=content_type,
+            endpoint_key=job_type,
+            idpost=idpost,
+            loaicx=payload.get("loaicx", ""),
+        )
+        claim = _classify_claim_response(
+            data,
+            message,
+            http_status=resp.status_code,
+            endpoint_key=job_type,
+            evidence=evidence,
+            raw_summary=_safe_display_message(decoded_text, limit=300),
+            server_raw_text=decoded_text,
+            content_type=content_type,
+        )
+
+        # Äá»c sá»‘ dÆ° náº¿u cÃ³
+        balance = None
+        if isinstance(data, dict) and isinstance(data.get("data"), dict):
+            raw_balance = data["data"].get("sodu")
+            balance = _parse_strict_integer(raw_balance)
+
+        claim.balance = balance
+        return claim.to_dict()
+
+    # ------------------------------------------------------------------
+    # close()
+    # ------------------------------------------------------------------
+
+    def close(self) -> None:
+        """ÄÃ³ng HTTP session."""
+        try:
+            self._session.close()
+        except Exception:
+            pass
+        self._authenticated = False
+        self._configured_facebook_uid = None
+        self._token = ""
+        self._user = ""
+        self._initial_balance = None
+
+# =====================================================================
+# Tên gọi thuận tiện khi tích hợp sang tool khác
+# =====================================================================
+
+class TTCJobType(str, Enum):
+    LIKE_POST_VIP_CHEO = "ttc_like_post_vip_cheo"
+    LIKE_POST_VIP_RE = "ttc_like_post_vip_re"
+    REACTION_VIP_CHEO = "ttc_reaction_vip_cheo"
+    REACTION_VIP_RE = "ttc_reaction_vip_re"
+    COMMENT = "ttc_comment"
+    FOLLOW = "ttc_follow"
+    LIKE_PAGE = "ttc_like_page"
+
+
+def _login_alias(self, token: str):
+    self.authenticate(token)
+    return self.get_account_info()
+
+
+def _set_uid_alias(self, uid: str):
+    return self.configure_facebook_uid(uid)
+
+
+def _get_jobs_alias(self, job_type):
+    key = job_type.value if isinstance(job_type, TTCJobType) else str(job_type)
+    return self.fetch_jobs(key)
+
+
+def _submit_job_alias(self, job: dict):
+    return self.claim_reward(job)
+
+
+TTCClient.login = _login_alias
+TTCClient.set_uid = _set_uid_alias
+TTCClient.get_jobs = _get_jobs_alias
+TTCClient.submit_job = _submit_job_alias
+
+
+# =====================================================================
+# TTC scheduler compatibility adapter
+# =====================================================================
+
+class TTCFetchState:
+    """Non-persistent endpoint state shared only by one automatic run."""
+
+    def __init__(self):
+        self.permanent_skip = set()
+        self.temporary_retry_at = {}
+
+
+class API_TTC:
+    """Expose TTC lifecycle operations without changing the Bumx runtime path."""
+
+    REACTION_JOB_TYPES = (
+        TTCJobType.LIKE_POST_VIP_CHEO,
+        TTCJobType.LIKE_POST_VIP_RE,
+        TTCJobType.REACTION_VIP_CHEO,
+        TTCJobType.REACTION_VIP_RE,
+    )
+    COMMENT_JOB_TYPES = (TTCJobType.COMMENT,)
+    LEGACY_JOB_TYPES = {
+        "like_facebook": REACTION_JOB_TYPES,
+        "like_poster": COMMENT_JOB_TYPES,
+    }
+
+    def __init__(self, access_token, worker_id="?", fetch_state=None):
+        self._access_token = access_token
+        self._client = TTCClient(worker_id=worker_id)
+        self._fetch_state = fetch_state if fetch_state is not None else TTCFetchState()
+        self._facebook_uid = None
+
+    def login(self):
+        return self._client.login(self._access_token)
+
+    def use_fetch_state(self, fetch_state):
+        if not isinstance(fetch_state, TTCFetchState):
+            raise TypeError("fetch_state must be TTCFetchState")
+        self._fetch_state = fetch_state
+
+    def set_facebook_uid(self, uid):
+        result = self._client.set_uid(uid)
+        self._facebook_uid = str(uid).strip()
+        return result
+
+    def fetch_jobs_for_legacy_type(self, legacy_type):
+        try:
+            job_types = self.LEGACY_JOB_TYPES[legacy_type]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported legacy job type: {legacy_type!r}") from exc
+
+        jobs = []
+        no_job = []
+        cooldowns = []
+        permanent_skips = []
+        now = time.monotonic()
+        for job_type in job_types:
+            endpoint_key = job_type.value
+            state_key = (self._facebook_uid, endpoint_key)
+            if state_key in self._fetch_state.permanent_skip:
+                permanent_skips.append({
+                    "job_type": endpoint_key,
+                    "source": "local",
+                })
+                continue
+
+            retry_at = self._fetch_state.temporary_retry_at.get(state_key)
+            if retry_at is not None:
+                if now < retry_at:
+                    cooldowns.append({
+                        "job_type": endpoint_key,
+                        "remaining": max(1, math.ceil(retry_at - now)),
+                        "retry_at": retry_at,
+                        "source": "local",
+                    })
+                    continue
+                del self._fetch_state.temporary_retry_at[state_key]
+
+            try:
+                ttc_jobs = self._client.get_jobs(job_type)
+            except TTCJobCooldown as exc:
+                retry_at = now + exc.retry_after
+                self._fetch_state.temporary_retry_at[state_key] = retry_at
+                cooldowns.append({
+                    "job_type": endpoint_key,
+                    "retry_after": exc.retry_after,
+                    "remaining": exc.retry_after,
+                    "retry_at": retry_at,
+                    "server_raw_text": exc.server_raw_text,
+                    "http_status": exc.http_status,
+                    "content_type": exc.content_type,
+                    "source": "server",
+                })
+                continue
+            except TTCVipIneligibleError as exc:
+                self._fetch_state.permanent_skip.add(state_key)
+                permanent_skips.append({
+                    "job_type": endpoint_key,
+                    "server_raw_text": exc.server_raw_text,
+                    "http_status": exc.http_status,
+                    "content_type": exc.content_type,
+                    "source": "server",
+                })
+                continue
+            except TTCNoJobAvailable as exc:
+                no_job.append({
+                    "job_type": job_type.value,
+                    "countdown": exc.countdown,
+                })
+                continue
+
+            for original_job in ttc_jobs:
+                scheduler_job = dict(original_job)
+                scheduler_job["type"] = legacy_type
+                scheduler_job["_ttc_job"] = original_job
+                jobs.append(scheduler_job)
+
+        return {
+            "jobs": jobs,
+            "no_job": no_job,
+            "cooldowns": cooldowns,
+            "permanent_skips": permanent_skips,
+        }
+
+    def submit_job(self, job):
+        original_job = job.get("_ttc_job", job) if isinstance(job, dict) else job
+        return self._client.submit_job(original_job)
+
+    def get_account_info(self):
+        return self._client.get_account_info()
+
+    def close(self):
+        return self._client.close()
 
 
 # ---------- Scheduler / delay helpers (ported from PC, kept single-file) ----------
@@ -257,16 +2053,24 @@ def print_info(msg):
 def print_warning(msg):
     print(f"{Fore.YELLOW}⚠️ {msg}{Style.RESET_ALL}")
 
+def print_ttc_server_response(job_type, server_raw_text):
+    """Print TTC evidence without changing its response body."""
+    print_warning(f"[TTC][{job_type}]")
+    print(server_raw_text)
+
+
+def print_ttc_exception(context, exc):
+    """Keep typed TTC response evidence separate from an internal failure line."""
+    server_raw_text = getattr(exc, "server_raw_text", "")
+    if not isinstance(server_raw_text, str) or not server_raw_text:
+        return False
+    print_error(context)
+    print_ttc_server_response(getattr(exc, "job_type", "") or "UNKNOWN", server_raw_text)
+    return True
+
+
 def print_debug(msg):
     print(f"{Fore.MAGENTA}🐞 {msg}{Style.RESET_ALL}")
-
-# ---------- Hàm tạo HMAC ----------
-def build_hmac_header(method: str, path: str) -> str:
-    timestamp_ms = int(time.time() * 1000)
-    payload = f"{timestamp_ms}.{method}.{path}"
-    key = b"bembembemzz"
-    digest = hmac.new(key, payload.encode('utf-8'), hashlib.sha256).hexdigest()
-    return f"{timestamp_ms}:{digest}"
 
 # ---------- Lưu / đọc cấu hình Termux/iSH ----------
 # Code chỉ nằm trong file .py này. Dữ liệu runtime được lưu riêng trong 1 JSON để
@@ -274,12 +2078,53 @@ def build_hmac_header(method: str, path: str) -> str:
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LEGACY_CONFIG_FILE = os.path.join(SCRIPT_DIR, "config_token.json")
 DATA_FILE = os.environ.get("BUMX_TERMUX_DATA_FILE", os.path.join(SCRIPT_DIR, "bumx_termux_data.json"))
+FB_APP_OAUTH_ENV = "TTC_FB_APP_OAUTH"
+FB_APP_OAUTH_FILE = os.path.join(SCRIPT_DIR, ".bumx_runtime", "facebook_app_oauth.txt")
 DATA_VERSION = 1
 SESSION_PROFILE_ID = None
 
 
 class ProfileInUseError(RuntimeError):
     pass
+
+
+class FacebookOAuthConfigurationError(RuntimeError):
+    pass
+
+
+def _validate_facebook_app_oauth(value, source):
+    credential = str(value or "").strip()
+    if not credential.startswith("OAuth ") or "|" not in credential:
+        raise FacebookOAuthConfigurationError(
+            f"Facebook app OAuth configuration from {source} is missing or malformed."
+        )
+    return credential
+
+
+def load_facebook_app_oauth():
+    environment_value = os.environ.get(FB_APP_OAUTH_ENV)
+    if environment_value is not None and str(environment_value).strip():
+        return _validate_facebook_app_oauth(
+            environment_value,
+            f"environment variable {FB_APP_OAUTH_ENV}",
+        )
+
+    if os.path.isfile(FB_APP_OAUTH_FILE):
+        try:
+            with open(FB_APP_OAUTH_FILE, "r", encoding="utf-8") as stream:
+                return _validate_facebook_app_oauth(
+                    stream.read(),
+                    FB_APP_OAUTH_FILE,
+                )
+        except OSError as exc:
+            raise FacebookOAuthConfigurationError(
+                f"Cannot read Facebook app OAuth configuration file: {FB_APP_OAUTH_FILE}"
+            ) from exc
+
+    raise FacebookOAuthConfigurationError(
+        f"Facebook app OAuth is not configured. Set {FB_APP_OAUTH_ENV} "
+        f"or create the local file {FB_APP_OAUTH_FILE}."
+    )
 
 def runtime_lock_path(filename):
     data_dir = os.path.dirname(os.path.abspath(DATA_FILE))
@@ -1075,6 +2920,7 @@ class Requests_facebook:
         import json
         import pyotp
 
+        app_oauth = load_facebook_app_oauth()
         ts = int(time.time())
         device = str(uuid.uuid4())
         client_trace_id = str(uuid.uuid4())
@@ -1096,7 +2942,7 @@ class Requests_facebook:
         }
 
         res = self._requests.post(url=self._url_api, headers={
-            "Authorization": "OAuth 350685531728|62f8ce9f74b12f84c123cc23437a4a32",
+            "Authorization": app_oauth,
             "X-FB-Friendly-Name": "CreateOneTimeChallengeNonceCreate",
         }, data=payload)
 
@@ -1146,7 +2992,7 @@ class Requests_facebook:
         }
 
         res = self._requests.post(url=self._url_api, headers={
-            "Authorization": "OAuth 350685531728|62f8ce9f74b12f84c123cc23437a4a32",
+            "Authorization": app_oauth,
             "X-FB-Friendly-Name": "FbBloksActionRootQuery-com.bloks.www.bloks.caa.login.async.send_login_request"
         }, data=payload)
 
@@ -1184,7 +3030,7 @@ class Requests_facebook:
                 'client_trace_id': '73b659d1-a3cc-4db4-bc79-892b41b88f2c'
             }
             res = self._requests.post(url=self._url_api, headers={
-                "Authorization": "OAuth 350685531728|62f8ce9f74b12f84c123cc23437a4a32",
+                "Authorization": app_oauth,
                 "X-FB-Friendly-Name": "FbBloksActionRootQuery-com.bloks.www.two_step_verification.verify_code.async"
             }, data=payload)
             data = res.text
@@ -1219,6 +3065,17 @@ class Requests_facebook:
         """
         try:
             token = self._login_facebook(email, password, secret_2fa)
+        except FacebookOAuthConfigurationError as exc:
+            self._record_login_result({
+                "status": "CONFIGURATION_ERROR",
+                "token": None,
+                "two_factor_context": None,
+                "message": str(exc),
+            }, "LOGIN_CONFIGURATION")
+            print_error(
+                f"Login Facebook thất bại: {self._last_login_result['message']}"
+            )
+            return None
         except Exception as exc:
             self._record_login_result({
                 "status": "NETWORK_RESPONSE_ERROR",
@@ -1261,10 +3118,136 @@ def build_attribution(fragments):
     return ';'.join(items)
 
 # ---------- Class AUTO_Action (giữ nguyên) ----------
+def _decode_facebook_comment_parent_id(comment_id):
+    """Return the parent post from the known encoded Facebook comment ID form."""
+    if not isinstance(comment_id, str) or not comment_id:
+        return None
+    try:
+        decoded = base64.b64decode(comment_id, validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return None
+    match = re.fullmatch(r"comment:([^_\s]+)_([^_\s]+)", decoded)
+    return match.group(1) if match else None
+
+
+def _facebook_comment_response_evidence(comment_data):
+    evidence = {
+        "comment_id": None,
+        "parent_post_id": None,
+        "outgoing_text": None,
+        "comment_keys": (),
+        "returned_text": None,
+        "returned_text_fields": (),
+        "returned_actor_id": None,
+        "returned_actor_fields": (),
+        "feedback_id": None,
+        "hidden": None,
+        "pending": None,
+        "visibility_fields": {},
+        "visibility_scalars": {},
+        "visibility_structures": {},
+    }
+    if not isinstance(comment_data, dict):
+        return evidence
+
+    evidence["comment_keys"] = tuple(sorted(str(key) for key in comment_data))
+    comment_id = comment_data.get("id")
+    if isinstance(comment_id, str) and comment_id:
+        evidence["comment_id"] = comment_id
+        evidence["parent_post_id"] = _decode_facebook_comment_parent_id(comment_id)
+
+    text_fields = []
+    for container_name in ("body", "message"):
+        container = comment_data.get(container_name)
+        if isinstance(container, dict) and isinstance(container.get("text"), str):
+            text_fields.append((f"{container_name}.text", container["text"]))
+    if isinstance(comment_data.get("text"), str):
+        text_fields.append(("text", comment_data["text"]))
+    evidence["returned_text_fields"] = tuple(text_fields)
+    if text_fields:
+        evidence["returned_text"] = text_fields[0][1]
+
+    actor_fields = []
+    for container_name in ("author", "actor"):
+        container = comment_data.get(container_name)
+        if isinstance(container, dict) and isinstance(container.get("id"), (str, int)):
+            if not isinstance(container["id"], bool):
+                actor_fields.append((f"{container_name}.id", str(container["id"])))
+    evidence["returned_actor_fields"] = tuple(actor_fields)
+    if actor_fields:
+        evidence["returned_actor_id"] = actor_fields[0][1]
+
+    feedback = comment_data.get("feedback")
+    if isinstance(feedback, dict) and isinstance(feedback.get("id"), (str, int)):
+        if not isinstance(feedback["id"], bool):
+            evidence["feedback_id"] = str(feedback["id"])
+
+    visibility_scalar_names = (
+        "comment_privacy_value",
+        "spam_display_mode",
+        "is_viewer_comment_poster",
+        "is_declined_by_group_admin_assistant",
+        "can_viewer_delete",
+        "can_viewer_edit",
+        "created_time",
+        "legacy_fbid",
+        "url",
+        "depth",
+    )
+    for key in visibility_scalar_names:
+        value = comment_data.get(key)
+        if value is None or isinstance(value, (str, int, float, bool)):
+            evidence["visibility_scalars"][key] = value
+
+    for key, value in comment_data.items():
+        if key in {"is_hidden", "is_pending"} or "visibility" in str(key).lower():
+            if value is None or isinstance(value, (str, int, float, bool)):
+                evidence["visibility_fields"][str(key)] = value
+
+    for key in (
+        "group_comment_info",
+        "comment_tombstone_upsell_config",
+        "private_reply_context",
+        "real_author_for_moderation",
+    ):
+        value = comment_data.get(key)
+        if not isinstance(value, dict):
+            evidence["visibility_structures"][key] = {
+                "type": "NOT AVAILABLE" if value is None else type(value).__name__,
+                "keys": (),
+                "safe_scalar_flags": {},
+            }
+            continue
+        evidence["visibility_structures"][key] = {
+            "type": "dict",
+            "keys": tuple(sorted(str(item) for item in value)),
+            "safe_scalar_flags": {
+                str(item): flag
+                for item, flag in value.items()
+                if isinstance(flag, bool) or flag is None
+            },
+        }
+    evidence["hidden"] = evidence["visibility_fields"].get("is_hidden")
+    evidence["pending"] = evidence["visibility_fields"].get("is_pending")
+    return evidence
+
+
+def _is_comment_pending_approval(evidence):
+    """Return true only for Facebook's explicit non-claimable comment state."""
+    if not isinstance(evidence, dict):
+        return False
+    visibility = evidence.get("visibility_scalars")
+    return (
+        isinstance(visibility, dict)
+        and visibility.get("comment_privacy_value") == "PENDING_APPROVAL"
+    )
+
+
 class AUTO_Action:
     def __init__(self):
         self.url = 'https://b-graph.facebook.com/graphql'
         self._requests = requests.Session()
+        self.last_comment_evidence = _facebook_comment_response_evidence(None)
         self.id_reaction = {
             'LIKE': 1635855486666999,
             'LOVE': 1678524932434102,
@@ -1329,9 +3312,11 @@ class AUTO_Action:
                 if "access_token" in err.get("message", "").lower():
                     return None, "Token đã die (hết hạn hoặc không hợp lệ)"
                 return None, err.get("message", "Lỗi GraphQL")
-        user_id = res_json.get("data", {}).get("me", {}).get("id")
-        if user_id:
-            return user_id, "OK"
+        response_data = res_json.get("data") if isinstance(res_json, dict) else None
+        me = response_data.get("me") if isinstance(response_data, dict) else None
+        user_id = me.get("id") if isinstance(me, dict) else None
+        if isinstance(user_id, str) and user_id.strip():
+            return user_id.strip(), "OK"
         return None, "Không tìm thấy user_id trong response (có thể token die)"
 
     def auto_reaction(self, post_id, reaction_type, token, actor_id):
@@ -1405,6 +3390,7 @@ class AUTO_Action:
             return False
 
     def auto_cmt(self, post_id, text, token, actor_id):
+        self.last_comment_evidence = _facebook_comment_response_evidence(None)
         raw = f"feedback:{post_id}"
         feedback_id = base64.b64encode(raw.encode()).decode()
         fragments = [
@@ -1521,7 +3507,22 @@ class AUTO_Action:
             return False
         else:
             comment_data = result.get("data", {}).get("comment_create", {}).get("comment")
-            if comment_data and comment_data.get("id"):
+            evidence = _facebook_comment_response_evidence(comment_data)
+            evidence["outgoing_text"] = text
+            self.last_comment_evidence = evidence
+            comment_id = evidence["comment_id"]
+            parent_post_id = evidence["parent_post_id"]
+            requested_text = unicodedata.normalize("NFC", text)
+            returned_text_matches = all(
+                unicodedata.normalize("NFC", returned_text) == requested_text
+                for _field, returned_text in evidence["returned_text_fields"]
+            )
+            returned_actor_matches = all(
+                returned_actor_id == str(actor_id)
+                for _field, returned_actor_id in evidence["returned_actor_fields"]
+            )
+            parent_matches = parent_post_id is None or parent_post_id == str(post_id)
+            if comment_id and parent_matches and returned_text_matches and returned_actor_matches:
                 print("✅ Comment thành công! ID:", comment_data["id"])
                 return True
             else:
@@ -1569,357 +3570,6 @@ def countdown(seconds, message="Chờ"):
         time.sleep(1)
     print(f"\r{Fore.GREEN}✅ Tiếp tục!{' ' * 20}{Style.RESET_ALL}")
 
-# ---------- Class API_BUMX ----------
-class API_BUMX:
-    def __init__(self, auth, fb_token, normal_delay_min=None, normal_delay_max=None,
-                 failed_delay_min=None, failed_delay_max=None, delay_between_jobs=None,
-                 like_delay_min=None, like_delay_max=None, comment_delay_min=None,
-                 comment_delay_max=None, profile_id=None):
-        self.refresh_token = auth
-        self.fb_token = fb_token
-        self.profile_id = profile_id
-        (
-            self.like_delay_range,
-            self.comment_delay_range,
-            self.failed_delay_range,
-            _,
-        ) = resolve_run_delay_ranges(
-            normal_delay_min, normal_delay_max, failed_delay_min, failed_delay_max,
-            delay_between_jobs, like_delay_min, like_delay_max,
-            comment_delay_min, comment_delay_max, None, None,
-        )
-        self.session = requests.Session()
-        self.base_headers = {
-            'accept-encoding': 'gzip',
-            'host': 'api-v2.bumx.vn',
-            'lang': 'vi',
-            'origin': 'app',
-            'platform': 'android',
-            'user-agent': 'Dart/3.11 (dart:io)',
-            'version': '42',
-            'visitor': 'PI',
-        }
-        self.session.headers.update(self.base_headers)
-        self.api_paths = {
-            'token': '/api/authorization/refresh-token',
-            'wallet': '/api/business/wallet',
-            'get-new-mission': '/api/buff/get-new-mission',
-            'mission': '/api/buff/mission',
-            'report-buff': '/api/buff/report-buff',
-            'load-mission': '/api/buff/load-mission',
-            'submit-mission': '/api/buff/submit-mission',
-        }
-        self.base_url = 'https://api-v2.bumx.vn'
-        self._refresh_token()
-
-    def _refresh_token(self):
-        try:
-            resp = self.session.post(
-                self.base_url + self.api_paths['token'],
-                json={'refreshToken': self.refresh_token}
-            )
-            if resp.status_code == 200:
-                data = resp.json().get('data', {})
-                if isinstance(data, str):
-                    data = json.loads(data)
-                new_token = data.get('accessToken')
-                if new_token:
-                    self.access_token = new_token
-                    self.session.headers.update({"authorization": self.access_token})
-                    if self.profile_id:
-                        update_profile_auth_token(self.profile_id, new_token)
-                    print_success(f"Token đã được refresh: {preview_token(new_token)}")
-                    return True
-            else:
-                print_error(f"Refresh token thất bại: {resp.status_code}")
-                return False
-        except Exception as e:
-            print_error(f"Lỗi khi refresh token: {e}")
-            return False
-
-    def _request(self, method, path, json_data=None, extra_headers=None, retry=True):
-        hmac_header = build_hmac_header(method, path)
-        headers = {'hmac': hmac_header}
-        if json_data is not None:
-            headers['content-type'] = 'application/json'
-        if extra_headers:
-            headers.update(extra_headers)
-
-        url = self.base_url + path
-        if method.upper() == 'GET':
-            resp = self.session.get(url, headers=headers, params=json_data)
-        else:
-            resp = self.session.post(url, headers=headers, json=json_data)
-
-        if resp.status_code == 401 and retry:
-            print_warning("AccessToken hết hạn, đang refresh...")
-            if self._refresh_token():
-                return self._request(method, path, json_data, extra_headers, retry=False)
-        return resp
-
-    def get_info_account(self):
-        path = self.api_paths['wallet']
-        resp = self._request('GET', path)
-        if resp.status_code == 200:
-            data = resp.json().get('data', {})
-            return data.get('balance', 0)
-        return 0
-
-    def get_mission_jobs(self):
-        path = self.api_paths['mission']
-        resp = self._request('GET', path, json_data={'is_from_mobile': True})
-        if resp.status_code != 200:
-            return []
-        try:
-            payload = resp.json()
-        except (TypeError, ValueError):
-            return []
-        if not isinstance(payload, dict):
-            return []
-        jobs = payload.get('data')
-        if not isinstance(jobs, list) or any(not isinstance(job, dict) for job in jobs):
-            return []
-        return jobs
-
-    def get_new_mission_jobs(self, mission_type):
-        path = self.api_paths['get-new-mission']
-        resp = self._request('POST', path, json_data={'type': mission_type})
-        if resp.status_code != 200:
-            return []
-        try:
-            payload = resp.json()
-        except (TypeError, ValueError):
-            return []
-        if not isinstance(payload, dict):
-            return []
-        jobs = payload.get('data')
-        if not isinstance(jobs, list):
-            return []
-        return jobs
-
-    def load_mission(self, buff_id):
-        path = self.api_paths['load-mission']
-        resp = self._request('POST', path, json_data={'buff_id': buff_id})
-        return resp.json()
-
-    def REPORT(self, buff_id):
-        path = self.api_paths['report-buff']
-        resp = self._request('POST', path, json_data={'buff_id': buff_id})
-        return resp.json()
-
-    def submit(self, buff_id, type_jobs, cmt_id=None, cmt="tt nha"):
-        path = self.api_paths['submit-mission']
-        payload = {
-            "buff_id": buff_id,
-            "comment": cmt,
-            "comment_id": cmt_id,
-            "code_submit": None,
-            "attachments": [],
-            "link_share": "",
-            "code": "",
-            "is_from_mobile": True,
-            "type": type_jobs,
-            "sub_id": None,
-            "data": None
-        }
-        resp = self._request('POST', path, json_data=payload)
-        return resp.json()
-
-    def run_jobs(self, max_jobs=30, job_types=None, like_batch_limit=None,
-                 comment_batch_limit=None, like_batch_min=None, like_batch_max=None,
-                 comment_batch_min=None, comment_batch_max=None):
-        global total_coin
-        enabled_types = normalize_job_types(job_types)
-        do_job = AUTO_Action()
-        uid, msg = do_job.get_info(self.fb_token)
-        if uid:
-            print("UID:" + str(uid))
-        else:
-            print('ERROR:' + msg)
-            return 0
-
-        print_info("Đang refresh token...")
-        self._refresh_token()
-
-        print_info("Đang kiểm tra job mới từ get-new-mission...")
-        while True:
-            like_data = self.get_new_mission_jobs('like_facebook') if 'like_facebook' in enabled_types else []
-            comment_data = self.get_new_mission_jobs('like_poster') if 'like_poster' in enabled_types else []
-            like_count = len(like_data)
-            comment_count = len(comment_data)
-            total_new_jobs = like_count + comment_count
-            print_info(f"get-new-mission: {like_count} job like, {comment_count} job comment")
-            if total_new_jobs > 0:
-                break
-            print_info("Không có job mới.")
-            countdown(300, "Không có job, chờ trước lần lấy job tiếp theo")
-
-        print_info("Đang lấy danh sách job từ mission...")
-        mission_jobs = self.get_mission_jobs()
-        print_info(f"mission: {len(mission_jobs)} job")
-        if not mission_jobs:
-            print_info("Không có job nào để làm.")
-            return 0
-
-        jobs = schedule_jobs_by_burst(
-            mission_jobs,
-            enabled_types,
-            max_jobs,
-            like_batch_limit=like_batch_limit,
-            comment_batch_limit=comment_batch_limit,
-            like_batch_min=like_batch_min,
-            like_batch_max=like_batch_max,
-            comment_batch_min=comment_batch_min,
-            comment_batch_max=comment_batch_max,
-        )
-        if not jobs:
-            print_info("Không có job thuộc loại đã chọn.")
-            return 0
-
-        print_info(f"Scheduler đã chọn {len(jobs)} job, hard cap {max_jobs}.")
-        total_jobs = len(jobs)
-        total_done = 0
-
-        for idx, job in enumerate(jobs, start=1):
-            buff_id = job.get('buff_id')
-            type_ = job.get('type')
-            job_succeeded = False
-            if not buff_id:
-                print_warning("Job thiếu buff_id, bỏ qua.")
-            else:
-                job_type_display = "LIKE" if type_ == 'like_facebook' else "CMT"
-                coin_reward = 20 if type_ == 'like_facebook' else 50
-                print_info(f"[{idx}/{total_jobs}] Đang xử lý job {type_} (buff_id: {buff_id})...")
-
-                if type_ == 'like_facebook':
-                    try:
-                        job_detail = self.load_mission(buff_id)
-                        object_id = job_detail.get('object_id')
-                        if not object_id:
-                            print_warning("Không có object_id, bỏ qua.")
-                            self.REPORT(buff_id)
-                        else:
-                            icon = job_detail.get('icon', '')
-                            if 'icon_like.png' in icon:
-                                reaction = 'LIKE'
-                            elif 'icon_love.png' in icon:
-                                reaction = 'LOVE'
-                            elif 'icon_thuongthuong.png' in icon:
-                                reaction = 'CARE'
-                            elif 'icon_haha.png' in icon:
-                                reaction = 'HAHA'
-                            elif 'icon_wow.png' in icon:
-                                reaction = 'WOW'
-                            elif 'icon_sad.png' in icon:
-                                reaction = 'SAD'
-                            elif 'icon_angry.png' in icon:
-                                reaction = 'ANGRY'
-                            else:
-                                reaction = 'LIKE'
-
-                            print_info(f"   Thực hiện {reaction} trên bài viết {object_id}")
-                            post_id = get_facebook_post_id(f'https://www.facebook.com/{object_id}')
-                            if int(post_id) > 0:
-                                status = do_job.auto_reaction(post_id, reaction, self.fb_token, uid)
-                                time.sleep(3)
-                                if status:
-                                    result = self.submit(buff_id, 'like_facebook')
-                                    if result.get('success'):
-                                        job_succeeded = True
-                                        total_done += 1
-                                        total_coin += coin_reward
-                                        msg = result.get('message', '')
-                                        print_success(f"[{idx}/{total_jobs}] {job_type_display} | +{coin_reward} | Tổng: {total_coin} | {msg}")
-                                    else:
-                                        print_warning(f"[{idx}/{total_jobs}] {job_type_display} | Submit thất bại, báo cáo buff {buff_id}")
-                                        self.REPORT(buff_id)
-                                else:
-                                    print_warning(f"[{idx}/{total_jobs}] {job_type_display} | Like thất bại, báo cáo buff {buff_id}")
-                                    self.REPORT(buff_id)
-                            else:
-                                print_warning(f"[{idx}/{total_jobs}] {job_type_display} | Lấy id thất bại {buff_id}")
-                                self.REPORT(buff_id)
-                    except Exception as exc:
-                        print_error(f"[{idx}/{total_jobs}] Lỗi like_facebook: {exc}")
-                        self.REPORT(buff_id)
-
-                elif type_ == 'like_poster':
-                    try:
-                        job_detail = self.load_mission(buff_id)
-                        object_id = job_detail.get('object_id')
-                        cmt = job_detail.get('data', '')
-                        if not object_id:
-                            print_warning("Không có object_id, bỏ qua.")
-                            self.REPORT(buff_id)
-                        else:
-                            try:
-                                if "\\u" in cmt:
-                                    cmt = cmt.encode('utf-8').decode('unicode_escape')
-                            except Exception:
-                                pass
-                            cmt_id = job_detail.get('comment_id')
-                            print_info(f"   Comment vào bài viết {object_id}")
-                            post_id = get_facebook_post_id(f'https://www.facebook.com/{object_id}')
-                            if int(post_id) > 0:
-                                status = do_job.auto_cmt(post_id, cmt, self.fb_token, uid)
-                                time.sleep(3)
-                                if status:
-                                    result = self.submit(buff_id, 'like_poster', cmt_id, cmt)
-                                    if result.get('success'):
-                                        job_succeeded = True
-                                        total_done += 1
-                                        total_coin += coin_reward
-                                        msg = result.get('message', '')
-                                        print_success(f"[{idx}/{total_jobs}] {job_type_display} | +{coin_reward} | Tổng: {total_coin} | {msg}")
-                                    else:
-                                        print_warning(f"[{idx}/{total_jobs}] {job_type_display} | Submit thất bại, báo cáo buff {buff_id}")
-                                        self.REPORT(buff_id)
-                                else:
-                                    print_warning(f"[{idx}/{total_jobs}] {job_type_display} | Comment thất bại, báo cáo buff {buff_id}")
-                                    self.REPORT(buff_id)
-                            else:
-                                print_warning(f"[{idx}/{total_jobs}] {job_type_display} | Lấy id thất bại {buff_id}")
-                                self.REPORT(buff_id)
-                    except Exception as exc:
-                        print_error(f"[{idx}/{total_jobs}] Lỗi like_poster: {exc}")
-                        self.REPORT(buff_id)
-
-            if idx < total_jobs:
-                if job_succeeded:
-                    delay_range = self.like_delay_range if type_ == 'like_facebook' else self.comment_delay_range
-                else:
-                    delay_range = self.failed_delay_range
-                delay = random.randint(*delay_range)
-                countdown(delay, f"Chờ trước job {idx+1}")
-
-        print_info(f"Hoàn thành {total_done}/{total_jobs} job. Tổng coin: {total_coin}")
-        return total_done
-
-    def show_jobs(self):
-        jobs = self.get_mission_jobs()
-        if not jobs:
-            self.get_new_mission_jobs('like_facebook')
-            self.get_new_mission_jobs('like_poster')
-            jobs = self.get_mission_jobs()
-        if not jobs:
-            return []
-        job_list = []
-        for job in jobs:
-            buff_id = job.get('buff_id')
-            if buff_id:
-                detail = self.load_mission(buff_id)
-                object_id = detail.get('object_id', 'N/A') if detail else 'N/A'
-                job_list.append({
-                    'buff_id': buff_id,
-                    'object_id': object_id,
-                    'type': job.get('type', 'unknown')
-                })
-        return job_list
-
-    def close(self):
-        pass
-
-# ---------- Quản lý Bumx profile / Facebook accounts ----------
 def parse_facebook_login_batch(raw):
     raw = str(raw or "")
     segments = raw.split(',')
@@ -2585,7 +4235,7 @@ def account_manager(profile_id):
             print("UID|PASSWORD|2FA,UID|PASSWORD|2FA")
             print("\n2FA có thể để trống:")
             print("UID|PASSWORD|")
-            raw_credentials = input("\nDán danh sách account: ")
+            raw_credentials = secret_input("\nDán danh sách account: ")
             if not raw_credentials.strip():
                 print_info("Đã hủy.")
                 continue
@@ -2763,8 +4413,7 @@ def create_profile(data):
     if not name:
         print_error("Tên không được trống.")
         return None
-    print("Nhập TTC token:")
-    token = input().strip()
+    token = input("Nhập TTC token: ").strip()
 
     print(f"\n{Fore.YELLOW}=== XÁC NHẬN PROFILE ==={Style.RESET_ALL}")
     print(f"Tên:\n{name}")
@@ -2806,7 +4455,7 @@ def view_bumx_token(data):
     while True:
         print(f"\n{Fore.YELLOW}=== TTC TOKEN — {profile['name']} ==={Style.RESET_ALL}")
         print("Token hiện tại:\n")
-        print(profile.get('auth_token') or '(trống)')
+        print(profile.get('auth_token', ''))
         print("\n1. Giữ nguyên")
         print("2. Nhập token mới")
         print("3. Quay lại")
@@ -2814,8 +4463,7 @@ def view_bumx_token(data):
         if choice == '1':
             return
         elif choice == '2':
-            print("\nNhập TTC token mới:")
-            token = input().strip()
+            token = input("\nNhập TTC token mới: ").strip()
             print("\nToken vừa nhập:\n")
             print(token)
             if input("\nLưu token này? (y/n): ").strip().lower() in ['y', 'yes']:
@@ -3035,7 +4683,7 @@ def profile_manager(data):
                 print(f"\n=== XÁC NHẬN XÓA PROFILE ===")
                 print(f"Profile:\n{profile['name']}")
                 print(f"\nFacebook:\n{fb_count} account")
-                print(f"\nTTC token:\n{profile.get('auth_token') or '(trống)'}")
+                print(f"\nTTC token:\n{preview_token(profile.get('auth_token'))}")
                 if input(f"\nXóa profile này? (y/n): ").strip().lower() in ['y', 'yes']:
                     deleted_id = profile['profile_id']
                     deleted_name = profile['name']
@@ -3064,12 +4712,14 @@ def _ttc_no_job_wait_seconds(no_job_metadata):
         if not isinstance(item, dict):
             raise ValueError("TTC adapter returned invalid no-job metadata")
         raw_countdown = item.get("countdown")
-        if raw_countdown in (None, ""):
+        if isinstance(raw_countdown, bool):
             continue
-        try:
-            seconds = int(raw_countdown)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("TTC adapter returned invalid countdown metadata") from exc
+        if isinstance(raw_countdown, int):
+            seconds = raw_countdown
+        elif isinstance(raw_countdown, str) and re.fullmatch(r"[+-]?\d+", raw_countdown.strip()):
+            seconds = int(raw_countdown.strip())
+        else:
+            continue
         if seconds > 0:
             positive_countdowns.append(seconds)
     return max(positive_countdowns) if positive_countdowns else 10
@@ -3078,10 +4728,11 @@ def _ttc_no_job_wait_seconds(no_job_metadata):
 def _normalize_ttc_earned_coin(value):
     if isinstance(value, bool):
         return 0
-    try:
-        return max(0, int(value or 0))
-    except (TypeError, ValueError):
-        return 0
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
+        return max(0, int(value.strip()))
+    return 0
 
 
 def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
@@ -3094,17 +4745,18 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
     enabled_types = normalize_job_types(job_types)
     do_job = AUTO_Action()
     uid, msg = do_job.get_info(fb_token)
-    if uid:
-        print("UID:" + str(uid))
-    else:
+    if not isinstance(uid, str) or not uid.strip():
         print("ERROR:" + msg)
         return 0
+    uid = uid.strip()
+    print("UID:" + uid)
 
     api.set_facebook_uid(uid)
 
     while True:
         fetched_jobs = []
         no_job_metadata = []
+        cooldown_metadata = []
         for legacy_type in ("like_facebook", "like_poster"):
             if legacy_type not in enabled_types:
                 continue
@@ -3113,13 +4765,45 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                     or not isinstance(result.get("jobs"), list)
                     or not isinstance(result.get("no_job"), list)):
                 raise ValueError("TTC adapter returned an invalid fetch result")
+            cooldowns = result.get("cooldowns", [])
+            permanent_skips = result.get("permanent_skips", [])
+            if not isinstance(cooldowns, list) or not isinstance(permanent_skips, list):
+                raise ValueError("TTC adapter returned invalid endpoint-state metadata")
             fetched_jobs.extend(result["jobs"])
             no_job_metadata.extend(result["no_job"])
+            cooldown_metadata.extend(cooldowns)
+
+            for item in cooldowns:
+                if not isinstance(item, dict):
+                    raise ValueError("TTC adapter returned invalid cooldown metadata")
+                if item.get("source") == "server":
+                    print_ttc_server_response(
+                        item.get("job_type", ""), item.get("server_raw_text", "")
+                    )
+                    print_info(
+                        f"Tạm chờ job này {item.get('retry_after', 0)} giây."
+                    )
+
+            for item in permanent_skips:
+                if not isinstance(item, dict):
+                    raise ValueError("TTC adapter returned invalid permanent-skip metadata")
+                if item.get("source") == "server":
+                    print_ttc_server_response(
+                        item.get("job_type", ""), item.get("server_raw_text", "")
+                    )
+                    print_info("Bỏ qua loại job này trong lượt áp dụng hiện tại.")
 
         if fetched_jobs:
             break
 
-        wait_seconds = _ttc_no_job_wait_seconds(no_job_metadata)
+        wait_seconds = _ttc_no_job_wait_seconds(
+            no_job_metadata
+            + [
+                {"countdown": item.get("remaining", 0)}
+                for item in cooldown_metadata
+                if isinstance(item, dict)
+            ]
+        )
         print_info("No supported TTC job is currently available.")
         countdown(wait_seconds, "Waiting before the next TTC fetch")
 
@@ -3141,6 +4825,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
     print_info(f"Scheduler selected {len(jobs)} jobs with hard cap {max_jobs}.")
     total_jobs = len(jobs)
     total_done = 0
+    comment_disabled_for_this_turn = False
 
     for idx, job in enumerate(jobs, start=1):
         type_ = job.get("type")
@@ -3169,7 +4854,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                 action_succeeded = False
                 try:
                     post_id = get_facebook_post_id(f"https://www.facebook.com/{object_id}")
-                    if int(post_id) > 0:
+                    if post_id is not None and int(post_id) > 0:
                         if type_ == "like_facebook":
                             print_info(f"   Executing {reaction} on Facebook object {object_id}")
                             action_succeeded = do_job.auto_reaction(
@@ -3180,7 +4865,23 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                             action_succeeded = do_job.auto_cmt(
                                 post_id, comment_text, fb_token, uid
                             )
-                        time.sleep(3)
+                            comment_evidence = getattr(do_job, "last_comment_evidence", None)
+                            if not isinstance(comment_evidence, dict):
+                                comment_evidence = {}
+                            if action_succeeded:
+                                if _is_comment_pending_approval(comment_evidence):
+                                    comment_disabled_for_this_turn = True
+                                    print_warning("Acc yếu bị Facebook ẩn comment.")
+                                    print_info("Bỏ qua TTC claim cho Comment này.")
+                                    print_info(
+                                        "Bỏ Comment trong lượt hiện tại, "
+                                        "chuyển sang Like tiếp tục làm."
+                                    )
+                        if not comment_disabled_for_this_turn:
+                            settle_seconds = (
+                                5 if type_ == "like_poster" and action_succeeded else 3
+                            )
+                            time.sleep(settle_seconds)
                     else:
                         print_warning(
                             f"[{idx}/{total_jobs}] {job_type_display} | Could not resolve "
@@ -3189,6 +4890,28 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                 except Exception as exc:
                     print_error(f"[{idx}/{total_jobs}] Facebook {type_} error: {exc}")
 
+                if comment_disabled_for_this_turn:
+                    remaining_jobs = max_jobs - total_done
+                    if remaining_jobs > 0:
+                        print_info("Đang lấy job Like...")
+                        fallback_done = run_ttc_jobs(
+                            api,
+                            fb_token,
+                            max_jobs=remaining_jobs,
+                            job_types={"like_facebook"},
+                            like_batch_limit=like_batch_limit,
+                            comment_batch_limit=comment_batch_limit,
+                            like_batch_min=like_batch_min,
+                            like_batch_max=like_batch_max,
+                            comment_batch_min=comment_batch_min,
+                            comment_batch_max=comment_batch_max,
+                            like_delay_range=like_delay_range,
+                            comment_delay_range=comment_delay_range,
+                            failed_delay_range=failed_delay_range,
+                        )
+                        total_done += fallback_done
+                    print_info(f"Completed {total_done}/{max_jobs} jobs. Total coin: {total_coin}")
+                    return total_done
                 if action_succeeded:
                     result = api.submit_job(original_job)
                     if result.get("success") is True:
@@ -3196,16 +4919,15 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                         job_succeeded = True
                         total_done += 1
                         total_coin += earned
-                        result_message = result.get("message", "")
                         print_success(
                             f"[{idx}/{total_jobs}] {job_type_display} | +{earned} | "
-                            f"Total: {total_coin} | {result_message}"
+                            f"Total: {total_coin}"
                         )
                     else:
-                        print_warning(
-                            f"[{idx}/{total_jobs}] {job_type_display} | TTC submit failed: "
-                            f"{result.get('message', '')}"
-                        )
+                        server_raw_text = result.get("server_raw_text", "")
+                        if isinstance(server_raw_text, str) and server_raw_text:
+                            print_ttc_server_response("CLAIM", server_raw_text)
+                        print_warning("TTC không xác nhận job.")
                 else:
                     print_warning(
                         f"[{idx}/{total_jobs}] {job_type_display} | Facebook action failed; "
@@ -3247,6 +4969,7 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
         account_delay_min, account_delay_max,
     )
     cycle = 1
+    ttc_fetch_state = TTCFetchState()
     while True:
         print_info(f"=== CHU KỲ {cycle} ===")
         total_all = 0
@@ -3261,6 +4984,7 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
             try:
                 worker_id = f"{profile_id or 'profile'}:{idx+1}"
                 api = API_TTC(auth_token, worker_id=worker_id)
+                api.use_fetch_state(ttc_fetch_state)
                 api.login()
                 done = run_ttc_jobs(
                     api,
@@ -3278,7 +5002,8 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
                 total_all += done
                 print_info(f"{identity} đã làm {done} job.")
             except Exception as exc:
-                print_error(f"Lỗi với {identity}: {exc}")
+                if not print_ttc_exception(f"Lỗi TTC với {identity}.", exc):
+                    print_error(f"Lỗi với {identity}: {exc}")
             finally:
                 if api:
                     api.close()
@@ -3299,7 +5024,7 @@ def run_active_profile(profile):
         print_error("TTC profile chưa có token.")
         return
     if not accounts:
-        print_warning("⚠️ Chưa có Facebook account nào được bật để chạy.")
+        print_warning("Chưa có Facebook account nào được bật để chạy.")
         return
     config = normalize_run_config(profile.get('run_config'))
     print_info(run_config_summary(config))
@@ -3358,7 +5083,8 @@ def check_balance(profile):
     except RuntimeError as e:
         print_error(str(e))
     except Exception as exc:
-        print_error(f"Lỗi: {exc}")
+        if not print_ttc_exception("Lỗi TTC khi kiểm tra số dư.", exc):
+            print_error(f"Lỗi: {exc}")
     finally:
         if api:
             api.close()
@@ -3409,7 +5135,8 @@ def show_jobs_for_profile(profile):
     except RuntimeError as e:
         print_error(str(e))
     except Exception as exc:
-        print_error(f"Lỗi: {exc}")
+        if not print_ttc_exception("Lỗi TTC khi lấy danh sách job.", exc):
+            print_error(f"Lỗi: {exc}")
     finally:
         if api:
             api.close()

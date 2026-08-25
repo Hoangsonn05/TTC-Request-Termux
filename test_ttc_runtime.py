@@ -4,8 +4,8 @@ import inspect
 import unittest
 from unittest.mock import MagicMock, call, patch
 
-import api_bumx
-from api_bumx import (
+import api_ttc
+from api_ttc import (
     TTCAuthError,
     TTCRateLimitError,
     TTCResponseError,
@@ -46,7 +46,7 @@ def fetched(*jobs, no_job=None, cooldowns=None, permanent_skips=None):
 
 class TTCCoreRuntimeTests(unittest.TestCase):
     def setUp(self):
-        api_bumx.total_coin = 0
+        api_ttc.total_coin = 0
 
     def _run_worker(self, api, *, job_types, action=None, **kwargs):
         if action is None:
@@ -66,16 +66,16 @@ class TTCCoreRuntimeTests(unittest.TestCase):
         }
         defaults.update(kwargs)
         with (
-            patch.object(api_bumx, "AUTO_Action", return_value=action),
-            patch.object(api_bumx, "get_facebook_post_id", side_effect=lambda url: url.rsplit("/", 1)[-1]),
-            patch.object(api_bumx.time, "sleep") as sleep,
-            patch.object(api_bumx, "countdown") as countdown,
-            patch.object(api_bumx, "print_info"),
-            patch.object(api_bumx, "print_warning"),
-            patch.object(api_bumx, "print_error"),
-            patch.object(api_bumx, "print_success"),
+            patch.object(api_ttc, "AUTO_Action", return_value=action),
+            patch.object(api_ttc, "get_facebook_post_id", side_effect=lambda url: url.rsplit("/", 1)[-1]),
+            patch.object(api_ttc.time, "sleep") as sleep,
+            patch.object(api_ttc, "countdown") as countdown,
+            patch.object(api_ttc, "print_info"),
+            patch.object(api_ttc, "print_warning"),
+            patch.object(api_ttc, "print_error"),
+            patch.object(api_ttc, "print_success"),
         ):
-            done = api_bumx.run_ttc_jobs(
+            done = api_ttc.run_ttc_jobs(
                 api,
                 "facebook-token",
                 job_types=job_types,
@@ -101,20 +101,20 @@ class TTCCoreRuntimeTests(unittest.TestCase):
             or {"success": True, "earned_coin": "37", "message": "ok"}
         )
 
-        real_scheduler = api_bumx.schedule_jobs_by_burst
+        real_scheduler = api_ttc.schedule_jobs_by_burst
         with (
-            patch.object(api_bumx, "API_TTC", return_value=api) as ttc_class,
-            patch.object(api_bumx, "AUTO_Action", return_value=action),
-            patch.object(api_bumx, "get_facebook_post_id", return_value="10001"),
-            patch.object(api_bumx, "schedule_jobs_by_burst", wraps=real_scheduler) as scheduler,
-            patch.object(api_bumx.time, "sleep") as sleep,
-            patch.object(api_bumx, "countdown") as countdown,
-            patch.object(api_bumx, "print_info"),
-            patch.object(api_bumx, "print_warning"),
-            patch.object(api_bumx, "print_error"),
-            patch.object(api_bumx, "print_success"),
+            patch.object(api_ttc, "API_TTC", return_value=api) as ttc_class,
+            patch.object(api_ttc, "AUTO_Action", return_value=action),
+            patch.object(api_ttc, "get_facebook_post_id", return_value="10001"),
+            patch.object(api_ttc, "schedule_jobs_by_burst", wraps=real_scheduler) as scheduler,
+            patch.object(api_ttc.time, "sleep") as sleep,
+            patch.object(api_ttc, "countdown") as countdown,
+            patch.object(api_ttc, "print_info"),
+            patch.object(api_ttc, "print_warning"),
+            patch.object(api_ttc, "print_error"),
+            patch.object(api_ttc, "print_success"),
         ):
-            api_bumx.run_multi_tokens(
+            api_ttc.run_multi_tokens(
                 "ttc-profile-token",
                 [{"email": "first", "token": "facebook-token"}],
                 max_jobs_per_acc=1,
@@ -154,7 +154,7 @@ class TTCCoreRuntimeTests(unittest.TestCase):
         sleep.assert_called_once_with(3)
         countdown.assert_not_called()
         self.assertEqual(original, original_snapshot)
-        self.assertEqual(api_bumx.total_coin, 37)
+        self.assertEqual(api_ttc.total_coin, 37)
 
     def test_comment_failure_and_semantic_submit_failure_use_failed_delay(self):
         first = make_original("comment", "1", comment="first comment")
@@ -181,7 +181,7 @@ class TTCCoreRuntimeTests(unittest.TestCase):
         )
 
         self.assertEqual(done, 1)
-        self.assertEqual(api_bumx.total_coin, 11)
+        self.assertEqual(api_ttc.total_coin, 11)
         self.assertEqual(
             action.auto_cmt.call_args_list,
             [
@@ -262,17 +262,17 @@ class TTCCoreRuntimeTests(unittest.TestCase):
         }
 
         with (
-            patch.object(api_bumx, "AUTO_Action", return_value=action),
-            patch.object(api_bumx, "get_facebook_post_id", return_value="10001"),
-            patch.object(api_bumx.time, "sleep"),
-            patch.object(api_bumx, "countdown"),
-            patch.object(api_bumx, "print_info") as info,
-            patch.object(api_bumx, "print_warning") as warning,
-            patch.object(api_bumx, "print_error"),
-            patch.object(api_bumx, "print_success"),
+            patch.object(api_ttc, "AUTO_Action", return_value=action),
+            patch.object(api_ttc, "get_facebook_post_id", return_value="10001"),
+            patch.object(api_ttc.time, "sleep"),
+            patch.object(api_ttc, "countdown"),
+            patch.object(api_ttc, "print_info") as info,
+            patch.object(api_ttc, "print_warning") as warning,
+            patch.object(api_ttc, "print_error"),
+            patch.object(api_ttc, "print_success"),
             patch("builtins.print") as raw_output,
         ):
-            done = api_bumx.run_ttc_jobs(
+            done = api_ttc.run_ttc_jobs(
                 api,
                 "facebook-token",
                 max_jobs=10,
@@ -287,7 +287,7 @@ class TTCCoreRuntimeTests(unittest.TestCase):
             )
 
         self.assertEqual(done, 10)
-        self.assertEqual(api_bumx.total_coin, 10)
+        self.assertEqual(api_ttc.total_coin, 10)
         action.auto_cmt.assert_called_once_with(
             "10001", "comment 11", "facebook-token", "fb-uid"
         )
@@ -308,12 +308,12 @@ class TTCCoreRuntimeTests(unittest.TestCase):
             self.assertFalse(str(item.args[0]).startswith(("⚠️", "ℹ️", "✅", "❌", "⏳")))
 
     def test_only_exact_pending_privacy_value_activates_comment_fallback(self):
-        self.assertTrue(api_bumx._is_comment_pending_approval({
+        self.assertTrue(api_ttc._is_comment_pending_approval({
             "visibility_scalars": {"comment_privacy_value": "PENDING_APPROVAL"}
         }))
         for value in ("PENDING_APPROVAL ", "DEFAULT", None, True):
             with self.subTest(value=value):
-                self.assertFalse(api_bumx._is_comment_pending_approval({
+                self.assertFalse(api_ttc._is_comment_pending_approval({
                     "visibility_scalars": {
                         "comment_privacy_value": value,
                         "spam_display_mode": "none",
@@ -373,12 +373,12 @@ class TTCCoreRuntimeTests(unittest.TestCase):
 
         with (
             patch.object(
-                api_bumx,
+                api_ttc,
                 "API_TTC",
                 side_effect=[api_a, api_b, api_c, api_d, api_a_next_cycle, KeyboardInterrupt()],
             ),
             patch.object(
-                api_bumx,
+                api_ttc,
                 "AUTO_Action",
                 side_effect=[
                     pending_action,
@@ -389,16 +389,16 @@ class TTCCoreRuntimeTests(unittest.TestCase):
                     a_next_cycle_action,
                 ],
             ),
-            patch.object(api_bumx, "get_facebook_post_id", return_value="10001"),
-            patch.object(api_bumx.time, "sleep"),
-            patch.object(api_bumx, "countdown"),
-            patch.object(api_bumx, "print_info"),
-            patch.object(api_bumx, "print_warning"),
-            patch.object(api_bumx, "print_error"),
-            patch.object(api_bumx, "print_success"),
+            patch.object(api_ttc, "get_facebook_post_id", return_value="10001"),
+            patch.object(api_ttc.time, "sleep"),
+            patch.object(api_ttc, "countdown"),
+            patch.object(api_ttc, "print_info"),
+            patch.object(api_ttc, "print_warning"),
+            patch.object(api_ttc, "print_error"),
+            patch.object(api_ttc, "print_success"),
         ):
             with self.assertRaises(KeyboardInterrupt):
-                api_bumx.run_multi_tokens(
+                api_ttc.run_multi_tokens(
                     "ttc-profile-token",
                     accounts,
                     max_jobs_per_acc=10,
@@ -448,20 +448,20 @@ class TTCCoreRuntimeTests(unittest.TestCase):
         }
 
         with (
-            patch.object(api_bumx, "AUTO_Action", return_value=action),
-            patch.object(api_bumx, "get_facebook_post_id", return_value="10001"),
+            patch.object(api_ttc, "AUTO_Action", return_value=action),
+            patch.object(api_ttc, "get_facebook_post_id", return_value="10001"),
             patch.object(
-                api_bumx.time,
+                api_ttc.time,
                 "sleep",
                 side_effect=lambda seconds: events.append(("sleep", seconds)),
             ),
-            patch.object(api_bumx, "countdown"),
-            patch.object(api_bumx, "print_info"),
-            patch.object(api_bumx, "print_warning"),
-            patch.object(api_bumx, "print_error"),
-            patch.object(api_bumx, "print_success"),
+            patch.object(api_ttc, "countdown"),
+            patch.object(api_ttc, "print_info"),
+            patch.object(api_ttc, "print_warning"),
+            patch.object(api_ttc, "print_error"),
+            patch.object(api_ttc, "print_success"),
         ):
-            done = api_bumx.run_ttc_jobs(
+            done = api_ttc.run_ttc_jobs(
                 api,
                 "facebook-token",
                 max_jobs=1,
@@ -492,16 +492,16 @@ class TTCCoreRuntimeTests(unittest.TestCase):
         }
 
         with (
-            patch.object(api_bumx, "AUTO_Action", return_value=action),
-            patch.object(api_bumx, "get_facebook_post_id", return_value="10001"),
-            patch.object(api_bumx.time, "sleep"),
-            patch.object(api_bumx, "countdown"),
-            patch.object(api_bumx, "print_info") as info,
-            patch.object(api_bumx, "print_warning") as warning,
-            patch.object(api_bumx, "print_error") as error,
-            patch.object(api_bumx, "print_success") as success,
+            patch.object(api_ttc, "AUTO_Action", return_value=action),
+            patch.object(api_ttc, "get_facebook_post_id", return_value="10001"),
+            patch.object(api_ttc.time, "sleep"),
+            patch.object(api_ttc, "countdown"),
+            patch.object(api_ttc, "print_info") as info,
+            patch.object(api_ttc, "print_warning") as warning,
+            patch.object(api_ttc, "print_error") as error,
+            patch.object(api_ttc, "print_success") as success,
         ):
-            done = api_bumx.run_ttc_jobs(
+            done = api_ttc.run_ttc_jobs(
                 api,
                 "facebook-token",
                 max_jobs=1,
@@ -541,17 +541,17 @@ class TTCCoreRuntimeTests(unittest.TestCase):
         action.auto_cmt.return_value = True
 
         with (
-            patch.object(api_bumx, "AUTO_Action", return_value=action),
-            patch.object(api_bumx, "get_facebook_post_id", return_value="10001"),
-            patch.object(api_bumx.time, "sleep"),
-            patch.object(api_bumx, "countdown"),
-            patch.object(api_bumx, "print_info"),
-            patch.object(api_bumx, "print_warning") as warning,
-            patch.object(api_bumx, "print_error"),
-            patch.object(api_bumx, "print_success"),
+            patch.object(api_ttc, "AUTO_Action", return_value=action),
+            patch.object(api_ttc, "get_facebook_post_id", return_value="10001"),
+            patch.object(api_ttc.time, "sleep"),
+            patch.object(api_ttc, "countdown"),
+            patch.object(api_ttc, "print_info"),
+            patch.object(api_ttc, "print_warning") as warning,
+            patch.object(api_ttc, "print_error"),
+            patch.object(api_ttc, "print_success"),
             patch("builtins.print") as raw_output,
         ):
-            api_bumx.run_ttc_jobs(
+            api_ttc.run_ttc_jobs(
                 api,
                 "facebook-token",
                 max_jobs=1,
@@ -582,16 +582,16 @@ class TTCCoreRuntimeTests(unittest.TestCase):
         action.auto_cmt.return_value = False
 
         with (
-            patch.object(api_bumx, "AUTO_Action", return_value=action),
-            patch.object(api_bumx, "get_facebook_post_id", return_value="10001"),
-            patch.object(api_bumx.time, "sleep"),
-            patch.object(api_bumx, "countdown"),
-            patch.object(api_bumx, "print_info") as info,
-            patch.object(api_bumx, "print_warning") as warning,
-            patch.object(api_bumx, "print_error") as error,
-            patch.object(api_bumx, "print_success") as success,
+            patch.object(api_ttc, "AUTO_Action", return_value=action),
+            patch.object(api_ttc, "get_facebook_post_id", return_value="10001"),
+            patch.object(api_ttc.time, "sleep"),
+            patch.object(api_ttc, "countdown"),
+            patch.object(api_ttc, "print_info") as info,
+            patch.object(api_ttc, "print_warning") as warning,
+            patch.object(api_ttc, "print_error") as error,
+            patch.object(api_ttc, "print_success") as success,
         ):
-            api_bumx.run_ttc_jobs(
+            api_ttc.run_ttc_jobs(
                 api,
                 "facebook-token",
                 max_jobs=1,
@@ -635,17 +635,17 @@ class TTCCoreRuntimeTests(unittest.TestCase):
         action.auto_cmt.return_value = False
 
         with (
-            patch.object(api_bumx, "AUTO_Action", return_value=action),
-            patch.object(api_bumx, "get_facebook_post_id", return_value="10001"),
-            patch.object(api_bumx.time, "sleep"),
-            patch.object(api_bumx, "countdown"),
-            patch.object(api_bumx, "print_info") as info,
-            patch.object(api_bumx, "print_warning") as warning,
-            patch.object(api_bumx, "print_error"),
-            patch.object(api_bumx, "print_success"),
+            patch.object(api_ttc, "AUTO_Action", return_value=action),
+            patch.object(api_ttc, "get_facebook_post_id", return_value="10001"),
+            patch.object(api_ttc.time, "sleep"),
+            patch.object(api_ttc, "countdown"),
+            patch.object(api_ttc, "print_info") as info,
+            patch.object(api_ttc, "print_warning") as warning,
+            patch.object(api_ttc, "print_error"),
+            patch.object(api_ttc, "print_success"),
             patch("builtins.print") as raw_output,
         ):
-            api_bumx.run_ttc_jobs(
+            api_ttc.run_ttc_jobs(
                 api,
                 "facebook-token",
                 max_jobs=1,
@@ -672,11 +672,11 @@ class TTCCoreRuntimeTests(unittest.TestCase):
         })()
 
         with (
-            patch.object(api_bumx, "print_error") as error,
-            patch.object(api_bumx, "print_warning") as warning,
+            patch.object(api_ttc, "print_error") as error,
+            patch.object(api_ttc, "print_warning") as warning,
             patch("builtins.print") as raw_output,
         ):
-            handled = api_bumx.print_ttc_exception("TTC request failed.", exc)
+            handled = api_ttc.print_ttc_exception("TTC request failed.", exc)
 
         self.assertTrue(handled)
         self.assertEqual(error.call_args_list, [call("TTC request failed.")])
@@ -703,21 +703,21 @@ class TTCCoreRuntimeTests(unittest.TestCase):
         )
 
         self.assertEqual(done, 1)
-        self.assertEqual(api_bumx.total_coin, 12)
+        self.assertEqual(api_ttc.total_coin, 12)
         api.submit_job.assert_called_once_with(second)
         countdown.assert_called_once_with(7, unittest.mock.ANY)
 
     def test_facebook_timeout_is_clean_failure_and_next_job_continues(self):
         session = MagicMock()
-        session.get.side_effect = api_bumx.requests.exceptions.ReadTimeout(
+        session.get.side_effect = api_ttc.requests.exceptions.ReadTimeout(
             "synthetic Facebook read timeout"
         )
         with (
-            patch.object(api_bumx.requests, "Session", return_value=session),
+            patch.object(api_ttc.requests, "Session", return_value=session),
             patch("builtins.print"),
         ):
             self.assertIsNone(
-                api_bumx.get_facebook_post_id("https://www.facebook.com/first")
+                api_ttc.get_facebook_post_id("https://www.facebook.com/first")
             )
 
         first = make_original("like_post_vip_cheo", "timeout", reaction="LIKE")
@@ -733,20 +733,20 @@ class TTCCoreRuntimeTests(unittest.TestCase):
         action.auto_reaction.return_value = True
 
         with (
-            patch.object(api_bumx, "AUTO_Action", return_value=action),
+            patch.object(api_ttc, "AUTO_Action", return_value=action),
             patch.object(
-                api_bumx,
+                api_ttc,
                 "get_facebook_post_id",
                 side_effect=[None, "10002"],
             ),
-            patch.object(api_bumx.time, "sleep"),
-            patch.object(api_bumx, "countdown"),
-            patch.object(api_bumx, "print_info"),
-            patch.object(api_bumx, "print_warning"),
-            patch.object(api_bumx, "print_error"),
-            patch.object(api_bumx, "print_success"),
+            patch.object(api_ttc.time, "sleep"),
+            patch.object(api_ttc, "countdown"),
+            patch.object(api_ttc, "print_info"),
+            patch.object(api_ttc, "print_warning"),
+            patch.object(api_ttc, "print_error"),
+            patch.object(api_ttc, "print_success"),
         ):
-            done = api_bumx.run_ttc_jobs(
+            done = api_ttc.run_ttc_jobs(
                 api,
                 "facebook-token",
                 max_jobs=2,
@@ -820,12 +820,12 @@ class TTCCoreRuntimeTests(unittest.TestCase):
                 self.assertIs(caught.exception, error)
 
     def test_reward_normalization_uses_zero_for_missing_or_invalid_values(self):
-        self.assertEqual(api_bumx._normalize_ttc_earned_coin(None), 0)
-        self.assertEqual(api_bumx._normalize_ttc_earned_coin(""), 0)
-        self.assertEqual(api_bumx._normalize_ttc_earned_coin("invalid"), 0)
-        self.assertEqual(api_bumx._normalize_ttc_earned_coin(True), 0)
-        self.assertEqual(api_bumx._normalize_ttc_earned_coin(-5), 0)
-        self.assertEqual(api_bumx._normalize_ttc_earned_coin("25"), 25)
+        self.assertEqual(api_ttc._normalize_ttc_earned_coin(None), 0)
+        self.assertEqual(api_ttc._normalize_ttc_earned_coin(""), 0)
+        self.assertEqual(api_ttc._normalize_ttc_earned_coin("invalid"), 0)
+        self.assertEqual(api_ttc._normalize_ttc_earned_coin(True), 0)
+        self.assertEqual(api_ttc._normalize_ttc_earned_coin(-5), 0)
+        self.assertEqual(api_ttc._normalize_ttc_earned_coin("25"), 25)
 
     def test_invalid_facebook_identity_stops_before_uid_or_fetch(self):
         api = MagicMock()
@@ -849,16 +849,16 @@ class TTCCoreRuntimeTests(unittest.TestCase):
             "name": "profile",
             "auth_token": "token-from-auth-token",
             "fb_accounts": [{"email": "a", "token": "facebook-token"}],
-            "run_config": api_bumx.normalize_run_config(),
+            "run_config": api_ttc.normalize_run_config(),
         }
         with (
-            patch.object(api_bumx, "selected_accounts", return_value=profile["fb_accounts"]),
-            patch.object(api_bumx, "profile_run_lock", return_value=contextlib.nullcontext()),
-            patch.object(api_bumx, "run_multi_tokens") as run_multi,
-            patch.object(api_bumx, "print_info"),
-            patch.object(api_bumx, "print_error"),
+            patch.object(api_ttc, "selected_accounts", return_value=profile["fb_accounts"]),
+            patch.object(api_ttc, "profile_run_lock", return_value=contextlib.nullcontext()),
+            patch.object(api_ttc, "run_multi_tokens") as run_multi,
+            patch.object(api_ttc, "print_info"),
+            patch.object(api_ttc, "print_error"),
         ):
-            api_bumx.run_active_profile(profile)
+            api_ttc.run_active_profile(profile)
 
         self.assertEqual(run_multi.call_args.args[0], "token-from-auth-token")
         self.assertIs(run_multi.call_args.args[1], profile["fb_accounts"])
@@ -874,22 +874,22 @@ class TTCCoreRuntimeTests(unittest.TestCase):
         action = MagicMock()
         action.get_info.side_effect = [("uid-a", "OK"), ("uid-b", "OK")]
         action.auto_reaction.return_value = True
-        real_scheduler = api_bumx.schedule_jobs_by_burst
+        real_scheduler = api_ttc.schedule_jobs_by_burst
 
         with (
-            patch.object(api_bumx, "API_TTC", side_effect=apis) as ttc_class,
-            patch.object(api_bumx, "AUTO_Action", return_value=action),
-            patch.object(api_bumx, "get_facebook_post_id", return_value="10001"),
-            patch.object(api_bumx, "schedule_jobs_by_burst", wraps=real_scheduler) as scheduler,
-            patch.object(api_bumx.time, "sleep"),
-            patch.object(api_bumx.random, "randint", side_effect=lambda a, b: a),
-            patch.object(api_bumx, "countdown") as countdown,
-            patch.object(api_bumx, "print_info"),
-            patch.object(api_bumx, "print_warning"),
-            patch.object(api_bumx, "print_error"),
-            patch.object(api_bumx, "print_success"),
+            patch.object(api_ttc, "API_TTC", side_effect=apis) as ttc_class,
+            patch.object(api_ttc, "AUTO_Action", return_value=action),
+            patch.object(api_ttc, "get_facebook_post_id", return_value="10001"),
+            patch.object(api_ttc, "schedule_jobs_by_burst", wraps=real_scheduler) as scheduler,
+            patch.object(api_ttc.time, "sleep"),
+            patch.object(api_ttc.random, "randint", side_effect=lambda a, b: a),
+            patch.object(api_ttc, "countdown") as countdown,
+            patch.object(api_ttc, "print_info"),
+            patch.object(api_ttc, "print_warning"),
+            patch.object(api_ttc, "print_error"),
+            patch.object(api_ttc, "print_success"),
         ):
-            api_bumx.run_multi_tokens(
+            api_ttc.run_multi_tokens(
                 "ttc-token",
                 [{"email": "a", "token": "fb-a"}, {"email": "b", "token": "fb-b"}],
                 max_jobs_per_acc=2,
@@ -935,18 +935,18 @@ class TTCCoreRuntimeTests(unittest.TestCase):
         action.auto_reaction.return_value = False
 
         with (
-            patch.object(api_bumx, "API_TTC", side_effect=[first_api, KeyboardInterrupt]) as ttc_class,
-            patch.object(api_bumx, "AUTO_Action", return_value=action),
-            patch.object(api_bumx, "get_facebook_post_id", return_value="10001"),
-            patch.object(api_bumx.time, "sleep"),
-            patch.object(api_bumx, "countdown") as countdown,
-            patch.object(api_bumx, "print_info"),
-            patch.object(api_bumx, "print_warning"),
-            patch.object(api_bumx, "print_error"),
-            patch.object(api_bumx, "print_success"),
+            patch.object(api_ttc, "API_TTC", side_effect=[first_api, KeyboardInterrupt]) as ttc_class,
+            patch.object(api_ttc, "AUTO_Action", return_value=action),
+            patch.object(api_ttc, "get_facebook_post_id", return_value="10001"),
+            patch.object(api_ttc.time, "sleep"),
+            patch.object(api_ttc, "countdown") as countdown,
+            patch.object(api_ttc, "print_info"),
+            patch.object(api_ttc, "print_warning"),
+            patch.object(api_ttc, "print_error"),
+            patch.object(api_ttc, "print_success"),
         ):
             with self.assertRaises(KeyboardInterrupt):
-                api_bumx.run_multi_tokens(
+                api_ttc.run_multi_tokens(
                     "ttc-token",
                     [{"email": "a", "token": "fb"}],
                     continuous=True,
@@ -1002,19 +1002,19 @@ class TTCCoreRuntimeTests(unittest.TestCase):
         action.auto_cmt.return_value = True
 
         with (
-            patch.object(api_bumx, "API_TTC", side_effect=[first_api, second_api, KeyboardInterrupt]),
-            patch.object(api_bumx, "AUTO_Action", return_value=action),
-            patch.object(api_bumx, "get_facebook_post_id", side_effect=lambda url: url.rsplit("/", 1)[-1]),
-            patch.object(api_bumx.time, "sleep"),
-            patch.object(api_bumx, "countdown"),
-            patch.object(api_bumx, "print_info"),
-            patch.object(api_bumx, "print_warning") as warning,
-            patch.object(api_bumx, "print_error"),
-            patch.object(api_bumx, "print_success"),
+            patch.object(api_ttc, "API_TTC", side_effect=[first_api, second_api, KeyboardInterrupt]),
+            patch.object(api_ttc, "AUTO_Action", return_value=action),
+            patch.object(api_ttc, "get_facebook_post_id", side_effect=lambda url: url.rsplit("/", 1)[-1]),
+            patch.object(api_ttc.time, "sleep"),
+            patch.object(api_ttc, "countdown"),
+            patch.object(api_ttc, "print_info"),
+            patch.object(api_ttc, "print_warning") as warning,
+            patch.object(api_ttc, "print_error"),
+            patch.object(api_ttc, "print_success"),
             patch("builtins.print") as raw_output,
         ):
             with self.assertRaises(KeyboardInterrupt):
-                api_bumx.run_multi_tokens(
+                api_ttc.run_multi_tokens(
                     "ttc-token",
                     [{"email": "a", "token": "fb-a"}],
                     continuous=True,
@@ -1044,7 +1044,7 @@ class TTCCoreRuntimeTests(unittest.TestCase):
         self.assertEqual(first_api.submit_job.call_count, 1)
         self.assertEqual(second_api.submit_job.call_count, 1)
         self.assertEqual(action.auto_cmt.call_count, 2)
-        self.assertEqual(api_bumx.total_coin, 24)
+        self.assertEqual(api_ttc.total_coin, 24)
         self.assertIn(call('{"error":"not eligible"}'), raw_output.call_args_list)
         self.assertIn("[TTC][ttc_like_post_vip_cheo]", [
             item.args[0] for item in warning.call_args_list
@@ -1064,17 +1064,17 @@ class TTCCoreRuntimeTests(unittest.TestCase):
             ]
             action.auto_reaction.return_value = False
             with (
-                patch.object(api_bumx, "API_TTC", side_effect=apis),
-                patch.object(api_bumx, "AUTO_Action", return_value=action),
-                patch.object(api_bumx, "get_facebook_post_id", return_value="10001"),
-                patch.object(api_bumx.time, "sleep"),
-                patch.object(api_bumx, "countdown"),
-                patch.object(api_bumx, "print_info"),
-                patch.object(api_bumx, "print_warning"),
-                patch.object(api_bumx, "print_error"),
-                patch.object(api_bumx, "print_success"),
+                patch.object(api_ttc, "API_TTC", side_effect=apis),
+                patch.object(api_ttc, "AUTO_Action", return_value=action),
+                patch.object(api_ttc, "get_facebook_post_id", return_value="10001"),
+                patch.object(api_ttc.time, "sleep"),
+                patch.object(api_ttc, "countdown"),
+                patch.object(api_ttc, "print_info"),
+                patch.object(api_ttc, "print_warning"),
+                patch.object(api_ttc, "print_error"),
+                patch.object(api_ttc, "print_success"),
             ):
-                api_bumx.run_multi_tokens(
+                api_ttc.run_multi_tokens(
                     "ttc-token",
                     [
                         {"email": str(index), "token": f"fb-{index}"}
@@ -1155,14 +1155,14 @@ class TTCCoreRuntimeTests(unittest.TestCase):
         action = MagicMock()
         action.get_info.return_value = ("uid", "OK")
         with (
-            patch.object(api_bumx, "API_TTC", return_value=api),
-            patch.object(api_bumx, "AUTO_Action", return_value=action),
-            patch.object(api_bumx, "print_info"),
-            patch.object(api_bumx, "print_warning"),
-            patch.object(api_bumx, "print_error") as print_error,
-            patch.object(api_bumx, "print_success"),
+            patch.object(api_ttc, "API_TTC", return_value=api),
+            patch.object(api_ttc, "AUTO_Action", return_value=action),
+            patch.object(api_ttc, "print_info"),
+            patch.object(api_ttc, "print_warning"),
+            patch.object(api_ttc, "print_error") as print_error,
+            patch.object(api_ttc, "print_success"),
         ):
-            api_bumx.run_multi_tokens(
+            api_ttc.run_multi_tokens(
                 "ttc-token",
                 [{"email": "a", "token": "fb"}],
                 job_types={"like_facebook"},
@@ -1184,16 +1184,16 @@ class TTCCoreRuntimeTests(unittest.TestCase):
         self.assertIn("expired", print_error.call_args.args[0])
 
     def test_core_source_has_no_bumx_mission_report_or_fixed_waits(self):
-        multi_source = inspect.getsource(api_bumx.run_multi_tokens)
-        worker_source = inspect.getsource(api_bumx.run_ttc_jobs)
-        self.assertFalse(hasattr(api_bumx, "API_BUMX"))
+        multi_source = inspect.getsource(api_ttc.run_multi_tokens)
+        worker_source = inspect.getsource(api_ttc.run_ttc_jobs)
+        self.assertFalse(hasattr(api_ttc, "API_BUMX"))
         self.assertIn("API_TTC(", multi_source)
         self.assertNotIn("API_BUMX(", multi_source)
         self.assertNotIn("countdown(20", multi_source)
-        self.assertNotIn("API_BUMX(", inspect.getsource(api_bumx.check_balance))
-        self.assertIn("API_TTC(", inspect.getsource(api_bumx.check_balance))
-        self.assertNotIn("API_BUMX(", inspect.getsource(api_bumx.show_jobs_for_profile))
-        self.assertIn("API_TTC(", inspect.getsource(api_bumx.show_jobs_for_profile))
+        self.assertNotIn("API_BUMX(", inspect.getsource(api_ttc.check_balance))
+        self.assertIn("API_TTC(", inspect.getsource(api_ttc.check_balance))
+        self.assertNotIn("API_BUMX(", inspect.getsource(api_ttc.show_jobs_for_profile))
+        self.assertIn("API_TTC(", inspect.getsource(api_ttc.show_jobs_for_profile))
         for forbidden in (
             "get_new_mission_jobs",
             "get_mission_jobs",

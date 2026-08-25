@@ -5,8 +5,8 @@ import time
 import unittest
 from unittest.mock import patch
 
-import api_bumx
-from api_bumx import (
+import api_ttc
+from api_ttc import (
     API_TTC,
     TTCAuthError,
     TTCClient,
@@ -222,7 +222,7 @@ class TTCFetchParserTests(unittest.TestCase):
         self.assertEqual(job["content_type"], "application/json; charset=utf-8")
 
     def test_all_supported_jobs_are_executable_and_claimable_after_normalization(self):
-        executor = api_bumx.AUTO_Action()
+        executor = api_ttc.AUTO_Action()
         self.addCleanup(executor._requests.close)
         supported_types = (
             TTCJobType.LIKE_POST_VIP_CHEO,
@@ -561,7 +561,7 @@ class TTCFetchParserTests(unittest.TestCase):
 
 class APITTCAdapterTests(unittest.TestCase):
     def setUp(self):
-        client_patcher = patch("api_bumx.TTCClient", autospec=True)
+        client_patcher = patch("api_ttc.TTCClient", autospec=True)
         self.addCleanup(client_patcher.stop)
         self.client_class = client_patcher.start()
         self.client = self.client_class.return_value
@@ -607,8 +607,8 @@ class APITTCAdapterTests(unittest.TestCase):
         self.assertEqual(len(result["jobs"]), 4)
         self.assertTrue(all(job["type"] == "like_facebook" for job in result["jobs"]))
         self.assertEqual(result["no_job"], [])
-        self.assertNotIn(TTCJobType.FOLLOW, [call.args[0] for call in self.client.get_jobs.call_args_list])
-        self.assertNotIn(TTCJobType.LIKE_PAGE, [call.args[0] for call in self.client.get_jobs.call_args_list])
+        self.assertFalse(hasattr(TTCJobType, "FOLLOW"))
+        self.assertFalse(hasattr(TTCJobType, "LIKE_PAGE"))
 
     def test_comment_fetch_uses_only_comment_endpoint(self):
         original = make_job(TTCJobType.COMMENT)
@@ -664,7 +664,7 @@ class APITTCAdapterTests(unittest.TestCase):
         self.client.get_jobs.side_effect = get_jobs
         self.api.set_facebook_uid("uid-a")
 
-        with patch("api_bumx.time.monotonic", side_effect=(100.0, 120.0, 132.0)):
+        with patch("api_ttc.time.monotonic", side_effect=(100.0, 120.0, 132.0)):
             first = self.api.fetch_jobs_for_legacy_type("like_facebook")
             calls_after_first = list(self.client.get_jobs.call_args_list)
             second = self.api.fetch_jobs_for_legacy_type("like_facebook")
@@ -829,10 +829,10 @@ class APITTCAdapterTests(unittest.TestCase):
         self.client.get_jobs.assert_not_called()
 
     def test_main_runtime_constructs_api_ttc_after_core_cutover(self):
-        source = inspect.getsource(api_bumx.run_multi_tokens)
+        source = inspect.getsource(api_ttc.run_multi_tokens)
         self.assertIn("api = API_TTC(", source)
         self.assertNotIn("api = API_BUMX(", source)
-        self.assertIs(api_bumx.API_TTC, API_TTC)
+        self.assertIs(api_ttc.API_TTC, API_TTC)
 
 
 if __name__ == "__main__":

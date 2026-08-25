@@ -7,8 +7,8 @@ from unittest.mock import patch
 
 import requests
 
-import api_bumx
-from api_bumx import (
+import api_ttc
+from api_ttc import (
     TTCAuthError,
     TTCClient,
     TTCJobType,
@@ -278,31 +278,31 @@ class FacebookAppOAuthConfigurationTests(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.secret_file = os.path.join(self.temp_dir.name, "facebook_app_oauth.txt")
-        file_patcher = patch.object(api_bumx, "FB_APP_OAUTH_FILE", self.secret_file)
+        file_patcher = patch.object(api_ttc, "FB_APP_OAUTH_FILE", self.secret_file)
         file_patcher.start()
         self.addCleanup(file_patcher.stop)
 
     def test_environment_has_priority_over_local_file(self):
         with open(self.secret_file, "w", encoding="utf-8") as stream:
             stream.write("OAuth local-fixture|local-secret")
-        with patch.dict(os.environ, {api_bumx.FB_APP_OAUTH_ENV: "OAuth env-fixture|env-secret"}):
-            self.assertEqual(api_bumx.load_facebook_app_oauth(), "OAuth env-fixture|env-secret")
+        with patch.dict(os.environ, {api_ttc.FB_APP_OAUTH_ENV: "OAuth env-fixture|env-secret"}):
+            self.assertEqual(api_ttc.load_facebook_app_oauth(), "OAuth env-fixture|env-secret")
 
     def test_local_untracked_file_is_used_when_environment_is_absent(self):
         with open(self.secret_file, "w", encoding="utf-8") as stream:
             stream.write("OAuth local-fixture|local-secret\n")
         with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop(api_bumx.FB_APP_OAUTH_ENV, None)
-            self.assertEqual(api_bumx.load_facebook_app_oauth(), "OAuth local-fixture|local-secret")
+            os.environ.pop(api_ttc.FB_APP_OAUTH_ENV, None)
+            self.assertEqual(api_ttc.load_facebook_app_oauth(), "OAuth local-fixture|local-secret")
 
     def test_missing_configuration_fails_before_facebook_request(self):
         with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop(api_bumx.FB_APP_OAUTH_ENV, None)
-            facebook = api_bumx.Requests_facebook()
+            os.environ.pop(api_ttc.FB_APP_OAUTH_ENV, None)
+            facebook = api_ttc.Requests_facebook()
             self.addCleanup(facebook._requests.close)
             with (
                 patch.object(facebook._requests, "post") as post,
-                patch.object(api_bumx, "print_error"),
+                patch.object(api_ttc, "print_error"),
             ):
                 token = facebook.login_and_get_token(
                     "fixture-user", "fixture-password", ""
@@ -310,17 +310,17 @@ class FacebookAppOAuthConfigurationTests(unittest.TestCase):
             self.assertIsNone(token)
             post.assert_not_called()
             self.assertEqual(facebook._last_login_result["status"], "CONFIGURATION_ERROR")
-            self.assertIn(api_bumx.FB_APP_OAUTH_ENV, facebook._last_login_result["message"])
+            self.assertIn(api_ttc.FB_APP_OAUTH_ENV, facebook._last_login_result["message"])
 
     def test_login_loads_once_and_reuses_one_oauth_boundary(self):
-        source = inspect.getsource(api_bumx.Requests_facebook._login_facebook)
+        source = inspect.getsource(api_ttc.Requests_facebook._login_facebook)
         self.assertEqual(source.count("load_facebook_app_oauth()"), 1)
         self.assertEqual(source.count('"Authorization": app_oauth'), 3)
 
 
 class FacebookSensitiveInputPolicyTests(unittest.TestCase):
     def test_batch_password_and_2fa_credentials_use_hidden_input(self):
-        source = inspect.getsource(api_bumx.account_manager)
+        source = inspect.getsource(api_ttc.account_manager)
         self.assertIn("raw_credentials = secret_input", source)
         self.assertNotIn('raw_credentials = input(', source)
 

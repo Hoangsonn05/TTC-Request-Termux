@@ -5,8 +5,8 @@ from unittest.mock import Mock, patch
 
 import requests
 
-import api_bumx
-from api_bumx import (
+import api_ttc
+from api_ttc import (
     TTCAuthError,
     TTCClient,
     TTCJobType,
@@ -151,7 +151,7 @@ class TTCExternalScalarContractTests(unittest.TestCase):
                 payload = {"data": {"user": value, "sodu": 123}}
                 client = client_with_session(RecordingSession(FakeResponse(payload)))
                 with (
-                    patch("api_bumx._safe_json", return_value=payload),
+                    patch("api_ttc._safe_json", return_value=payload),
                     self.assertRaises((TTCAuthError, TTCResponseError)),
                 ):
                     client.authenticate("synthetic-token")
@@ -162,7 +162,7 @@ class TTCExternalScalarContractTests(unittest.TestCase):
                 })
 
     def test_facebook_uid_parser_and_ttc_uid_input_are_text_only(self):
-        facebook = api_bumx.AUTO_Action()
+        facebook = api_ttc.AUTO_Action()
         self.addCleanup(facebook._requests.close)
         for value in ({}, [], True, 123, 123.5):
             with self.subTest(parser_value_type=type(value).__name__):
@@ -263,21 +263,21 @@ class TTCExternalScalarContractTests(unittest.TestCase):
             with self.subTest(exception_invalid_type=type(value).__name__):
                 self.assertEqual(TTCNoJobAvailable("none", value).countdown, 0)
 
-        self.assertEqual(api_bumx._ttc_no_job_wait_seconds([{"countdown": "17"}]), 17)
+        self.assertEqual(api_ttc._ttc_no_job_wait_seconds([{"countdown": "17"}]), 17)
         for value in (True, False, 1.5, {}, [], None, "1.5", "bad"):
             with self.subTest(runtime_invalid_type=type(value).__name__, runtime_invalid=value):
-                self.assertEqual(api_bumx._ttc_no_job_wait_seconds([{"countdown": value}]), 10)
+                self.assertEqual(api_ttc._ttc_no_job_wait_seconds([{"countdown": value}]), 10)
 
     def test_runtime_rejects_structured_facebook_uid_before_ttc_or_action_calls(self):
         api = Mock()
         action = Mock()
         action.get_info.return_value = ({"id": "998877"}, "malformed UID")
         with (
-            patch.object(api_bumx, "AUTO_Action", return_value=action),
-            patch.object(api_bumx, "print_error"),
+            patch.object(api_ttc, "AUTO_Action", return_value=action),
+            patch.object(api_ttc, "print_error"),
             patch("builtins.print"),
         ):
-            result = api_bumx.run_ttc_jobs(api, "synthetic-facebook-token", job_types={"like_facebook"})
+            result = api_ttc.run_ttc_jobs(api, "synthetic-facebook-token", job_types={"like_facebook"})
 
         self.assertEqual(result, 0)
         api.set_facebook_uid.assert_not_called()
@@ -286,11 +286,11 @@ class TTCExternalScalarContractTests(unittest.TestCase):
         action.auto_cmt.assert_not_called()
 
     def test_runtime_earned_coin_accepts_only_integer_or_integer_text(self):
-        self.assertEqual(api_bumx._normalize_ttc_earned_coin(25), 25)
-        self.assertEqual(api_bumx._normalize_ttc_earned_coin("25"), 25)
+        self.assertEqual(api_ttc._normalize_ttc_earned_coin(25), 25)
+        self.assertEqual(api_ttc._normalize_ttc_earned_coin("25"), 25)
         for value in (True, False, 1.5, {}, [], None, "1.5", "bad", -5):
             with self.subTest(value_type=type(value).__name__, value=value):
-                self.assertEqual(api_bumx._normalize_ttc_earned_coin(value), 0)
+                self.assertEqual(api_ttc._normalize_ttc_earned_coin(value), 0)
 
 
 if __name__ == "__main__":

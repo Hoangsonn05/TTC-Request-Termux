@@ -3,7 +3,7 @@ import unittest
 
 import requests
 
-from api_bumx import (
+from api_ttc import (
     TTC_AUTH_URL,
     TTC_ENDPOINTS,
     TTC_SET_UID_URL,

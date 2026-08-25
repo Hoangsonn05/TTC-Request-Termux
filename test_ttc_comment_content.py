@@ -5,8 +5,8 @@ import json
 import unittest
 from unittest.mock import MagicMock, call, patch
 
-import api_bumx
-from api_bumx import (
+import api_ttc
+from api_ttc import (
     TTCClient,
     TTCJobType,
     TTCResponseError,
@@ -194,7 +194,7 @@ class TTCFacebookCommentBoundaryTests(unittest.TestCase):
                 captured.update(kwargs)
                 return GraphResponse()
 
-        action = api_bumx.AUTO_Action.__new__(api_bumx.AUTO_Action)
+        action = api_ttc.AUTO_Action.__new__(api_ttc.AUTO_Action)
         action.url = "mock://graphql"
         action._requests = GraphSession()
         with contextlib.redirect_stdout(io.StringIO()):
@@ -307,7 +307,7 @@ class TTCFacebookCommentBoundaryTests(unittest.TestCase):
             "comment_tombstone_upsell_config": {"is_hidden": False},
         }
 
-        evidence = api_bumx._facebook_comment_response_evidence(comment_data)
+        evidence = api_ttc._facebook_comment_response_evidence(comment_data)
 
         self.assertEqual(evidence["visibility_scalars"]["comment_privacy_value"], "DEFAULT")
         self.assertTrue(evidence["visibility_structures"]["group_comment_info"]["safe_scalar_flags"]["is_pending"])
@@ -330,7 +330,7 @@ class TTCFacebookCommentBoundaryTests(unittest.TestCase):
                 captured.update(kwargs)
                 return GraphResponse()
 
-        action = api_bumx.AUTO_Action.__new__(api_bumx.AUTO_Action)
+        action = api_ttc.AUTO_Action.__new__(api_ttc.AUTO_Action)
         action.url = "mock://graphql"
         action._requests = GraphSession()
 

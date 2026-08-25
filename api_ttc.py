@@ -69,21 +69,13 @@ TTC_ENDPOINTS = {
         f"{TTC_BASE_URL}/kiemtien/cmtcheo/getpost.php",
         f"{TTC_BASE_URL}/kiemtien/cmtcheo/nhantien.php",
     ),
-    "ttc_follow": (
-        f"{TTC_BASE_URL}/kiemtien/subcheo/getpost.php",
-        f"{TTC_BASE_URL}/kiemtien/subcheo/nhantien.php",
-    ),
-    "ttc_like_page": (
-        f"{TTC_BASE_URL}/kiemtien/likepagecheo/getpost.php",
-        f"{TTC_BASE_URL}/kiemtien/likepagecheo/nhantien.php",
-    ),
 }
 
 TTC_AUTH_URL = f"{TTC_BASE_URL}/logintoken.php"
 TTC_SET_UID_URL = f"{TTC_BASE_URL}/cauhinh/datnick.php"
 
 # =====================================================================
-# Tất cả 7 loại job được hỗ trợ
+# Năm loại job TTC được hỗ trợ
 # =====================================================================
 
 ALL_JOB_TYPES = list(TTC_ENDPOINTS.keys())
@@ -113,8 +105,6 @@ ACTION_GROUP_MAP = {
     "ttc_reaction_vip_cheo": "reaction",
     "ttc_reaction_vip_re": "reaction",
     "ttc_comment": "comment",
-    "ttc_follow": "follow",
-    "ttc_like_page": "page_like",
 }
 
 # Nhóm loại job theo action_group
@@ -127,8 +117,6 @@ ACTION_GROUPS_BLOCKED_BY = {
         "ttc_reaction_vip_re",
     ],
     "comment": ["ttc_comment"],
-    "follow": ["ttc_follow"],
-    "page_like": ["ttc_like_page"],
 }
 
 # =====================================================================
@@ -1664,8 +1652,6 @@ class TTCJobType(str, Enum):
     REACTION_VIP_CHEO = "ttc_reaction_vip_cheo"
     REACTION_VIP_RE = "ttc_reaction_vip_re"
     COMMENT = "ttc_comment"
-    FOLLOW = "ttc_follow"
-    LIKE_PAGE = "ttc_like_page"
 
 
 def _login_alias(self, token: str):
@@ -1705,7 +1691,7 @@ class TTCFetchState:
 
 
 class API_TTC:
-    """Expose TTC lifecycle operations without changing the Bumx runtime path."""
+    """Expose TTC lifecycle operations through the existing runtime interface."""
 
     REACTION_JOB_TYPES = (
         TTCJobType.LIKE_POST_VIP_CHEO,
@@ -2068,9 +2054,6 @@ def print_ttc_exception(context, exc):
     print_ttc_server_response(getattr(exc, "job_type", "") or "UNKNOWN", server_raw_text)
     return True
 
-
-def print_debug(msg):
-    print(f"{Fore.MAGENTA}🐞 {msg}{Style.RESET_ALL}")
 
 # ---------- Lưu / đọc cấu hình Termux/iSH ----------
 # Code chỉ nằm trong file .py này. Dữ liệu runtime được lưu riêng trong 1 JSON để
@@ -2498,7 +2481,7 @@ def create_profile_record(name, token):
 
 
 def load_config():
-    """Compatibility helper: trả config của Bumx profile đang chọn."""
+    """Compatibility helper: trả config của TTC profile đang chọn."""
     data = load_database()
     profile = get_profile(data)
     if profile is None:
@@ -2507,7 +2490,7 @@ def load_config():
 
 
 def save_config(auth_token, fb_accounts):
-    """Compatibility helper: chỉ lưu vào Bumx profile đang chọn."""
+    """Compatibility helper: chỉ lưu vào TTC profile đang chọn."""
     def _mutator(data):
         profile = get_profile(data)
         if profile is None:
@@ -4445,7 +4428,7 @@ def create_profile(data):
     return profile
 
 
-def view_bumx_token(data):
+def view_ttc_token(data):
     index = _profile_index(data, "Chọn profile muốn xem/cập nhật token: ")
     if index is None:
         return
@@ -4671,7 +4654,7 @@ def profile_manager(data):
                     except Exception as exc:
                         print_error(f"Không thể lưu thay đổi. Dữ liệu cũ vẫn được giữ nguyên. {exc}")
         elif choice == '4':
-            view_bumx_token(data)
+            view_ttc_token(data)
         elif choice == '5':
             copy_facebook_accounts_from_profile(SESSION_PROFILE_ID)
         elif choice == '6':

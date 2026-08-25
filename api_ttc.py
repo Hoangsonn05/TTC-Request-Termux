@@ -15,7 +15,6 @@ import re
 import unicodedata
 import math
 import html
-import logging
 from dataclasses import dataclass
 from enum import Enum
 from urllib.parse import unquote
@@ -107,18 +106,6 @@ ACTION_GROUP_MAP = {
     "ttc_comment": "comment",
 }
 
-# Nhóm loại job theo action_group
-ACTION_GROUPS_BLOCKED_BY = {
-    # action_group -> list[job_type] bị ảnh hưởng khi group bị block
-    "reaction": [
-        "ttc_like_post_vip_cheo",
-        "ttc_like_post_vip_re",
-        "ttc_reaction_vip_cheo",
-        "ttc_reaction_vip_re",
-    ],
-    "comment": ["ttc_comment"],
-}
-
 # =====================================================================
 # Reaction type mapping TTC -> nội bộ
 # =====================================================================
@@ -157,24 +144,9 @@ def normalize_reaction_type(raw: str) -> str:
 # Normalize job type
 # =====================================================================
 
-def normalize_job_type(job_type: str) -> str:
-    """Xác minh job_type hợp lệ, trả về chuỗi gốc nếu OK."""
-    if job_type in ALL_JOB_TYPES:
-        return job_type
-    return ""
-
-
 def get_action_group(job_type: str) -> str:
     """Lấy action_group từ job_type nội bộ."""
     return ACTION_GROUP_MAP.get(job_type, "unknown")
-
-
-def get_endpoint_urls(job_type: str):
-    """Lấy (get_url, claim_url) theo job_type.
-
-    Raises KeyError nếu job_type không hợp lệ.
-    """
-    return TTC_ENDPOINTS[job_type]
 
 
 # =====================================================================
@@ -420,21 +392,6 @@ def normalize_jobs_list(job_type: str, raw_list: list) -> list:
     return result
 
 
-def normalize_delay_range(min_delay, max_delay):
-    """Chuẩn hóa cặp delay (min, max) về giá trị hợp lệ."""
-    try:
-        min_delay = int(min_delay)
-        max_delay = int(max_delay)
-    except (TypeError, ValueError):
-        return 5, 15
-    if min_delay < 0 or max_delay < 0:
-        return 5, 15
-    if min_delay > max_delay:
-        min_delay, max_delay = max_delay, min_delay
-    min_delay = min(min_delay, 3600)
-    max_delay = min(max_delay, 3600)
-    return min_delay, max_delay
-
 @dataclass
 class TTCClaimResult:
     success: bool
@@ -470,8 +427,6 @@ class TTCClaimResult:
             "content_type": self.content_type,
         }
 
-logger = logging.getLogger(__name__)
-
 # =====================================================================
 # Custom exceptions
 # =====================================================================
@@ -501,11 +456,11 @@ class TTCError(Exception):
 
 
 class TTCAuthError(TTCError):
-    """Token TTC khÃ´ng há»£p lá»‡ hoáº·c Ä‘Ã£ háº¿t háº¡n."""
+    """Token TTC không hợp lệ hoặc đã hết hạn."""
 
 
 class TTCNoJobAvailable(TTCError):
-    """Endpoint khÃ´ng cÃ³ job nÃ o phÃ¹ há»£p (khÃ´ng pháº£i lá»—i API tháº­t)."""
+    """Endpoint không có job nào phù hợp (không phải lỗi API thật)."""
 
     def __init__(self, message="", countdown=0, **metadata):
         super().__init__(message, **metadata)
@@ -515,7 +470,7 @@ class TTCNoJobAvailable(TTCError):
 
 
 class TTCRateLimitError(TTCError):
-    """Server TTC Ä‘ang rate limit request."""
+    """Server TTC đang rate limit request."""
 
 
 class TTCVipIneligibleError(TTCError):
@@ -523,7 +478,7 @@ class TTCVipIneligibleError(TTCError):
 
 
 class TTCResponseError(TTCError):
-    """Response khÃ´ng Ä‘Ãºng format hoáº·c HTTP lá»—i."""
+    """Response không đúng format hoặc HTTP lỗi."""
 
 
 class TTCJobCooldown(TTCError):
@@ -536,7 +491,7 @@ class TTCJobCooldown(TTCError):
 
 
 # =====================================================================
-# Helpers ná»™i bá»™
+# Helpers nội bộ
 # =====================================================================
 
 _UA = (
@@ -553,7 +508,7 @@ _HEADERS_BASE = {
 
 
 def _mask_token(token: str) -> str:
-    """Che token, chá»‰ log hash ngáº¯n."""
+    """Che token, chỉ log hash ngắn."""
     if not token or len(token) < 8:
         return "***"
     h = hashlib.sha256(token.encode("utf-8")).hexdigest()[:8]
@@ -688,20 +643,20 @@ def _safe_json(response, label="response", allow_plain_text=False):
 
 
 def _parse_earned_coin(message: str) -> int:
-    """Parse sá»‘ xu kiáº¿m Ä‘Æ°á»£c tá»« message TTC.
+    """Parse số xu kiếm được từ message TTC.
 
-    Há»— trá»£ dáº¥u cháº¥m vÃ  dáº¥u pháº©y trong sá»‘ (vd: 1.000, 1,000).
+    Hỗ trợ dấu chấm và dấu phẩy trong số (vd: 1.000, 1,000).
     """
     if not message:
         return 0
-    # TÃ¬m pattern "cá»™ng <sá»‘> xu" hoáº·c "cá»™ng <sá»‘>xu"
-    # Sá»‘ cÃ³ thá»ƒ chá»©a dáº¥u . hoáº·c , ngÄƒn cÃ¡ch hÃ ng nghÃ¬n
+    # Tìm pattern "cộng <số> xu" hoặc "cộng <số>xu"
+    # Số có thể chứa dấu . hoặc , ngăn cách hàng nghìn
     folded = _strip_accents(message).casefold()
     match = re.search(r"cong\s+([\d.,]+)\s*xu", folded, flags=re.IGNORECASE | re.UNICODE)
     if not match:
         match = re.search(r"c\S*ng\s+([\d.,]+)\s*xu", str(message or "").lower(), flags=re.IGNORECASE | re.UNICODE)
     if not match:
-        # Thá»­ tÃ¬m sá»‘ ngay sau "cá»™ng "
+        # Thử tìm số ngay sau "cộng "
         match = re.search(r"cong\s+([\d.,]+)", folded, flags=re.IGNORECASE | re.UNICODE)
     if not match:
         match = re.search(r"c\S*ng\s+([\d.,]+)", str(message or "").lower(), flags=re.IGNORECASE | re.UNICODE)
@@ -715,7 +670,7 @@ def _parse_earned_coin(message: str) -> int:
 
 
 def _parse_countdown(data) -> int:
-    """Láº¥y giÃ¡ trá»‹ countdown tá»« response dict."""
+    """Lấy giá trị countdown từ response dict."""
     if not isinstance(data, dict):
         return 0
     for key in ("countdown", "time", "wait"):
@@ -1007,16 +962,16 @@ def _classify_claim_response(
 
 
 class TTCClient:
-    """HTTP client TTC cho má»™t worker.
+    """HTTP client TTC cho một worker.
 
-    Má»—i worker táº¡o má»™t instance riÃªng â€” khÃ´ng chia sáº» session/cookie.
+    Mỗi worker tạo một instance riêng — không chia sẻ session/cookie.
     """
 
     def __init__(self, worker_id="?", log_fn=None):
         """
         Args:
-            worker_id: ID worker dÃ¹ng Ä‘á»ƒ prefix log.
-            log_fn: callable(message, level) hoáº·c None (dÃ¹ng print).
+            worker_id: ID worker dùng để prefix log.
+            log_fn: callable(message, level) hoặc None (dùng print).
         """
         self.worker_id = str(worker_id)
         self._log_fn = log_fn
@@ -1050,15 +1005,15 @@ class TTCClient:
     # ------------------------------------------------------------------
 
     def authenticate(self, token: str) -> None:
-        """ÄÄƒng nháº­p TTC báº±ng access_token.
+        """Đăng nhập TTC bằng access_token.
 
         Args:
-            token: TTC token (khÃ´ng log Ä‘áº§y Ä‘á»§).
+            token: TTC token (không log đầy đủ).
 
         Raises:
-            TTCAuthError: Token sai hoáº·c response khÃ´ng há»£p lá»‡.
-            TTCResponseError: Response khÃ´ng parse Ä‘Æ°á»£c.
-            TTCRateLimitError: Rate limit tá»« server.
+            TTCAuthError: Token sai hoặc response không hợp lệ.
+            TTCResponseError: Response không parse được.
+            TTCRateLimitError: Rate limit từ server.
         """
         self._token = ""
         self._user = ""
@@ -1149,13 +1104,13 @@ class TTCClient:
     # ------------------------------------------------------------------
 
     def configure_facebook_uid(self, uid: str) -> None:
-        """Äáº·t UID Facebook cho tÃ i khoáº£n TTC.
+        """Đặt UID Facebook cho tài khoản TTC.
 
-        Chá»‰ gá»i sau khi authenticate() thÃ nh cÃ´ng.
+        Chỉ gọi sau khi authenticate() thành công.
 
         Raises:
-            TTCAuthError: ChÆ°a Ä‘Äƒng nháº­p.
-            TTCResponseError: Request lá»—i hoáº·c server khÃ´ng xÃ¡c nháº­n.
+            TTCAuthError: Chưa đăng nhập.
+            TTCResponseError: Request lỗi hoặc server không xác nhận.
         """
         if not self._authenticated:
             raise TTCAuthError("[TTC] Chưa đăng nhập trước khi đặt UID.")
@@ -1213,7 +1168,7 @@ class TTCClient:
     # ------------------------------------------------------------------
 
     def get_account_info(self) -> dict:
-        """Láº¥y thÃ´ng tin user vÃ  sá»‘ dÆ° tá»« session hiá»‡n táº¡i."""
+        """Lấy thông tin user và số dư từ session hiện tại."""
         return {
             "user": self._user,
             "balance": self._initial_balance,
@@ -1225,20 +1180,20 @@ class TTCClient:
     # ------------------------------------------------------------------
 
     def fetch_jobs(self, job_type: str) -> list:
-        """Láº¥y danh sÃ¡ch job tá»« endpoint TTC.
+        """Lấy danh sách job từ endpoint TTC.
 
         Args:
-            job_type: Má»™t trong ALL_JOB_TYPES.
+            job_type: Một trong ALL_JOB_TYPES.
 
         Returns:
-            List cÃ¡c job Ä‘Ã£ normalize, sáºµn sÃ ng Ä‘Æ°a vÃ o JobQueue.
+            List các job đã normalize, sẵn sàng đưa vào JobQueue.
 
         Raises:
-            TTCNoJobAvailable: KhÃ´ng cÃ³ job (khÃ´ng pháº£i lá»—i API).
-            TTCAuthError: PhiÃªn Ä‘Ã£ háº¿t háº¡n.
+            TTCNoJobAvailable: Không có job (không phải lỗi API).
+            TTCAuthError: Phiên đã hết hạn.
             TTCRateLimitError: Rate limit.
-            TTCResponseError: Lá»—i HTTP hoáº·c format.
-            ValueError: job_type khÃ´ng há»£p lá»‡.
+            TTCResponseError: Lỗi HTTP hoặc format.
+            ValueError: job_type không hợp lệ.
         """
         if not self._authenticated:
             raise TTCAuthError("[TTC] Chưa đăng nhập trước khi fetch_jobs.")
@@ -1247,7 +1202,7 @@ class TTCClient:
                 "[TTC] Chưa có UID Facebook được server xác nhận trước khi fetch_jobs."
             )
         if job_type not in TTC_ENDPOINTS:
-            raise ValueError(f"[TTC] job_type khÃ´ng há»£p lá»‡: {job_type!r}")
+            raise ValueError(f"[TTC] job_type không hợp lệ: {job_type!r}")
 
         get_url, _ = TTC_ENDPOINTS[job_type]
         job_type_key = job_type.value if isinstance(job_type, Enum) else str(job_type)
@@ -1260,13 +1215,13 @@ class TTCClient:
             )
         except requests.exceptions.Timeout as e:
             raise TTCResponseError(
-                f"[TTC] Timeout khi láº¥y job {job_type}: {e}",
+                f"[TTC] Timeout khi lấy job {job_type}: {e}",
                 job_type=job_type_key,
                 endpoint=get_url,
             ) from e
         except requests.exceptions.RequestException as e:
             raise TTCResponseError(
-                f"[TTC] Lá»—i máº¡ng khi láº¥y job {job_type}: {e}",
+                f"[TTC] Lỗi mạng khi lấy job {job_type}: {e}",
                 job_type=job_type_key,
                 endpoint=get_url,
             ) from e
@@ -1283,7 +1238,7 @@ class TTCClient:
         if resp.status_code == 429:
             raise TTCRateLimitError(
                 _server_evidence_message(
-                    f"[TTC] Rate limit khi láº¥y job {job_type}.",
+                    f"[TTC] Rate limit khi lấy job {job_type}.",
                     job_type_key,
                     decoded_text,
                     "RATE_LIMIT",
@@ -1303,7 +1258,7 @@ class TTCClient:
         if resp.status_code >= 500:
             raise TTCResponseError(
                 _server_evidence_message(
-                    f"[TTC] Server lá»—i {resp.status_code} khi láº¥y job {job_type}.",
+                    f"[TTC] Server lỗi {resp.status_code} khi lấy job {job_type}.",
                     job_type_key,
                     decoded_text,
                     "RESPONSE_ERROR",
@@ -1313,7 +1268,7 @@ class TTCClient:
         if resp.status_code >= 400:
             raise TTCResponseError(
                 _server_evidence_message(
-                    f"[TTC] HTTP {resp.status_code} khi láº¥y job {job_type}.",
+                    f"[TTC] HTTP {resp.status_code} khi lấy job {job_type}.",
                     job_type_key,
                     decoded_text,
                     "RESPONSE_ERROR",
@@ -1336,11 +1291,11 @@ class TTCClient:
         try:
             data = json.loads(decoded_text)
         except Exception:
-            # KhÃ´ng pháº£i JSON â€” cÃ³ thá»ƒ lÃ  HTML lá»—i hoáº·c empty
+            # Không phải JSON — có thể là HTML lỗi hoặc empty
             snippet = _safe_display_message(decoded_text, limit=200)
             raise TTCResponseError(
                 _server_evidence_message(
-                    f"[TTC] Response khÃ´ng pháº£i JSON tá»« {job_type}. Snippet: {snippet!r}",
+                    f"[TTC] Response không phải JSON từ {job_type}. Snippet: {snippet!r}",
                     job_type_key,
                     decoded_text,
                     "RESPONSE_ERROR",
@@ -1349,7 +1304,7 @@ class TTCClient:
             )
 
         semantic_text = _fetch_semantic_text(data)
-        # Case 1: List cÃ³ job
+        # Case 1: List có job
         if (
             job_type in _VIP_JOB_TYPES
             and _is_vip_ineligible_message(semantic_text)
@@ -1387,10 +1342,10 @@ class TTCClient:
                 job["content_type"] = content_type
             return jobs
 
-        # Case 2: List rá»—ng
+        # Case 2: List rỗng
         if isinstance(data, list) and len(data) == 0:
             raise TTCNoJobAvailable(
-                f"[TTC] KhÃ´ng cÃ³ job {job_type}.",
+                f"[TTC] Không có job {job_type}.",
                 0,
                 **response_metadata,
             )
@@ -1477,7 +1432,7 @@ class TTCClient:
 
         raise TTCResponseError(
             _server_evidence_message(
-                f"[TTC] Response format khÃ´ng xÃ¡c Ä‘á»‹nh tá»« {job_type}: {type(data).__name__}",
+                f"[TTC] Response format không xác định từ {job_type}: {type(data).__name__}",
                 job_type_key,
                 decoded_text,
                 "RESPONSE_ERROR",
@@ -1490,12 +1445,12 @@ class TTCClient:
     # ------------------------------------------------------------------
 
     def claim_reward(self, job: dict) -> dict:
-        """Nháº­n xu sau khi thao tÃ¡c Facebook thÃ nh cÃ´ng.
+        """Nhận xu sau khi thao tác Facebook thành công.
 
-        Chá»‰ gá»i hÃ m nÃ y sau khi xÃ¡c nháº­n Facebook action = True.
+        Chỉ gọi hàm này sau khi xác nhận Facebook action = True.
 
         Args:
-            job: Dict job ná»™i bá»™ Ä‘Ã£ normalize.
+            job: Dict job nội bộ đã normalize.
 
         Returns:
             {
@@ -1506,15 +1461,15 @@ class TTCClient:
             }
 
         Raises:
-            TTCAuthError: PhiÃªn háº¿t háº¡n.
-            TTCResponseError: Lá»—i máº¡ng/HTTP.
+            TTCAuthError: Phiên hết hạn.
+            TTCResponseError: Lỗi mạng/HTTP.
         """
         if not self._authenticated:
             raise TTCAuthError("[TTC] Chưa đăng nhập trước khi claim_reward.")
 
         job_type = job.get("type", "")
         if job_type not in TTC_ENDPOINTS:
-            raise ValueError(f"[TTC] job_type khÃ´ng há»£p lá»‡ khi claim: {job_type!r}")
+            raise ValueError(f"[TTC] job_type không hợp lệ khi claim: {job_type!r}")
 
         _, claim_url = TTC_ENDPOINTS[job_type]
         job_type_key = job_type.value if isinstance(job_type, Enum) else str(job_type)
@@ -1523,7 +1478,7 @@ class TTCClient:
         except (AttributeError, ValueError) as exc:
             raise ValueError("[TTC] claim idpost phải là chuỗi không rỗng.") from exc
 
-        # Payload theo loáº¡i job
+        # Payload theo loại job
         payload = {"id": idpost}
         if job_type in ("ttc_reaction_vip_cheo", "ttc_reaction_vip_re"):
             reaction_type = job.get("reaction_type")
@@ -1546,7 +1501,7 @@ class TTCClient:
             ) from e
         except requests.exceptions.RequestException as e:
             raise TTCResponseError(
-                f"[TTC] Lá»—i máº¡ng khi claim reward job_type={job_type}: {e}",
+                f"[TTC] Lỗi mạng khi claim reward job_type={job_type}: {e}",
                 job_type=job_type_key,
                 endpoint=claim_url,
             ) from e
@@ -1617,7 +1572,7 @@ class TTCClient:
             content_type=content_type,
         )
 
-        # Äá»c sá»‘ dÆ° náº¿u cÃ³
+        # Đọc số dư nếu có
         balance = None
         if isinstance(data, dict) and isinstance(data.get("data"), dict):
             raw_balance = data["data"].get("sodu")
@@ -1631,7 +1586,7 @@ class TTCClient:
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        """ÄÃ³ng HTTP session."""
+        """Đóng HTTP session."""
         try:
             self._session.close()
         except Exception:
@@ -1925,23 +1880,6 @@ def schedule_jobs_by_burst(jobs, enabled_types, max_jobs,
     return scheduled
 
 
-def resolve_delay_ranges(normal_delay_min=10, normal_delay_max=None,
-                         failed_delay_min=None, failed_delay_max=None,
-                         delay_between_jobs=None):
-    if delay_between_jobs is not None:
-        normal_delay_min = delay_between_jobs
-        normal_delay_max = delay_between_jobs
-    if normal_delay_max is None:
-        normal_delay_max = normal_delay_min
-    if failed_delay_min is None:
-        failed_delay_min = normal_delay_min
-    if failed_delay_max is None:
-        failed_delay_max = normal_delay_max
-    normal_range = validate_integer_range(normal_delay_min, normal_delay_max, "normal delay", 0)
-    failed_range = validate_integer_range(failed_delay_min, failed_delay_max, "failed delay", 0)
-    return normal_range, failed_range
-
-
 def _resolve_explicit_delay_range(minimum, maximum, fallback_range,
                                   fallback_was_explicit, label):
     if minimum is None and maximum is None:
@@ -1990,17 +1928,6 @@ def resolve_run_delay_ranges(normal_delay_min=None, normal_delay_max=None,
         account_delay_min, account_delay_max, normal_range, legacy_was_explicit, "account delay"
     )
     return like_range, comment_range, failed_range, account_range
-
-
-def prompt_positive_int(prompt, default):
-    raw_value = input(prompt).strip()
-    if not raw_value:
-        return default
-    try:
-        return validate_batch_limit(int(raw_value), "batch limit")
-    except ValueError:
-        print_warning(f"Giá trị không hợp lệ, dùng mặc định {default}.")
-        return default
 
 
 def prompt_int(prompt, default, minimum=0):
@@ -2381,36 +2308,6 @@ def get_profile(data, profile_id=None):
         if profile.get("profile_id") == target:
             return profile
     return None
-
-
-def save_profile(profile):
-    """
-    WARNING: Do not use for interactive stale read-modify-write flows.
-    This replaces the entire profile object, which could overwrite fields
-    changed by another process. Prefer targeted mutators instead.
-    """
-    def _mutator(data):
-        profile_id = profile.get("profile_id")
-        for index, existing in enumerate(data["profiles"]):
-            if existing.get("profile_id") == profile_id:
-                data["profiles"][index] = profile
-                return profile
-        raise KeyError("Không tìm thấy TTC profile")
-    return mutate_database(_mutator)
-
-
-def update_profile_auth_token(profile_id, token):
-    def _mutator(data):
-        profile = get_profile(data, profile_id)
-        if profile is None:
-            return False
-        profile["auth_token"] = str(token or "").strip()
-        return True
-    try:
-        return mutate_database(_mutator)
-    except Exception as exc:
-        print_error(f"Token TTC đã refresh trong phiên hiện tại nhưng không thể lưu dữ liệu do xung đột/IO: {exc}")
-        return False
 
 
 def rename_profile(profile_id, new_name):
@@ -3660,37 +3557,6 @@ def add_manual_account(profile_id, token):
     try:
         with profile_run_lock(profile_id):
             mutate_database(_mutator)
-            return True
-    except RuntimeError as e:
-        print_error(str(e))
-        return False
-    except ValueError as e:
-        print_warning(str(e))
-        return False
-
-
-def add_login_account(profile_id, email, password, secret="", req_fb=None):
-    email = str(email or '').strip()
-    if not email:
-        print_error("Email / UID không được để trống.")
-        return False
-
-    req_fb = req_fb or Requests_facebook()
-    token = req_fb.login_and_get_token(email, password, secret)
-    if not token:
-        print_error(f"Đăng nhập thất bại cho {email}.")
-        return False
-
-    try:
-        persist_status = _persist_login_account(profile_id, email, password, secret, token)
-        if persist_status == "profile_missing":
-            print_warning("Không tìm thấy profile")
-            return False
-        if persist_status == "duplicate":
-            print_warning("Facebook account đã tồn tại trong TTC profile này.")
-            return False
-        if persist_status == "success":
-            print_success(f"Đã thêm Facebook account {email}.")
             return True
     except RuntimeError as e:
         print_error(str(e))

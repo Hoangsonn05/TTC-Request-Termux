@@ -40,7 +40,10 @@ init(autoreset=True)
 
 total_coin = 0
 SUPPORTED_JOB_TYPES = frozenset({'like_facebook', 'like_poster'})
+FB_READ_TIMEOUT = (10, 40)
+FB_ACTION_TIMEOUT = (10, 45)
 FB_LOGIN_TIMEOUT = (10, 45)
+NETWORK_RETRY_DELAY = 2
 
 # =====================================================================
 # TTC API implementation
@@ -3232,10 +3235,21 @@ class AUTO_Action:
             'fb_api_analytics_tags': '["GraphServices"]',
             'client_trace_id': client_trace_id
         }
-        res = self._requests.post(url=self.url, headers={
-            "Authorization": f"OAuth {token}",
-            "X-FB-Friendly-Name": "FbStoriesLightBucketsQuery",
-        }, data=payload)
+        for attempt in range(2):
+            try:
+                res = self._requests.post(url=self.url, headers={
+                    "Authorization": f"OAuth {token}",
+                    "X-FB-Friendly-Name": "FbStoriesLightBucketsQuery",
+                }, data=payload, timeout=FB_READ_TIMEOUT)
+                break
+            except requests.RequestException as exc:
+                if attempt == 0:
+                    print_warning(
+                        f"Facebook get_info timeout/lỗi mạng: {exc}; thử lại lần cuối..."
+                    )
+                    time.sleep(NETWORK_RETRY_DELAY)
+                    continue
+                return None, f"Facebook get_info timeout/lỗi mạng: {exc}"
         try:
             res_json = res.json()
         except:
@@ -3300,10 +3314,14 @@ class AUTO_Action:
             'fb_api_analytics_tags': '["GraphServices"]',
             'client_trace_id': client_trace_id
         }
-        res = self._requests.post(url=self.url, headers={
-            "Authorization": f"OAuth {token}",
-            "X-FB-Friendly-Name": "ViewerReactionsMutation",
-        }, data=payload)
+        try:
+            res = self._requests.post(url=self.url, headers={
+                "Authorization": f"OAuth {token}",
+                "X-FB-Friendly-Name": "ViewerReactionsMutation",
+            }, data=payload, timeout=FB_ACTION_TIMEOUT)
+        except requests.RequestException as exc:
+            print_error(f"Facebook reaction timeout/lỗi mạng: {exc}; outcome unknown")
+            return False
         try:
             result = res.json()
         except:
@@ -3424,10 +3442,14 @@ class AUTO_Action:
             "fb_api_analytics_tags": r'''["nav_attribution_id_v2=%s","GraphServices","surface_hierarchy=FeedbackFragment,story_feedback_flyout,null;SimpleUFIPopoverFragment,story_feedback_flyout,null;NewsFeedFragment,native_newsfeed,null;FbChromeFragment,unknown,null;FbMainTabActivity,native_newsfeed,null","visitation_id=null","session_id=%s"]''' % (attribution_str,session_id),
             "client_trace_id": client_trace_id
         }
-        res = self._requests.post(url=self.url, headers={
-            "Authorization": f"OAuth {token}",
-            "X-FB-Friendly-Name": "CommentCreateMutation",
-        }, data=payload)
+        try:
+            res = self._requests.post(url=self.url, headers={
+                "Authorization": f"OAuth {token}",
+                "X-FB-Friendly-Name": "CommentCreateMutation",
+            }, data=payload, timeout=FB_ACTION_TIMEOUT)
+        except requests.RequestException as exc:
+            print_error(f"Facebook comment timeout/lỗi mạng: {exc}; outcome unknown")
+            return False
         try:
             result = res.json()
         except:
@@ -4168,7 +4190,7 @@ def account_manager(profile_id):
             print("UID|PASSWORD|2FA,UID|PASSWORD|2FA")
             print("\n2FA có thể để trống:")
             print("UID|PASSWORD|")
-            raw_credentials = secret_input("\nDán danh sách account: ")
+            raw_credentials = input("\nDán danh sách account: ")
             if not raw_credentials.strip():
                 print_info("Đã hủy.")
                 continue

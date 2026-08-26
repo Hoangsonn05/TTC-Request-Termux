@@ -41,7 +41,7 @@ Chỉ response body chính xác bằng `"1"` sau khi loại transport whitespace
 - TTC `acctoken` được lưu dưới compatibility key `auth_token`.
 - TTC token và Facebook token hiển thị theo policy CLI hiện tại.
 - Password và mã 2FA được nhập ẩn.
-- Static Facebook OAuth được đọc từ biến môi trường `TTC_FB_APP_OAUTH` hoặc file local `.bumx_runtime/facebook_app_oauth.txt` đã được ignore.
+- Facebook login dùng cùng app authorization được bundle trong implementation tham chiếu Bumx; không cần cấu hình OAuth runtime riêng cho TTC.
 - `.env` và `.env.*` chỉ dành cho cấu hình local, không commit.
 
 Các tên storage cũ có thể tiếp tục chứa chữ `bumx` để profile/account/config hiện có vẫn load được:
@@ -74,4 +74,4 @@ Không giảm coverage hoặc sửa expected result chỉ để làm suite xanh.
 
 ## Bảo mật
 
-Không commit TTC credential, Facebook credential, static OAuth secret, file runtime hoặc `.env`. Nếu static OAuth từng xuất hiện trong Git history, cần rotate/revoke trước khi public push hoặc release; project cleanup không rewrite history.
+Không commit TTC credential, Facebook account credential, file runtime hoặc `.env`. Không in/log app authorization đã bundle trong implementation Facebook login.

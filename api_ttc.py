@@ -15,6 +15,7 @@ import re
 import unicodedata
 import math
 import html
+import logging
 from dataclasses import dataclass
 from enum import Enum
 from urllib.parse import unquote
@@ -39,6 +40,7 @@ init(autoreset=True)
 
 total_coin = 0
 SUPPORTED_JOB_TYPES = frozenset({'like_facebook', 'like_poster'})
+FB_LOGIN_TIMEOUT = (10, 45)
 
 # =====================================================================
 # TTC API implementation
@@ -106,6 +108,18 @@ ACTION_GROUP_MAP = {
     "ttc_comment": "comment",
 }
 
+# Nhóm loại job theo action_group
+ACTION_GROUPS_BLOCKED_BY = {
+    # action_group -> list[job_type] bị ảnh hưởng khi group bị block
+    "reaction": [
+        "ttc_like_post_vip_cheo",
+        "ttc_like_post_vip_re",
+        "ttc_reaction_vip_cheo",
+        "ttc_reaction_vip_re",
+    ],
+    "comment": ["ttc_comment"],
+}
+
 # =====================================================================
 # Reaction type mapping TTC -> nội bộ
 # =====================================================================
@@ -144,9 +158,24 @@ def normalize_reaction_type(raw: str) -> str:
 # Normalize job type
 # =====================================================================
 
+def normalize_job_type(job_type: str) -> str:
+    """Xác minh job_type hợp lệ, trả về chuỗi gốc nếu OK."""
+    if job_type in ALL_JOB_TYPES:
+        return job_type
+    return ""
+
+
 def get_action_group(job_type: str) -> str:
     """Lấy action_group từ job_type nội bộ."""
     return ACTION_GROUP_MAP.get(job_type, "unknown")
+
+
+def get_endpoint_urls(job_type: str):
+    """Lấy (get_url, claim_url) theo job_type.
+
+    Raises KeyError nếu job_type không hợp lệ.
+    """
+    return TTC_ENDPOINTS[job_type]
 
 
 # =====================================================================
@@ -392,6 +421,21 @@ def normalize_jobs_list(job_type: str, raw_list: list) -> list:
     return result
 
 
+def normalize_delay_range(min_delay, max_delay):
+    """Chuẩn hóa cặp delay (min, max) về giá trị hợp lệ."""
+    try:
+        min_delay = int(min_delay)
+        max_delay = int(max_delay)
+    except (TypeError, ValueError):
+        return 5, 15
+    if min_delay < 0 or max_delay < 0:
+        return 5, 15
+    if min_delay > max_delay:
+        min_delay, max_delay = max_delay, min_delay
+    min_delay = min(min_delay, 3600)
+    max_delay = min(max_delay, 3600)
+    return min_delay, max_delay
+
 @dataclass
 class TTCClaimResult:
     success: bool
@@ -426,6 +470,8 @@ class TTCClaimResult:
             "server_raw_text": self.server_raw_text,
             "content_type": self.content_type,
         }
+
+logger = logging.getLogger(__name__)
 
 # =====================================================================
 # Custom exceptions
@@ -1880,6 +1926,23 @@ def schedule_jobs_by_burst(jobs, enabled_types, max_jobs,
     return scheduled
 
 
+def resolve_delay_ranges(normal_delay_min=10, normal_delay_max=None,
+                         failed_delay_min=None, failed_delay_max=None,
+                         delay_between_jobs=None):
+    if delay_between_jobs is not None:
+        normal_delay_min = delay_between_jobs
+        normal_delay_max = delay_between_jobs
+    if normal_delay_max is None:
+        normal_delay_max = normal_delay_min
+    if failed_delay_min is None:
+        failed_delay_min = normal_delay_min
+    if failed_delay_max is None:
+        failed_delay_max = normal_delay_max
+    normal_range = validate_integer_range(normal_delay_min, normal_delay_max, "normal delay", 0)
+    failed_range = validate_integer_range(failed_delay_min, failed_delay_max, "failed delay", 0)
+    return normal_range, failed_range
+
+
 def _resolve_explicit_delay_range(minimum, maximum, fallback_range,
                                   fallback_was_explicit, label):
     if minimum is None and maximum is None:
@@ -1928,6 +1991,17 @@ def resolve_run_delay_ranges(normal_delay_min=None, normal_delay_max=None,
         account_delay_min, account_delay_max, normal_range, legacy_was_explicit, "account delay"
     )
     return like_range, comment_range, failed_range, account_range
+
+
+def prompt_positive_int(prompt, default):
+    raw_value = input(prompt).strip()
+    if not raw_value:
+        return default
+    try:
+        return validate_batch_limit(int(raw_value), "batch limit")
+    except ValueError:
+        print_warning(f"Giá trị không hợp lệ, dùng mặc định {default}.")
+        return default
 
 
 def prompt_int(prompt, default, minimum=0):
@@ -1988,8 +2062,6 @@ def print_ttc_exception(context, exc):
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LEGACY_CONFIG_FILE = os.path.join(SCRIPT_DIR, "config_token.json")
 DATA_FILE = os.environ.get("BUMX_TERMUX_DATA_FILE", os.path.join(SCRIPT_DIR, "bumx_termux_data.json"))
-FB_APP_OAUTH_ENV = "TTC_FB_APP_OAUTH"
-FB_APP_OAUTH_FILE = os.path.join(SCRIPT_DIR, ".bumx_runtime", "facebook_app_oauth.txt")
 DATA_VERSION = 1
 SESSION_PROFILE_ID = None
 
@@ -1997,44 +2069,6 @@ SESSION_PROFILE_ID = None
 class ProfileInUseError(RuntimeError):
     pass
 
-
-class FacebookOAuthConfigurationError(RuntimeError):
-    pass
-
-
-def _validate_facebook_app_oauth(value, source):
-    credential = str(value or "").strip()
-    if not credential.startswith("OAuth ") or "|" not in credential:
-        raise FacebookOAuthConfigurationError(
-            f"Facebook app OAuth configuration from {source} is missing or malformed."
-        )
-    return credential
-
-
-def load_facebook_app_oauth():
-    environment_value = os.environ.get(FB_APP_OAUTH_ENV)
-    if environment_value is not None and str(environment_value).strip():
-        return _validate_facebook_app_oauth(
-            environment_value,
-            f"environment variable {FB_APP_OAUTH_ENV}",
-        )
-
-    if os.path.isfile(FB_APP_OAUTH_FILE):
-        try:
-            with open(FB_APP_OAUTH_FILE, "r", encoding="utf-8") as stream:
-                return _validate_facebook_app_oauth(
-                    stream.read(),
-                    FB_APP_OAUTH_FILE,
-                )
-        except OSError as exc:
-            raise FacebookOAuthConfigurationError(
-                f"Cannot read Facebook app OAuth configuration file: {FB_APP_OAUTH_FILE}"
-            ) from exc
-
-    raise FacebookOAuthConfigurationError(
-        f"Facebook app OAuth is not configured. Set {FB_APP_OAUTH_ENV} "
-        f"or create the local file {FB_APP_OAUTH_FILE}."
-    )
 
 def runtime_lock_path(filename):
     data_dir = os.path.dirname(os.path.abspath(DATA_FILE))
@@ -2308,6 +2342,36 @@ def get_profile(data, profile_id=None):
         if profile.get("profile_id") == target:
             return profile
     return None
+
+
+def save_profile(profile):
+    """
+    WARNING: Do not use for interactive stale read-modify-write flows.
+    This replaces the entire profile object, which could overwrite fields
+    changed by another process. Prefer targeted mutators instead.
+    """
+    def _mutator(data):
+        profile_id = profile.get("profile_id")
+        for index, existing in enumerate(data["profiles"]):
+            if existing.get("profile_id") == profile_id:
+                data["profiles"][index] = profile
+                return profile
+        raise KeyError("Không tìm thấy TTC profile")
+    return mutate_database(_mutator)
+
+
+def update_profile_auth_token(profile_id, token):
+    def _mutator(data):
+        profile = get_profile(data, profile_id)
+        if profile is None:
+            return False
+        profile["auth_token"] = str(token or "").strip()
+        return True
+    try:
+        return mutate_database(_mutator)
+    except Exception as exc:
+        print_error(f"Token TTC đã refresh trong phiên hiện tại nhưng không thể lưu dữ liệu do xung đột/IO: {exc}")
+        return False
 
 
 def rename_profile(profile_id, new_name):
@@ -2800,7 +2864,6 @@ class Requests_facebook:
         import json
         import pyotp
 
-        app_oauth = load_facebook_app_oauth()
         ts = int(time.time())
         device = str(uuid.uuid4())
         client_trace_id = str(uuid.uuid4())
@@ -2822,9 +2885,10 @@ class Requests_facebook:
         }
 
         res = self._requests.post(url=self._url_api, headers={
-            "Authorization": app_oauth,
+            "Authorization": "OAuth 350685531728|62f8ce9f74b12f84c123cc23437a4a32",
             "X-FB-Friendly-Name": "CreateOneTimeChallengeNonceCreate",
-        }, data=payload)
+            "X-ZERO-F-DEVICE-ID": device,
+        }, data=payload, timeout=FB_LOGIN_TIMEOUT)
 
         data = res.json()
         print(data)
@@ -2872,9 +2936,9 @@ class Requests_facebook:
         }
 
         res = self._requests.post(url=self._url_api, headers={
-            "Authorization": app_oauth,
+            "Authorization": "OAuth 350685531728|62f8ce9f74b12f84c123cc23437a4a32",
             "X-FB-Friendly-Name": "FbBloksActionRootQuery-com.bloks.www.bloks.caa.login.async.send_login_request"
-        }, data=payload)
+        }, data=payload, timeout=FB_LOGIN_TIMEOUT)
 
         data = res.text
         password_result = _parse_facebook_login_response(data)
@@ -2910,9 +2974,9 @@ class Requests_facebook:
                 'client_trace_id': '73b659d1-a3cc-4db4-bc79-892b41b88f2c'
             }
             res = self._requests.post(url=self._url_api, headers={
-                "Authorization": app_oauth,
+                "Authorization": "OAuth 350685531728|62f8ce9f74b12f84c123cc23437a4a32",
                 "X-FB-Friendly-Name": "FbBloksActionRootQuery-com.bloks.www.two_step_verification.verify_code.async"
-            }, data=payload)
+            }, data=payload, timeout=FB_LOGIN_TIMEOUT)
             data = res.text
         except (binascii.Error, TypeError, ValueError):
             self._record_login_result({
@@ -2945,17 +3009,6 @@ class Requests_facebook:
         """
         try:
             token = self._login_facebook(email, password, secret_2fa)
-        except FacebookOAuthConfigurationError as exc:
-            self._record_login_result({
-                "status": "CONFIGURATION_ERROR",
-                "token": None,
-                "two_factor_context": None,
-                "message": str(exc),
-            }, "LOGIN_CONFIGURATION")
-            print_error(
-                f"Login Facebook thất bại: {self._last_login_result['message']}"
-            )
-            return None
         except Exception as exc:
             self._record_login_result({
                 "status": "NETWORK_RESPONSE_ERROR",
@@ -3557,6 +3610,37 @@ def add_manual_account(profile_id, token):
     try:
         with profile_run_lock(profile_id):
             mutate_database(_mutator)
+            return True
+    except RuntimeError as e:
+        print_error(str(e))
+        return False
+    except ValueError as e:
+        print_warning(str(e))
+        return False
+
+
+def add_login_account(profile_id, email, password, secret="", req_fb=None):
+    email = str(email or '').strip()
+    if not email:
+        print_error("Email / UID không được để trống.")
+        return False
+
+    req_fb = req_fb or Requests_facebook()
+    token = req_fb.login_and_get_token(email, password, secret)
+    if not token:
+        print_error(f"Đăng nhập thất bại cho {email}.")
+        return False
+
+    try:
+        persist_status = _persist_login_account(profile_id, email, password, secret, token)
+        if persist_status == "profile_missing":
+            print_warning("Không tìm thấy profile")
+            return False
+        if persist_status == "duplicate":
+            print_warning("Facebook account đã tồn tại trong TTC profile này.")
+            return False
+        if persist_status == "success":
+            print_success(f"Đã thêm Facebook account {email}.")
             return True
     except RuntimeError as e:
         print_error(str(e))

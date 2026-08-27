@@ -2164,6 +2164,7 @@ DEFAULT_RUN_CONFIG = {
     "failed_delay_max": 10,
     "account_delay_min": 10,
     "account_delay_max": 10,
+    "skip_hidden_comments": True,
     "selected_fb_account_keys": None,
 }
 
@@ -2221,6 +2222,8 @@ def normalize_run_config(data=None):
     config["job_types"] = sorted(normalize_job_types(config["job_types"]))
     if not isinstance(config["continuous"], bool):
         config["continuous"] = bool(config["continuous"])
+    if not isinstance(config["skip_hidden_comments"], bool):
+        config["skip_hidden_comments"] = bool(config["skip_hidden_comments"])
     config["max_jobs_per_acc"] = validate_batch_limit(
         config["max_jobs_per_acc"], "max jobs per account"
     )
@@ -4226,7 +4229,8 @@ def run_config_summary(config):
         f"C {config['comment_delay_min']}-{config['comment_delay_max']}s, "
         f"fail {config['failed_delay_min']}-{config['failed_delay_max']}s, "
         f"acc {config['account_delay_min']}-{config['account_delay_max']}s | "
-        f"continuous={'ON' if config['continuous'] else 'OFF'}"
+        f"continuous={'ON' if config['continuous'] else 'OFF'} | "
+        f"hidden-comment-skip={'ON' if config['skip_hidden_comments'] else 'OFF'}"
     )
 
 
@@ -4244,9 +4248,13 @@ def configure_run(profile):
         print("7. Delay Comment min-max")
         print("8. Delay khi job lỗi min-max")
         print("9. Delay chuyển Facebook account min-max")
-        print("10. Reset mặc định")
-        print("11. Quay lại")
-        choice = input("Chọn (1-11): ").strip()
+        print(
+            "10. Bỏ Comment khi Facebook ẩn: "
+            f"{'ON' if config['skip_hidden_comments'] else 'OFF'}"
+        )
+        print("11. Reset mặc định")
+        print("12. Quay lại")
+        choice = input("Chọn (1-12): ").strip()
         candidate = dict(config)
         changed_fields = ()
         if choice == '1':
@@ -4301,11 +4309,14 @@ def configure_run(profile):
             )
             changed_fields = ('account_delay_min', 'account_delay_max')
         elif choice == '10':
+            candidate['skip_hidden_comments'] = not config['skip_hidden_comments']
+            changed_fields = ('skip_hidden_comments',)
+        elif choice == '11':
             candidate = normalize_run_config()
             changed_fields = tuple(
                 field for field in DEFAULT_RUN_CONFIG if field != 'selected_fb_account_keys'
             )
-        elif choice == '11':
+        elif choice == '12':
             return
         else:
             print_error("Lựa chọn không hợp lệ.")
@@ -4695,7 +4706,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                  like_batch_min=None, like_batch_max=None,
                  comment_batch_min=None, comment_batch_max=None,
                  like_delay_range=(10, 10), comment_delay_range=(10, 10),
-                 failed_delay_range=(10, 10)):
+                 failed_delay_range=(10, 10), skip_hidden_comments=True):
     global total_coin
     enabled_types = normalize_job_types(job_types)
     do_job = AUTO_Action()
@@ -4825,13 +4836,14 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                                 comment_evidence = {}
                             if action_succeeded:
                                 if _is_comment_pending_approval(comment_evidence):
-                                    comment_disabled_for_this_turn = True
                                     print_warning("Acc yếu bị Facebook ẩn comment.")
-                                    print_info("Bỏ qua TTC claim cho Comment này.")
-                                    print_info(
-                                        "Bỏ Comment trong lượt hiện tại, "
-                                        "chuyển sang Like tiếp tục làm."
-                                    )
+                                    if skip_hidden_comments:
+                                        comment_disabled_for_this_turn = True
+                                        print_info("Bỏ qua TTC claim cho Comment này.")
+                                        print_info(
+                                            "Bỏ Comment trong lượt hiện tại, "
+                                            "chuyển sang Like tiếp tục làm."
+                                        )
                         if not comment_disabled_for_this_turn:
                             settle_seconds = (
                                 5 if type_ == "like_poster" and action_succeeded else 3
@@ -4863,6 +4875,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                             like_delay_range=like_delay_range,
                             comment_delay_range=comment_delay_range,
                             failed_delay_range=failed_delay_range,
+                            skip_hidden_comments=skip_hidden_comments,
                         )
                         total_done += fallback_done
                     print_info(f"Completed {total_done}/{max_jobs} jobs. Total coin: {total_coin}")
@@ -4910,7 +4923,7 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
                      like_delay_min=None, like_delay_max=None,
                      comment_delay_min=None, comment_delay_max=None,
                      account_delay_min=None, account_delay_max=None,
-                     profile_id=None):
+                     profile_id=None, skip_hidden_comments=True):
     enabled_types = normalize_job_types(job_types)
     like_batch_range, comment_batch_range = resolve_burst_ranges(
         like_batch_limit, comment_batch_limit,
@@ -4953,6 +4966,7 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
                     like_delay_range=like_delay_range,
                     comment_delay_range=comment_delay_range,
                     failed_delay_range=failed_delay_range,
+                    skip_hidden_comments=skip_hidden_comments,
                 )
                 total_all += done
                 print_info(f"{identity} đã làm {done} job.")
@@ -5005,6 +5019,7 @@ def run_active_profile(profile):
                 account_delay_min=config['account_delay_min'],
                 account_delay_max=config['account_delay_max'],
                 profile_id=profile['profile_id'],
+                skip_hidden_comments=config['skip_hidden_comments'],
             )
     except RuntimeError as e:
         print_error(str(e))

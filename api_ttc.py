@@ -44,6 +44,7 @@ FB_READ_TIMEOUT = (10, 40)
 FB_ACTION_TIMEOUT = (10, 45)
 FB_LOGIN_TIMEOUT = (10, 45)
 NETWORK_RETRY_DELAY = 2
+TTC_CLAIM_RETRY_DELAY = 2
 
 # =====================================================================
 # TTC API implementation
@@ -934,6 +935,11 @@ def _classify_claim_response(
 ) -> TTCClaimResult:
     clean_message = _safe_display_message(message)
     folded = _strip_accents(clean_message).casefold()
+    claim_error_message = ""
+    claim_error_folded = ""
+    if isinstance(data, dict) and isinstance(data.get("error"), str):
+        claim_error_message = _safe_display_message(data["error"])
+        claim_error_folded = _strip_accents(claim_error_message).casefold()
     response_kind, response_keys = _response_kind_and_keys(data)
     success_flag = _dict_success_flag(data)
     failure_flag = _dict_failure_flag(data)
@@ -966,8 +972,17 @@ def _classify_claim_response(
             retryable=False,
             **kwargs,
         )
-    if any(marker in folded for marker in ("chua lam", "chua tuong tac", "chua xac nhan", "chua thay", "not observed")):
-        return TTCClaimResult(False, "NOT_OBSERVED_YET", clean_message, retryable=True, **kwargs)
+    if (any(marker in folded for marker in (
+            "chua lam", "chua tuong tac", "chua xac nhan", "chua thay",
+            "chua like", "not observed",
+        )) or "chua like" in claim_error_folded):
+        return TTCClaimResult(
+            False,
+            "NOT_OBSERVED_YET",
+            clean_message or claim_error_message,
+            retryable=True,
+            **kwargs,
+        )
     if any(marker in folded for marker in ("da nhan", "da duoc nhan", "already")):
         return TTCClaimResult(False, "ALREADY_CLAIMED", clean_message, retryable=False, **kwargs)
     if any(marker in folded for marker in ("dang nhap", "vui long dang nhap", "het han", "login", "unauthorized", "auth")):
@@ -4904,6 +4919,23 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                     return total_done
                 if action_succeeded:
                     result = api.submit_job(original_job)
+                    claim_retried = False
+                    if (
+                        type_ == "like_facebook"
+                        and action_succeeded is True
+                        and result.get("success") is not True
+                        and result.get("reason") == "NOT_OBSERVED_YET"
+                    ):
+                        server_raw_text = result.get("server_raw_text", "")
+                        if isinstance(server_raw_text, str) and server_raw_text:
+                            print_ttc_server_response("CLAIM", server_raw_text)
+                        print_warning(
+                            "TTC chưa ghi nhận reaction, thử gửi lại kết quả "
+                            f"sau {TTC_CLAIM_RETRY_DELAY} giây..."
+                        )
+                        time.sleep(TTC_CLAIM_RETRY_DELAY)
+                        result = api.submit_job(original_job)
+                        claim_retried = True
                     if result.get("success") is True:
                         earned = _normalize_ttc_earned_coin(result.get("earned_coin"))
                         job_succeeded = True
@@ -4922,7 +4954,12 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                         server_raw_text = result.get("server_raw_text", "")
                         if isinstance(server_raw_text, str) and server_raw_text:
                             print_ttc_server_response("CLAIM", server_raw_text)
-                        print_warning("TTC không xác nhận job.")
+                        if claim_retried:
+                            print_warning(
+                                "TTC vẫn không xác nhận job sau 1 lần thử lại."
+                            )
+                        else:
+                            print_warning("TTC không xác nhận job.")
                 else:
                     print_warning(
                         f"[{idx}/{total_jobs}] {job_type_display} | Thao tác Facebook thất bại; "

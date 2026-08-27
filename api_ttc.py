@@ -1893,40 +1893,28 @@ def schedule_jobs_by_burst(jobs, enabled_types, max_jobs,
     if max_jobs <= 0:
         return []
 
-    filtered_jobs = [job for job in jobs if job.get('type') in enabled_types]
-    if enabled_types != SUPPORTED_JOB_TYPES:
-        return filtered_jobs[:max_jobs]
-
     queues = {
-        'like_facebook': [job for job in filtered_jobs if job.get('type') == 'like_facebook'],
-        'like_poster': [job for job in filtered_jobs if job.get('type') == 'like_poster'],
+        'like_facebook': [
+            job for job in jobs
+            if 'like_facebook' in enabled_types and job.get('type') == 'like_facebook'
+        ],
+        'like_poster': [
+            job for job in jobs
+            if 'like_poster' in enabled_types and job.get('type') == 'like_poster'
+        ],
     }
     ranges = {'like_facebook': like_range, 'like_poster': comment_range}
-    positions = {'like_facebook': 0, 'like_poster': 0}
-    current_type = 'like_facebook' if queues['like_facebook'] else 'like_poster'
-    scheduled = []
+    candidate_jobs = []
 
-    while len(scheduled) < max_jobs:
-        other_type = 'like_poster' if current_type == 'like_facebook' else 'like_facebook'
-        current_position = positions[current_type]
-        current_queue = queues[current_type]
-        if current_position >= len(current_queue):
-            if positions[other_type] >= len(queues[other_type]):
-                break
-            current_type = other_type
+    for job_type in ('like_facebook', 'like_poster'):
+        if job_type not in enabled_types:
             continue
+        target = random.randint(*ranges[job_type])
+        candidate_jobs.extend(queues[job_type][:target])
 
-        burst_target = random.randint(*ranges[current_type])
-        batch_size = min(
-            burst_target,
-            len(current_queue) - current_position,
-            max_jobs - len(scheduled),
-        )
-        scheduled.extend(current_queue[current_position:current_position + batch_size])
-        positions[current_type] += batch_size
-        if positions[other_type] < len(queues[other_type]):
-            current_type = other_type
-    return scheduled
+    if len(candidate_jobs) > 1:
+        random.shuffle(candidate_jobs)
+    return candidate_jobs[:max_jobs]
 
 
 def resolve_delay_ranges(normal_delay_min=10, normal_delay_max=None,

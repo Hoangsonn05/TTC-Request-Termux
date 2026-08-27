@@ -1043,6 +1043,8 @@ class TTCClient:
     def _log(self, message: str, level: str = "api"):
         if self._log_fn:
             self._log_fn(message, level)
+        elif level == "account":
+            print(f"{Fore.MAGENTA}{Style.BRIGHT}👤 {message}{Style.RESET_ALL}")
         else:
             print(f"[TTC Worker #{self.worker_id}] [{level.upper()}] {message}")
 
@@ -1084,8 +1086,6 @@ class TTCClient:
             raise TTCAuthError("[TTC] Token rỗng, không thể đăng nhập.")
 
         token_value = str(token).strip()
-        masked = _mask_token(token_value)
-        self._log(f"Đang đăng nhập TTC với token {masked}...", "auth")
 
         try:
             resp = self._session.post(
@@ -1144,8 +1144,8 @@ class TTCClient:
         self._authenticated = True
 
         self._log(
-            f"Đăng nhập TTC thành công. User: {self._user} | Số dư: {balance} xu",
-            "auth",
+            f"TTC: {self._user} | {format_coin(balance)} xu",
+            "account",
         )
 
     # ------------------------------------------------------------------
@@ -1171,8 +1171,6 @@ class TTCClient:
             uid = _strict_required_text(uid, "Facebook UID")
         except ValueError as exc:
             raise ValueError("[TTC] UID Facebook phải là chuỗi không rỗng.") from exc
-        self._log(f"Đang đặt UID Facebook TTC: uid={uid}", "auth")
-
         try:
             resp = self._session.post(
                 TTC_SET_UID_URL,
@@ -1210,7 +1208,6 @@ class TTCClient:
             )
 
         self._configured_facebook_uid = uid
-        self._log(f"Đã đặt UID Facebook: uid={uid}.", "auth")
 
     # ------------------------------------------------------------------
     # get_account_info()
@@ -1628,6 +1625,14 @@ class TTCClient:
             balance = _parse_strict_integer(raw_balance)
 
         claim.balance = balance
+        if claim.success:
+            if balance is not None:
+                self._initial_balance = balance
+            elif (isinstance(self._initial_balance, int)
+                    and not isinstance(self._initial_balance, bool)
+                    and isinstance(claim.earned_coin, int)
+                    and not isinstance(claim.earned_coin, bool)):
+                self._initial_balance += claim.earned_coin
         return claim.to_dict()
 
     # ------------------------------------------------------------------
@@ -2019,6 +2024,13 @@ def prompt_range(label, current_min, current_max, minimum_allowed=0):
             print_error(str(exc))
 
 # ---------- Màu sắc ----------
+def format_coin(value):
+    """Format an internal integer for compact Vietnamese coin output."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("coin value must be an integer")
+    return f"{value:,}".replace(",", ".")
+
+
 def print_success(msg):
     print(f"{Fore.GREEN}✅ {msg}{Style.RESET_ALL}")
 
@@ -4689,6 +4701,28 @@ def _normalize_ttc_earned_coin(value):
     return 0
 
 
+def _latest_known_ttc_balance(api, claim_result=None):
+    if isinstance(claim_result, dict):
+        authoritative = _parse_strict_integer(claim_result.get("balance"))
+        if authoritative is not None:
+            return authoritative
+    get_account_info = getattr(api, "get_account_info", None)
+    if not callable(get_account_info):
+        return None
+    account_info = get_account_info()
+    if not isinstance(account_info, dict):
+        return None
+    return _parse_strict_integer(account_info.get("balance"))
+
+
+def _print_ttc_completion(api, done, total):
+    latest_balance = _latest_known_ttc_balance(api)
+    summary = f"Hoàn thành {done}/{total} job | Total: {format_coin(total_coin)}"
+    if latest_balance is not None:
+        summary += f" | {format_coin(latest_balance)} xu"
+    print_success(summary)
+
+
 def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                  like_batch_limit=None, comment_batch_limit=None,
                  like_batch_min=None, like_batch_max=None,
@@ -4703,9 +4737,9 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
         print("ERROR:" + msg)
         return 0
     uid = uid.strip()
-    print("UID:" + uid)
 
     api.set_facebook_uid(uid)
+    print(f"{Fore.CYAN}{Style.BRIGHT}📱 Facebook: {uid}{Style.RESET_ALL}")
 
     while True:
         fetched_jobs = []
@@ -4758,8 +4792,8 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                 if isinstance(item, dict)
             ]
         )
-        print_info("No supported TTC job is currently available.")
-        countdown(wait_seconds, "Waiting before the next TTC fetch")
+        print_info("Hiện chưa có job TTC phù hợp.")
+        countdown(wait_seconds, "Chờ lấy job TTC tiếp theo")
 
     jobs = schedule_jobs_by_burst(
         fetched_jobs,
@@ -4773,10 +4807,10 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
         comment_batch_max=comment_batch_max,
     )
     if not jobs:
-        print_info("No supported TTC job was selected by the scheduler.")
+        print_info("Không có job TTC phù hợp được chọn.")
         return 0
 
-    print_info(f"Scheduler selected {len(jobs)} jobs with hard cap {max_jobs}.")
+    print_info(f"Đã chọn {len(jobs)} job, tối đa {max_jobs}.")
     total_jobs = len(jobs)
     total_done = 0
     comment_disabled_for_this_turn = False
@@ -4790,7 +4824,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
         else:
             object_id = original_job.get("object_id")
             if not object_id:
-                print_warning("TTC job is missing object_id; skipping.")
+                print_warning("Job TTC thiếu object_id; bỏ qua.")
             else:
                 job_type_display = "LIKE" if type_ == "like_facebook" else "CMT"
                 if type_ == "like_facebook":
@@ -4802,7 +4836,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                     if not isinstance(comment_text, str) or not comment_text:
                         raise ValueError("TTC comment job is missing comment_text")
                 print_info(
-                    f"[{idx}/{total_jobs}] Processing TTC job {type_} "
+                    f"[{idx}/{total_jobs}] Đang xử lý {job_type_display} "
                     f"(job_id: {original_job.get('job_id', '')})..."
                 )
                 action_succeeded = False
@@ -4810,12 +4844,12 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                     post_id = get_facebook_post_id(f"https://www.facebook.com/{object_id}")
                     if post_id is not None and int(post_id) > 0:
                         if type_ == "like_facebook":
-                            print_info(f"   Executing {reaction} on Facebook object {object_id}")
+                            print_info(f"Đang thực hiện {reaction} trên Facebook object {object_id}")
                             action_succeeded = do_job.auto_reaction(
                                 post_id, reaction, fb_token, uid
                             )
                         else:
-                            print_info(f"   Commenting on Facebook object {object_id}")
+                            print_info(f"Đang thực hiện Comment trên Facebook object {object_id}")
                             action_succeeded = do_job.auto_cmt(
                                 post_id, comment_text, fb_token, uid
                             )
@@ -4839,11 +4873,11 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                             time.sleep(settle_seconds)
                     else:
                         print_warning(
-                            f"[{idx}/{total_jobs}] {job_type_display} | Could not resolve "
-                            f"Facebook ID for {original_job.get('job_id', '')}"
+                            f"[{idx}/{total_jobs}] {job_type_display} | Không lấy được "
+                            f"Facebook ID cho {original_job.get('job_id', '')}"
                         )
                 except Exception as exc:
-                    print_error(f"[{idx}/{total_jobs}] Facebook {type_} error: {exc}")
+                    print_error(f"[{idx}/{total_jobs}] Lỗi Facebook {type_}: {exc}")
 
                 if comment_disabled_for_this_turn:
                     remaining_jobs = max_jobs - total_done
@@ -4866,7 +4900,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                             skip_hidden_comments=skip_hidden_comments,
                         )
                         total_done += fallback_done
-                    print_info(f"Completed {total_done}/{max_jobs} jobs. Total coin: {total_coin}")
+                    _print_ttc_completion(api, total_done, max_jobs)
                     return total_done
                 if action_succeeded:
                     result = api.submit_job(original_job)
@@ -4875,9 +4909,14 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                         job_succeeded = True
                         total_done += 1
                         total_coin += earned
+                        latest_balance = _latest_known_ttc_balance(api, result)
+                        balance_text = (
+                            f" | {format_coin(latest_balance)} xu"
+                            if latest_balance is not None else ""
+                        )
                         print_success(
-                            f"[{idx}/{total_jobs}] {job_type_display} | +{earned} | "
-                            f"Total: {total_coin}"
+                            f"[{idx}/{total_jobs}] {job_type_display} | +{format_coin(earned)} | "
+                            f"Total: {format_coin(total_coin)}{balance_text}"
                         )
                     else:
                         server_raw_text = result.get("server_raw_text", "")
@@ -4886,8 +4925,8 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                         print_warning("TTC không xác nhận job.")
                 else:
                     print_warning(
-                        f"[{idx}/{total_jobs}] {job_type_display} | Facebook action failed; "
-                        "TTC submit skipped."
+                        f"[{idx}/{total_jobs}] {job_type_display} | Thao tác Facebook thất bại; "
+                        "bỏ qua gửi kết quả TTC."
                     )
 
         if idx < total_jobs:
@@ -4896,9 +4935,9 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
             else:
                 delay_range = failed_delay_range
             delay = random.randint(*delay_range)
-            countdown(delay, f"Waiting before job {idx+1}")
+            countdown(delay, f"Chờ job {idx+1} : ")
 
-    print_info(f"Completed {total_done}/{total_jobs} jobs. Total coin: {total_coin}")
+    _print_ttc_completion(api, total_done, total_jobs)
     return total_done
 
 
@@ -4935,7 +4974,6 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
                 print_warning(f"Tài khoản {idx+1} chưa có token, bỏ qua.")
                 continue
             identity = str(acc.get('email') or '').strip() or f"Account {idx+1}"
-            print_info(f"\n--- {identity} ({idx+1}/{len(fb_accounts)}) ---")
             api = None
             try:
                 worker_id = f"{profile_id or 'profile'}:{idx+1}"
@@ -4957,7 +4995,6 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
                     skip_hidden_comments=skip_hidden_comments,
                 )
                 total_all += done
-                print_info(f"{identity} đã làm {done} job.")
             except Exception as exc:
                 if not print_ttc_exception(f"Lỗi TTC với {identity}.", exc):
                     print_error(f"Lỗi với {identity}: {exc}")

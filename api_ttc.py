@@ -2058,6 +2058,24 @@ def print_info(msg):
 def print_warning(msg):
     print(f"{Fore.YELLOW}⚠️ {msg}{Style.RESET_ALL}")
 
+def _facebook_job_link_for_display(job_link):
+    if not isinstance(job_link, str) or not job_link.strip():
+        return None
+    job_link = job_link.strip()
+    if job_link.lower().startswith(("http://", "https://")):
+        return job_link
+    return f"https://www.facebook.com/{job_link.lstrip('/')}"
+
+
+def print_facebook_job_link(job_link):
+    facebook_job_link = _facebook_job_link_for_display(job_link)
+    if facebook_job_link:
+        print(
+            f"{Fore.BLUE}{Style.BRIGHT}\U0001f517 Link: "
+            f"{facebook_job_link}{Style.RESET_ALL}"
+        )
+
+
 def print_ttc_server_response(job_type, server_raw_text):
     """Print TTC evidence without changing its response body."""
     print_warning(f"[TTC][{job_type}]")
@@ -4854,6 +4872,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                     f"[{idx}/{total_jobs}] Đang xử lý {job_type_display} "
                     f"(job_id: {original_job.get('job_id', '')})..."
                 )
+                print_facebook_job_link(original_job.get("link"))
                 action_succeeded = False
                 try:
                     post_id = get_facebook_post_id(f"https://www.facebook.com/{object_id}")

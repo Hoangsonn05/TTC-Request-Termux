@@ -3561,23 +3561,30 @@ def get_facebook_post_id(url):
     }
     session = requests.Session()
     session.headers.update(headers)
-    try:
-        resp = session.get(url, timeout=15, allow_redirects=True)
-        if resp.status_code != 200:
-            print(f"Lỗi HTTP {resp.status_code}")
-            return None
-        final_url = resp.url
-    except Exception as e:
-        print(f"Lỗi kết nối: {e}")
-        return None
-    resp = session.get(final_url, timeout=15, allow_redirects=True)
-    html = resp.text
-    try:
-        uid = html.split('"post_id":"')[1].split('",')[0]
-        print(f"{Fore.GREEN}{Style.BRIGHT}✅ Post ID: {uid}{Style.RESET_ALL}")
-        return uid
-    except:
-        return 0
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = session.get(url, timeout=15, allow_redirects=True)
+            if resp.status_code != 200:
+                failure = f"Lỗi HTTP {resp.status_code} khi lấy Post ID"
+            else:
+                html = resp.text
+                try:
+                    uid = html.split('"post_id":"')[1].split('",')[0]
+                except (AttributeError, IndexError):
+                    print("Không tìm thấy Post ID trong phản hồi Facebook.")
+                    return None
+                print(f"{Fore.GREEN}{Style.BRIGHT}✅ Post ID: {uid}{Style.RESET_ALL}")
+                return uid
+        except requests.RequestException as exc:
+            failure = f"Lấy Post ID timeout/lỗi mạng: {exc}"
+
+        if attempt < max_attempts:
+            print(f"{failure}, thử lại {attempt + 1}/{max_attempts}...")
+            time.sleep(NETWORK_RETRY_DELAY)
+        else:
+            print(f"{failure}; đã hết {max_attempts} lần thử.")
+    return None
 
 # ---------- Hàm đếm delay ----------
 def countdown(seconds, message="Chờ"):

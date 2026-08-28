@@ -1937,6 +1937,31 @@ def schedule_jobs_by_burst(jobs, enabled_types, max_jobs,
     return candidate_jobs[:max_jobs]
 
 
+def schedule_job_types_by_burst(enabled_types, max_jobs,
+                                like_batch_limit=None, comment_batch_limit=None, *,
+                                like_batch_min=None, like_batch_max=None,
+                                comment_batch_min=None, comment_batch_max=None):
+    like_range, comment_range = resolve_burst_ranges(
+        like_batch_limit, comment_batch_limit,
+        like_batch_min, like_batch_max,
+        comment_batch_min, comment_batch_max,
+    )
+    if max_jobs <= 0:
+        return []
+
+    ranges = {'like_facebook': like_range, 'like_poster': comment_range}
+    type_slots = []
+    for job_type in ('like_facebook', 'like_poster'):
+        if job_type not in enabled_types:
+            continue
+        target = random.randint(*ranges[job_type])
+        type_slots.extend([job_type] * target)
+
+    if len(type_slots) > 1:
+        random.shuffle(type_slots)
+    return type_slots[:max_jobs]
+
+
 def resolve_delay_ranges(normal_delay_min=10, normal_delay_max=None,
                          failed_delay_min=None, failed_delay_max=None,
                          delay_between_jobs=None):
@@ -4774,14 +4799,35 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
     api.set_facebook_uid(uid)
     print(f"{Fore.CYAN}{Style.BRIGHT}📱 Facebook: {uid}{Style.RESET_ALL}")
 
-    while True:
-        fetched_jobs = []
-        no_job_metadata = []
-        cooldown_metadata = []
-        for legacy_type in ("like_facebook", "like_poster"):
-            if legacy_type not in enabled_types:
+    type_slots = schedule_job_types_by_burst(
+        enabled_types,
+        max_jobs,
+        like_batch_limit=like_batch_limit,
+        comment_batch_limit=comment_batch_limit,
+        like_batch_min=like_batch_min,
+        like_batch_max=like_batch_max,
+        comment_batch_min=comment_batch_min,
+        comment_batch_max=comment_batch_max,
+    )
+    if not type_slots:
+        print_info("Không có job TTC phù hợp được chọn.")
+        return 0
+
+    print_info(f"Đã lên kế hoạch {len(type_slots)} job, tối đa {max_jobs}.")
+    total_jobs = len(type_slots)
+    total_done = 0
+    comment_disabled_for_this_turn = False
+    job_cache = {legacy_type: [] for legacy_type in enabled_types}
+    fetch_retry_at = {}
+
+    for idx, type_ in enumerate(type_slots, start=1):
+        cached_jobs = job_cache[type_]
+        if not cached_jobs:
+            retry_at = fetch_retry_at.get(type_)
+            if retry_at is not None and time.monotonic() < retry_at:
                 continue
-            result = api.fetch_jobs_for_legacy_type(legacy_type)
+
+            result = api.fetch_jobs_for_legacy_type(type_)
             if (not isinstance(result, dict)
                     or not isinstance(result.get("jobs"), list)
                     or not isinstance(result.get("no_job"), list)):
@@ -4790,9 +4836,6 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
             permanent_skips = result.get("permanent_skips", [])
             if not isinstance(cooldowns, list) or not isinstance(permanent_skips, list):
                 raise ValueError("TTC adapter returned invalid endpoint-state metadata")
-            fetched_jobs.extend(result["jobs"])
-            no_job_metadata.extend(result["no_job"])
-            cooldown_metadata.extend(cooldowns)
 
             for item in cooldowns:
                 if not isinstance(item, dict):
@@ -4814,42 +4857,23 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                     )
                     print_info("Bỏ qua loại job này trong lượt áp dụng hiện tại.")
 
-        if fetched_jobs:
-            break
+            cached_jobs.extend(result["jobs"])
+            if cached_jobs:
+                fetch_retry_at.pop(type_, None)
+            else:
+                wait_seconds = _ttc_no_job_wait_seconds(
+                    result["no_job"]
+                    + [
+                        {"countdown": item.get("remaining", 0)}
+                        for item in cooldowns
+                        if isinstance(item, dict)
+                    ]
+                )
+                fetch_retry_at[type_] = time.monotonic() + wait_seconds
+                print_info("Hiện chưa có job TTC phù hợp.")
+                continue
 
-        wait_seconds = _ttc_no_job_wait_seconds(
-            no_job_metadata
-            + [
-                {"countdown": item.get("remaining", 0)}
-                for item in cooldown_metadata
-                if isinstance(item, dict)
-            ]
-        )
-        print_info("Hiện chưa có job TTC phù hợp.")
-        countdown(wait_seconds, "Chờ lấy job TTC tiếp theo")
-
-    jobs = schedule_jobs_by_burst(
-        fetched_jobs,
-        enabled_types,
-        max_jobs,
-        like_batch_limit=like_batch_limit,
-        comment_batch_limit=comment_batch_limit,
-        like_batch_min=like_batch_min,
-        like_batch_max=like_batch_max,
-        comment_batch_min=comment_batch_min,
-        comment_batch_max=comment_batch_max,
-    )
-    if not jobs:
-        print_info("Không có job TTC phù hợp được chọn.")
-        return 0
-
-    print_info(f"Đã chọn {len(jobs)} job, tối đa {max_jobs}.")
-    total_jobs = len(jobs)
-    total_done = 0
-    comment_disabled_for_this_turn = False
-
-    for idx, job in enumerate(jobs, start=1):
-        type_ = job.get("type")
+        job = cached_jobs.pop(0)
         original_job = job.get("_ttc_job")
         job_succeeded = False
         if not isinstance(original_job, dict):
@@ -4872,7 +4896,6 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                     f"[{idx}/{total_jobs}] Đang xử lý {job_type_display} "
                     f"(job_id: {original_job.get('job_id', '')})..."
                 )
-                print_facebook_job_link(original_job.get("link"))
                 action_succeeded = False
                 try:
                     post_id = get_facebook_post_id(f"https://www.facebook.com/{object_id}")

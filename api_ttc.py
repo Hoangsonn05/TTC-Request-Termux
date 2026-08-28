@@ -40,6 +40,10 @@ init(autoreset=True)
 
 total_coin = 0
 SUPPORTED_JOB_TYPES = frozenset({'like_facebook', 'like_poster'})
+TTC_DIRECT_POST_ID_JOB_TYPES = frozenset({
+    "ttc_like_post_vip_re",
+    "ttc_reaction_vip_re",
+})
 FB_READ_TIMEOUT = (10, 40)
 FB_ACTION_TIMEOUT = (10, 45)
 FB_LOGIN_TIMEOUT = (10, 45)
@@ -341,6 +345,11 @@ def normalize_job(job_type: str, raw_data: dict) -> dict:
     else:
         idpost = raw_idpost.strip() if isinstance(raw_idpost, str) else ""
         link = raw_link.strip() if isinstance(raw_link, str) else ""
+    post_id = ""
+    if job_type in TTC_DIRECT_POST_ID_JOB_TYPES:
+        post_id = _strict_required_text(raw_data.get("idfb"), "idfb")
+        if re.fullmatch(r"[0-9]+", post_id) is None:
+            raise ValueError("invalid idfb")
     action_group = get_action_group(job_type)
 
     # Supported application jobs keep claim ID and executor target independent.
@@ -386,6 +395,7 @@ def normalize_job(job_type: str, raw_data: dict) -> dict:
         "reaction_type": reaction_type,
         "comment_text": comment_text,
         "ttc_source": job_type,
+        **({"post_id": post_id} if job_type in TTC_DIRECT_POST_ID_JOB_TYPES else {}),
         "idpost": idpost,            # giữ để gọi nhantien.php
         "raw_data": dict(raw_data),  # debug only, không để GUI phụ thuộc
     }
@@ -4905,7 +4915,15 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                 )
                 action_succeeded = False
                 try:
-                    post_id = get_facebook_post_id(f"https://www.facebook.com/{object_id}")
+                    ttc_source = original_job.get("ttc_source")
+                    if ttc_source in TTC_DIRECT_POST_ID_JOB_TYPES:
+                        post_id = original_job.get("post_id")
+                        if (not isinstance(post_id, str)
+                                or re.fullmatch(r"[0-9]+", post_id) is None):
+                            raise ValueError("TTC direct Post ID is invalid")
+                        print(f"{Fore.GREEN}{Style.BRIGHT}✅ Post ID: {post_id}{Style.RESET_ALL}")
+                    else:
+                        post_id = get_facebook_post_id(f"https://www.facebook.com/{object_id}")
                     if post_id is not None and int(post_id) > 0:
                         if type_ == "like_facebook":
                             print_info(f"Đang thực hiện {reaction} trên Facebook object {object_id}")

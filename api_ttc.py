@@ -83,6 +83,13 @@ TTC_ENDPOINTS = {
 TTC_AUTH_URL = f"{TTC_BASE_URL}/logintoken.php"
 TTC_SET_UID_URL = f"{TTC_BASE_URL}/cauhinh/datnick.php"
 
+_TTC_NICKCHAY_JOB_TYPES = frozenset({
+    "ttc_like_post_vip_cheo",
+    "ttc_reaction_vip_cheo",
+    "ttc_reaction_vip_re",
+    "ttc_comment",
+})
+
 # =====================================================================
 # Năm loại job TTC được hỗ trợ
 # =====================================================================
@@ -1278,12 +1285,17 @@ class TTCClient:
         get_url, _ = TTC_ENDPOINTS[job_type]
         job_type_key = job_type.value if isinstance(job_type, Enum) else str(job_type)
 
+        request_kwargs = {
+            "headers": self._headers(),
+            "timeout": 15,
+        }
+        if job_type in _TTC_NICKCHAY_JOB_TYPES:
+            request_kwargs["params"] = {
+                "nickchay": self._configured_facebook_uid,
+            }
+
         try:
-            resp = self._session.get(
-                get_url,
-                headers=self._headers(),
-                timeout=15,
-            )
+            resp = self._session.get(get_url, **request_kwargs)
         except requests.exceptions.Timeout as e:
             raise TTCResponseError(
                 f"[TTC] Timeout khi lấy job {job_type}: {e}",
@@ -1556,6 +1568,12 @@ class TTCClient:
             if not isinstance(reaction_type, str) or reaction_type not in VALID_REACTIONS:
                 raise ValueError("[TTC] claim reaction_type phải là canonical reaction string.")
             payload["loaicx"] = reaction_type
+        if job_type in _TTC_NICKCHAY_JOB_TYPES:
+            if self._configured_facebook_uid is None:
+                raise TTCResponseError(
+                    "[TTC] Chưa có UID Facebook được server xác nhận trước khi claim_reward."
+                )
+            payload["nickchay"] = self._configured_facebook_uid
 
         try:
             resp = self._session.post(

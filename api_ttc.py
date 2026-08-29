@@ -16,6 +16,7 @@ import unicodedata
 import math
 import html
 import logging
+import threading
 from dataclasses import dataclass
 from enum import Enum
 from urllib.parse import unquote
@@ -1759,9 +1760,9 @@ class API_TTC:
         "like_poster": COMMENT_JOB_TYPES,
     }
 
-    def __init__(self, access_token, worker_id="?", fetch_state=None):
+    def __init__(self, access_token, worker_id="?", fetch_state=None, log_fn=None):
         self._access_token = access_token
-        self._client = TTCClient(worker_id=worker_id)
+        self._client = TTCClient(worker_id=worker_id, log_fn=log_fn)
         self._fetch_state = fetch_state if fetch_state is not None else TTCFetchState()
         self._facebook_uid = None
 
@@ -2236,6 +2237,44 @@ def profile_run_lock(profile_id):
                 msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
             os.close(fd)
 
+
+class ProfileRunLease:
+    """Long-lived owner for one profile run group.
+
+    The existing ``profile_run_lock`` remains the cross-process primitive used
+    by CLI and mutations.  A GUI acquires one lease for the whole group and
+    its account workers deliberately do not reacquire the same exclusive lock.
+    """
+
+    def __init__(self, profile_id):
+        self.profile_id = str(profile_id or "").strip()
+        self._context = None
+        self.held = False
+
+    def acquire(self):
+        if self.held:
+            return self
+        context = profile_run_lock(self.profile_id)
+        context.__enter__()
+        self._context = context
+        self.held = True
+        return self
+
+    def release(self):
+        if not self.held:
+            return
+        context = self._context
+        context.__exit__(None, None, None)
+        self._context = None
+        self.held = False
+
+    def __enter__(self):
+        return self.acquire()
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.release()
+        return False
+
 DEFAULT_RUN_CONFIG = {
     "job_types": ["like_facebook", "like_poster"],
     "continuous": False,
@@ -2601,6 +2640,203 @@ def selected_accounts(profile):
         account for account in profile.get("fb_accounts", [])
         if facebook_account_key(account) in selected and str(account.get("token", "")).strip()
     ]
+
+
+def get_profile_snapshot(profile_id):
+    """Load the latest validated profile object for a non-interactive caller."""
+    profile = get_profile(load_database(), profile_id)
+    if profile is None:
+        raise KeyError("Không tìm thấy TTC profile")
+    return profile
+
+
+def add_manual_account_record(profile_id, token):
+    """Add a manual-token account without CLI prompts."""
+    token = str(token or "").strip()
+    if not token:
+        raise ValueError("Token Facebook không được để trống.")
+    account = {"email": "", "password": "", "secret": "", "token": token}
+
+    def _mutator(data):
+        profile = get_profile(data, profile_id)
+        if profile is None:
+            raise KeyError("Không tìm thấy TTC profile")
+        accounts = profile.setdefault("fb_accounts", [])
+        if _is_duplicate_account(accounts, account):
+            raise ValueError("Facebook account/token đã tồn tại trong TTC profile này.")
+        accounts.append(dict(account))
+        _include_new_account_in_explicit_selection(profile, account)
+        return dict(account)
+
+    with profile_run_lock(profile_id):
+        return mutate_database(_mutator)
+
+
+def update_account_record(profile_id, account_key, updates, enabled=None):
+    """Update only named fields on the latest account record."""
+    if not isinstance(updates, dict):
+        raise ValueError("Dữ liệu cập nhật Facebook account không hợp lệ.")
+    allowed_fields = {"email", "password", "secret", "token"}
+    unknown_fields = set(updates) - allowed_fields
+    if unknown_fields:
+        raise ValueError(f"Trường Facebook account không hỗ trợ: {sorted(unknown_fields)}")
+    normalized_updates = {
+        field: (str(value or "").strip() if field in {"email", "token"} else str(value or ""))
+        for field, value in updates.items()
+    }
+
+    def _mutator(data):
+        profile = get_profile(data, profile_id)
+        if profile is None:
+            raise KeyError("Không tìm thấy TTC profile")
+        accounts = profile.get("fb_accounts", [])
+        target_index = next(
+            (index for index, account in enumerate(accounts)
+             if facebook_account_key(account) == account_key),
+            None,
+        )
+        if target_index is None:
+            raise ValueError("Facebook account không còn tồn tại trong dữ liệu mới nhất.")
+        updated = dict(accounts[target_index])
+        updated.update(normalized_updates)
+        updated = _normalize_account(updated)
+        if not updated["token"]:
+            raise ValueError("Facebook token không được để trống.")
+        if _is_duplicate_account(accounts, updated, ignore_index=target_index):
+            raise ValueError("Email hoặc token mới bị trùng với account khác.")
+
+        accounts[target_index] = updated
+        new_key = facebook_account_key(updated)
+        selected = profile["run_config"].get("selected_fb_account_keys")
+        if selected is not None and new_key != account_key:
+            was_selected = account_key in selected
+            selected[:] = [key for key in selected if key != account_key]
+            if was_selected and new_key and new_key not in selected:
+                selected.append(new_key)
+        if enabled is not None:
+            if selected is None:
+                selected = [facebook_account_key(account) for account in accounts]
+                selected = [key for key in selected if key]
+                profile["run_config"]["selected_fb_account_keys"] = selected
+            selected[:] = [key for key in selected if key != new_key]
+            if bool(enabled) and new_key:
+                selected.append(new_key)
+        return {"account": dict(updated), "account_key": new_key}
+
+    with profile_run_lock(profile_id):
+        return mutate_database(_mutator)
+
+
+def delete_account_record(profile_id, account_key):
+    """Delete one latest account record by its stable core key."""
+    def _mutator(data):
+        profile = get_profile(data, profile_id)
+        if profile is None:
+            raise KeyError("Không tìm thấy TTC profile")
+        accounts = profile.get("fb_accounts", [])
+        target_index = next(
+            (index for index, account in enumerate(accounts)
+             if facebook_account_key(account) == account_key),
+            None,
+        )
+        if target_index is None:
+            raise ValueError("Facebook account không còn tồn tại trong dữ liệu mới nhất.")
+        deleted = accounts.pop(target_index)
+        selected = profile["run_config"].get("selected_fb_account_keys")
+        if selected is not None:
+            selected[:] = [key for key in selected if key != account_key]
+        return deleted
+
+    with profile_run_lock(profile_id):
+        return mutate_database(_mutator)
+
+
+def relogin_account_record(profile_id, account_key, password=None, secret=None,
+                           req_fb=None):
+    """Login outside locks, then atomically replace credentials/token."""
+    snapshot = get_profile_snapshot(profile_id)
+    account = next(
+        (item for item in snapshot.get("fb_accounts", [])
+         if facebook_account_key(item) == account_key),
+        None,
+    )
+    if account is None:
+        raise ValueError("Facebook account không còn tồn tại trong dữ liệu mới nhất.")
+    email = str(account.get("email", "")).strip()
+    if not email:
+        raise ValueError("Manual-token account không có UID/email để login lại.")
+    login_password = str(account.get("password", "")) if password is None else str(password)
+    login_secret = str(account.get("secret", "")) if secret is None else str(secret)
+    if not login_password:
+        raise ValueError("Password không được để trống khi login lại.")
+
+    login_client = req_fb or Requests_facebook()
+    token = login_client.login_and_get_token(email, login_password, login_secret)
+    if not token:
+        raise RuntimeError("Login lại thất bại; token cũ vẫn được giữ.")
+    updates = {"token": token}
+    if password is not None:
+        updates["password"] = login_password
+    if secret is not None:
+        updates["secret"] = login_secret
+    return update_account_record(profile_id, account_key, updates)
+
+
+def update_profile_run_config(profile_id, updates):
+    """Merge validated run-config fields into the latest profile snapshot."""
+    if not isinstance(updates, dict):
+        raise ValueError("Cấu hình chạy không hợp lệ.")
+    unknown_fields = set(updates) - set(DEFAULT_RUN_CONFIG)
+    if unknown_fields:
+        raise ValueError(f"Trường cấu hình không hỗ trợ: {sorted(unknown_fields)}")
+
+    def _mutator(data):
+        profile = get_profile(data, profile_id)
+        if profile is None:
+            raise KeyError("Không tìm thấy TTC profile")
+        latest = normalize_run_config(profile.get("run_config"))
+        latest.update(updates)
+        normalized = normalize_run_config(latest)
+        profile["run_config"] = normalized
+        return dict(normalized)
+
+    with profile_run_lock(profile_id):
+        return mutate_database(_mutator)
+
+
+def copy_facebook_account_records(source_profile_id, destination_profile_id,
+                                  account_keys=None):
+    """Copy selected latest accounts between profiles without stale writes."""
+    requested_keys = None if account_keys is None else list(dict.fromkeys(account_keys))
+
+    def _mutator(data):
+        source = get_profile(data, source_profile_id)
+        destination = get_profile(data, destination_profile_id)
+        if source is None or destination is None:
+            raise KeyError("Không tìm thấy profile nguồn hoặc đích")
+        source_by_key = {
+            facebook_account_key(account): account
+            for account in source.get("fb_accounts", [])
+            if facebook_account_key(account)
+        }
+        keys = list(source_by_key) if requested_keys is None else requested_keys
+        if any(key not in source_by_key for key in keys):
+            raise ValueError("Facebook account nguồn đã thay đổi. Vui lòng chọn lại.")
+        copied = 0
+        skipped = 0
+        destination_accounts = destination.setdefault("fb_accounts", [])
+        for key in keys:
+            candidate = dict(source_by_key[key])
+            if _is_duplicate_account(destination_accounts, candidate):
+                skipped += 1
+                continue
+            destination_accounts.append(candidate)
+            _include_new_account_in_explicit_selection(destination, candidate)
+            copied += 1
+        return {"copied": copied, "skipped": skipped}
+
+    with profile_run_lock(destination_profile_id):
+        return mutate_database(_mutator)
 
 # ---------- Class Facebook login (từ file cũ) ----------
 _FACEBOOK_LOGIN_MESSAGES = {
@@ -4822,12 +5058,65 @@ def _latest_known_ttc_balance(api, claim_result=None):
     return _parse_strict_integer(account_info.get("balance"))
 
 
-def _print_ttc_completion(api, done, total):
+def _runtime_stop_requested(stop_event):
+    if stop_event is None:
+        return False
+    is_set = getattr(stop_event, "is_set", None)
+    if callable(is_set):
+        return bool(is_set())
+    if callable(stop_event):
+        return bool(stop_event())
+    raise TypeError("stop_event must expose is_set() or be callable")
+
+
+def _emit_runtime_event(event_callback, event_type, message="", **payload):
+    if event_callback is None:
+        return
+    event = {"type": str(event_type), "message": str(message)}
+    event.update(payload)
+    event_callback(event)
+
+
+def _cooperative_countdown(seconds, message, stop_event=None,
+                           event_callback=None):
+    if stop_event is None:
+        countdown(seconds, message)
+        return True
+    seconds = max(0, int(seconds))
+    _emit_runtime_event(
+        event_callback,
+        "delay",
+        f"{message}: {seconds}s",
+        seconds=seconds,
+    )
+    wait = getattr(stop_event, "wait", None)
+    if callable(wait):
+        return not bool(wait(seconds))
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if _runtime_stop_requested(stop_event):
+            return False
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    return not _runtime_stop_requested(stop_event)
+
+
+def _print_ttc_completion(api, done, total, metrics=None, event_callback=None):
     latest_balance = _latest_known_ttc_balance(api)
-    summary = f"Hoàn thành {done}/{total} job | Total: {format_coin(total_coin)}"
+    coin_total = total_coin if metrics is None else metrics.get("session_coin", 0)
+    completed_count = done if metrics is None else metrics.get("jobs_succeeded", done)
+    summary = f"Hoàn thành {done}/{total} job | Total: {format_coin(coin_total)}"
     if latest_balance is not None:
         summary += f" | {format_coin(latest_balance)} xu"
     print_success(summary)
+    _emit_runtime_event(
+        event_callback,
+        "completion",
+        summary,
+        jobs_succeeded=completed_count,
+        jobs_planned=total,
+        session_coin=coin_total,
+        balance=latest_balance,
+    )
 
 
 def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
@@ -4835,18 +5124,30 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                  like_batch_min=None, like_batch_max=None,
                  comment_batch_min=None, comment_batch_max=None,
                  like_delay_range=(10, 10), comment_delay_range=(10, 10),
-                 failed_delay_range=(10, 10), skip_hidden_comments=True):
+                 failed_delay_range=(10, 10), skip_hidden_comments=True,
+                 stop_event=None, event_callback=None, metrics=None,
+                 action=None, transaction_sleep_fn=None):
     global total_coin
     enabled_types = normalize_job_types(job_types)
-    do_job = AUTO_Action()
+    transaction_sleep_fn = transaction_sleep_fn or time.sleep
+    if metrics is not None:
+        metrics.setdefault("jobs_succeeded", 0)
+        metrics.setdefault("session_coin", 0)
+        metrics.setdefault("balance", None)
+    if _runtime_stop_requested(stop_event):
+        _emit_runtime_event(event_callback, "stopped", "Đã dừng trước khi bắt đầu job.")
+        return 0
+    do_job = action if action is not None else AUTO_Action()
     uid, msg = do_job.get_info(fb_token)
     if not isinstance(uid, str) or not uid.strip():
         print("ERROR:" + msg)
+        _emit_runtime_event(event_callback, "error", msg, stage="facebook_identity")
         return 0
     uid = uid.strip()
 
     api.set_facebook_uid(uid)
     print(f"{Fore.CYAN}{Style.BRIGHT}📱 Facebook: {uid}{Style.RESET_ALL}")
+    _emit_runtime_event(event_callback, "identity", f"Facebook UID: {uid}", uid=uid)
 
     type_slots = schedule_job_types_by_burst(
         enabled_types,
@@ -4860,6 +5161,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
     )
     if not type_slots:
         print_info("Không có job TTC phù hợp được chọn.")
+        _emit_runtime_event(event_callback, "log", "Không có job TTC phù hợp được chọn.")
         return 0
 
     print_info(f"Đã lên kế hoạch {len(type_slots)} job, tối đa {max_jobs}.")
@@ -4870,6 +5172,12 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
     fetch_retry_at = {}
 
     for idx, type_ in enumerate(type_slots, start=1):
+        if _runtime_stop_requested(stop_event):
+            _emit_runtime_event(
+                event_callback, "stopped", "Đã dừng trước job tiếp theo.",
+                jobs_succeeded=total_done,
+            )
+            break
         cached_jobs = job_cache[type_]
         if not cached_jobs:
             retry_at = fetch_retry_at.get(type_)
@@ -4920,8 +5228,18 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                 )
                 fetch_retry_at[type_] = time.monotonic() + wait_seconds
                 print_info("Hiện chưa có job TTC phù hợp.")
+                _emit_runtime_event(
+                    event_callback, "log", "Hiện chưa có job TTC phù hợp.",
+                    level="info", job_type=type_,
+                )
                 continue
 
+        if _runtime_stop_requested(stop_event):
+            _emit_runtime_event(
+                event_callback, "stopped", "Đã dừng sau khi lấy job.",
+                jobs_succeeded=total_done,
+            )
+            break
         job = cached_jobs.pop(0)
         original_job = job.get("_ttc_job")
         job_succeeded = False
@@ -4944,6 +5262,16 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                 print_info(
                     f"[{idx}/{total_jobs}] Đang xử lý {job_type_display} "
                     f"(job_id: {original_job.get('job_id', '')})..."
+                )
+                _emit_runtime_event(
+                    event_callback,
+                    "job_started",
+                    f"[{idx}/{total_jobs}] Đang xử lý {job_type_display}",
+                    index=idx,
+                    total=total_jobs,
+                    job_type=type_,
+                    uid=uid,
+                    job_id=original_job.get("job_id", ""),
                 )
                 action_succeeded = False
                 try:
@@ -4976,7 +5304,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                             settle_seconds = (
                                 5 if type_ == "like_poster" and action_succeeded else 3
                             )
-                            time.sleep(settle_seconds)
+                            transaction_sleep_fn(settle_seconds)
                     else:
                         print_warning(
                             f"[{idx}/{total_jobs}] {job_type_display} | Không lấy được "
@@ -4984,10 +5312,14 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                         )
                 except Exception as exc:
                     print_error(f"[{idx}/{total_jobs}] Lỗi Facebook {type_}: {exc}")
+                    _emit_runtime_event(
+                        event_callback, "error", f"Lỗi Facebook {type_}: {exc}",
+                        stage="facebook_action", uid=uid,
+                    )
 
                 if comment_disabled_for_this_turn:
                     remaining_jobs = max_jobs - total_done
-                    if remaining_jobs > 0:
+                    if remaining_jobs > 0 and not _runtime_stop_requested(stop_event):
                         print_info("Đang lấy job Like...")
                         fallback_done = run_ttc_jobs(
                             api,
@@ -5004,9 +5336,18 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                             comment_delay_range=comment_delay_range,
                             failed_delay_range=failed_delay_range,
                             skip_hidden_comments=skip_hidden_comments,
+                            stop_event=stop_event,
+                            event_callback=event_callback,
+                            metrics=metrics,
+                            action=do_job,
+                            transaction_sleep_fn=transaction_sleep_fn,
                         )
                         total_done += fallback_done
-                    _print_ttc_completion(api, total_done, max_jobs)
+                    _print_ttc_completion(
+                        api, total_done, max_jobs,
+                        metrics=metrics,
+                        event_callback=event_callback,
+                    )
                     return total_done
                 if action_succeeded:
                     result = api.submit_job(original_job)
@@ -5024,22 +5365,44 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                             "TTC chưa ghi nhận reaction, thử gửi lại kết quả "
                             f"sau {TTC_CLAIM_RETRY_DELAY} giây..."
                         )
-                        time.sleep(TTC_CLAIM_RETRY_DELAY)
+                        transaction_sleep_fn(TTC_CLAIM_RETRY_DELAY)
                         result = api.submit_job(original_job)
                         claim_retried = True
                     if result.get("success") is True:
                         earned = _normalize_ttc_earned_coin(result.get("earned_coin"))
                         job_succeeded = True
                         total_done += 1
-                        total_coin += earned
+                        if metrics is None:
+                            total_coin += earned
+                            displayed_total = total_coin
+                        else:
+                            metrics["jobs_succeeded"] += 1
+                            metrics["session_coin"] += earned
+                            displayed_total = metrics["session_coin"]
                         latest_balance = _latest_known_ttc_balance(api, result)
+                        if metrics is not None:
+                            metrics["balance"] = latest_balance
                         balance_text = (
                             f" | {format_coin(latest_balance)} xu"
                             if latest_balance is not None else ""
                         )
                         print_success(
                             f"[{idx}/{total_jobs}] {job_type_display} | +{format_coin(earned)} | "
-                            f"Total: {format_coin(total_coin)}{balance_text}"
+                            f"Total: {format_coin(displayed_total)}{balance_text}"
+                        )
+                        _emit_runtime_event(
+                            event_callback,
+                            "job_succeeded",
+                            f"{job_type_display} +{format_coin(earned)}",
+                            uid=uid,
+                            jobs_succeeded=(
+                                total_done if metrics is None
+                                else metrics["jobs_succeeded"]
+                            ),
+                            session_coin=displayed_total,
+                            earned_coin=earned,
+                            balance=latest_balance,
+                            claim_id=original_job.get("idpost", ""),
                         )
                     else:
                         server_raw_text = result.get("server_raw_text", "")
@@ -5058,15 +5421,223 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                     )
 
         if idx < total_jobs:
+            if _runtime_stop_requested(stop_event):
+                _emit_runtime_event(
+                    event_callback, "stopped", "Đã dừng sau current job.",
+                    jobs_succeeded=total_done,
+                )
+                break
             if job_succeeded:
                 delay_range = like_delay_range if type_ == "like_facebook" else comment_delay_range
             else:
                 delay_range = failed_delay_range
             delay = random.randint(*delay_range)
-            countdown(delay, f"Chờ job {idx+1} : ")
+            if not _cooperative_countdown(
+                    delay, f"Chờ job {idx+1}", stop_event, event_callback):
+                _emit_runtime_event(
+                    event_callback, "stopped", "Delay đã được ngắt để dừng.",
+                    jobs_succeeded=total_done,
+                )
+                break
 
-    _print_ttc_completion(api, total_done, total_jobs)
+    _print_ttc_completion(
+        api, total_done, total_jobs,
+        metrics=metrics,
+        event_callback=event_callback,
+    )
     return total_done
+
+
+class TTCAccountRuntime:
+    """Independent production runtime for one Facebook account.
+
+    This object owns its TTC client/session, fetch state, Facebook action
+    session, stop state, immutable run snapshot, and GUI-facing metrics.
+    """
+
+    def __init__(self, profile_id, auth_token, account, config, worker_id=None,
+                 stop_event=None, event_callback=None, api_factory=None,
+                 action_factory=None, transaction_sleep_fn=None):
+        self.profile_id = str(profile_id or "").strip()
+        self.auth_token = str(auth_token or "").strip()
+        self.account = _normalize_account(dict(account or {}))
+        self.account_key = facebook_account_key(self.account)
+        self.config = normalize_run_config(dict(config or {}))
+        self.worker_id = str(worker_id or self.account_key or "account")
+        self.stop_event = stop_event if stop_event is not None else threading.Event()
+        self.event_callback = event_callback
+        self.api_factory = api_factory or API_TTC
+        self.action_factory = action_factory or AUTO_Action
+        self.transaction_sleep_fn = transaction_sleep_fn
+        self.fetch_state = TTCFetchState()
+        self.metrics = {
+            "jobs_succeeded": 0,
+            "session_coin": 0,
+            "balance": None,
+        }
+        self.api = None
+        self.facebook_action = None
+        self.uid = None
+
+    def request_stop(self):
+        self.stop_event.set()
+
+    def _handle_event(self, event):
+        if event.get("type") == "identity":
+            self.uid = event.get("uid")
+        if self.event_callback is not None:
+            self.event_callback(dict(event))
+
+    def _ttc_log(self, message, level="api"):
+        self._handle_event({
+            "type": "log",
+            "message": str(message),
+            "level": str(level),
+        })
+
+    def run(self):
+        if not self.auth_token:
+            raise ValueError("TTC profile chưa có token.")
+        if not self.account_key or not self.account.get("token"):
+            raise ValueError("Facebook account không có identity/token hợp lệ.")
+        if _runtime_stop_requested(self.stop_event):
+            return dict(self.metrics)
+
+        self.api = self.api_factory(
+            self.auth_token,
+            worker_id=self.worker_id,
+            fetch_state=self.fetch_state,
+            log_fn=self._ttc_log,
+        )
+        self.facebook_action = self.action_factory()
+        try:
+            self._handle_event({
+                "type": "status",
+                "message": "Đang đăng nhập TTC",
+                "status": "Running",
+            })
+            account_info = self.api.login()
+            if isinstance(account_info, dict):
+                self.metrics["balance"] = _parse_strict_integer(
+                    account_info.get("balance")
+                )
+
+            cycle = 1
+            while not _runtime_stop_requested(self.stop_event):
+                self._handle_event({
+                    "type": "cycle",
+                    "message": f"Chu kỳ {cycle}",
+                    "cycle": cycle,
+                })
+                run_ttc_jobs(
+                    self.api,
+                    self.account["token"],
+                    max_jobs=self.config["max_jobs_per_acc"],
+                    job_types=set(self.config["job_types"]),
+                    like_batch_min=self.config["like_batch_min"],
+                    like_batch_max=self.config["like_batch_max"],
+                    comment_batch_min=self.config["comment_batch_min"],
+                    comment_batch_max=self.config["comment_batch_max"],
+                    like_delay_range=(
+                        self.config["like_delay_min"],
+                        self.config["like_delay_max"],
+                    ),
+                    comment_delay_range=(
+                        self.config["comment_delay_min"],
+                        self.config["comment_delay_max"],
+                    ),
+                    failed_delay_range=(
+                        self.config["failed_delay_min"],
+                        self.config["failed_delay_max"],
+                    ),
+                    skip_hidden_comments=self.config["skip_hidden_comments"],
+                    stop_event=self.stop_event,
+                    event_callback=self._handle_event,
+                    metrics=self.metrics,
+                    action=self.facebook_action,
+                    transaction_sleep_fn=self.transaction_sleep_fn,
+                )
+                if not self.config["continuous"]:
+                    break
+                cycle += 1
+
+            status = "Stopped" if _runtime_stop_requested(self.stop_event) else "Completed"
+            self._handle_event({
+                "type": "status",
+                "message": status,
+                "status": status,
+                **self.metrics,
+            })
+            return dict(self.metrics)
+        except Exception as exc:
+            self._handle_event({
+                "type": "error",
+                "message": str(exc),
+                "stage": "account_runtime",
+            })
+            raise
+        finally:
+            if self.api is not None:
+                self.api.close()
+
+
+def get_profile_balance(profile_id):
+    """Return TTC account info for GUI/background callers."""
+    api = None
+    with profile_run_lock(profile_id):
+        try:
+            profile = get_profile_snapshot(profile_id)
+            auth_token = str(profile.get("auth_token") or "").strip()
+            if not auth_token:
+                raise ValueError("Cần TTC token.")
+            api = API_TTC(auth_token, worker_id=f"{profile_id}:balance")
+            api.login()
+            return dict(api.get_account_info())
+        finally:
+            if api is not None:
+                api.close()
+
+
+def get_profile_jobs_preview(profile_id, account_key=None):
+    """Fetch current normalized jobs for GUI/background callers."""
+    api = None
+    with profile_run_lock(profile_id):
+        try:
+            profile = get_profile_snapshot(profile_id)
+            auth_token = str(profile.get("auth_token") or "").strip()
+            if not auth_token:
+                raise ValueError("Cần TTC token.")
+            accounts = profile.get("fb_accounts", [])
+            if account_key:
+                account = next(
+                    (item for item in accounts
+                     if facebook_account_key(item) == account_key),
+                    None,
+                )
+            else:
+                selected = selected_accounts(profile)
+                account = selected[0] if selected else next(
+                    (item for item in accounts
+                     if str(item.get("token") or "").strip()),
+                    None,
+                )
+            if account is None:
+                raise ValueError("Cần ít nhất một Facebook token.")
+            api = API_TTC(auth_token, worker_id=f"{profile_id}:preview")
+            api.login()
+            action = AUTO_Action()
+            uid, message = action.get_info(str(account.get("token") or "").strip())
+            if not uid:
+                raise RuntimeError(f"Không thể lấy UID Facebook: {message}")
+            api.set_facebook_uid(uid)
+            jobs = []
+            for group in ("like_facebook", "like_poster"):
+                result = api.fetch_jobs_for_legacy_type(group)
+                jobs.extend(result["jobs"])
+            return {"uid": uid, "jobs": jobs}
+        finally:
+            if api is not None:
+                api.close()
 
 
 def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_per_acc=30,

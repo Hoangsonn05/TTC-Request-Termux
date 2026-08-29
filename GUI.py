@@ -1,1474 +1,1133 @@
-import sys
-import time
-import hmac
-import hashlib
-import json
-import os
-import base64
-import uuid
 import random
-import sqlite3
+import sys
+import threading
 from datetime import datetime
-from colorama import init
-import pyotp
 
-import requests
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QTabWidget, QPushButton, QLineEdit, QTextEdit, QLabel, QGroupBox,
-    QCheckBox, QSpinBox, QMessageBox, QProgressBar, QScrollArea,
-    QGridLayout, QDialog, QDialogButtonBox
-)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import QThread, QTimer, Qt, pyqtSignal
 from PyQt5.QtGui import QFont
+from PyQt5.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QScrollArea,
+    QSpinBox,
+    QTabWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
 
-init(autoreset=True)
+import api_ttc as core
 
-# ========================== CƠ SỞ DỮ LIỆU ==========================
-class Database:
-    def __init__(self, db_file="data.db"):
-        self.db_file = db_file
-        self.init_db()
 
-    def init_db(self):
-        conn = sqlite3.connect(self.db_file)
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS accounts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE,
-            password_enc TEXT,
-            secret_enc TEXT,
-            token TEXT,
-            uid TEXT,
-            name TEXT,
-            jobs_done INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )''')
-        c.execute('''CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )''')
-        conn.commit()
-        conn.close()
+def _identity(account):
+    email = str(account.get("email", "")).strip()
+    return email or f"Manual token {core.preview_token(account.get('token', ''))}"
 
-    def add_account(self, email, password_enc, secret_enc, token, uid, name):
-        conn = sqlite3.connect(self.db_file)
-        c = conn.cursor()
-        c.execute('''INSERT OR REPLACE INTO accounts 
-            (email, password_enc, secret_enc, token, uid, name, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)''',
-            (email, password_enc, secret_enc, token, uid, name))
-        conn.commit()
-        conn.close()
 
-    def update_account_token(self, uid, token):
-        conn = sqlite3.connect(self.db_file)
-        c = conn.cursor()
-        c.execute('''UPDATE accounts SET token = ?, updated_at = CURRENT_TIMESTAMP WHERE uid = ?''', (token, uid))
-        conn.commit()
-        conn.close()
-
-    def update_account_jobs(self, uid, jobs_done):
-        conn = sqlite3.connect(self.db_file)
-        c = conn.cursor()
-        c.execute('''UPDATE accounts SET jobs_done = jobs_done + ?, updated_at = CURRENT_TIMESTAMP WHERE uid = ?''', (jobs_done, uid))
-        conn.commit()
-        conn.close()
-
-    def delete_account(self, uid):
-        conn = sqlite3.connect(self.db_file)
-        c = conn.cursor()
-        c.execute('DELETE FROM accounts WHERE uid = ?', (uid,))
-        conn.commit()
-        conn.close()
-
-    def get_all_accounts(self):
-        conn = sqlite3.connect(self.db_file)
-        c = conn.cursor()
-        c.execute('SELECT email, password_enc, secret_enc, token, uid, name, jobs_done FROM accounts')
-        rows = c.fetchall()
-        conn.close()
-        accounts = []
-        for row in rows:
-            accounts.append({
-                'email': row[0],
-                'password_enc': row[1],
-                'secret_enc': row[2],
-                'token': row[3],
-                'uid': row[4],
-                'name': row[5],
-                'jobs_done': row[6]
-            })
-        return accounts
-
-    def get_setting(self, key, default=None):
-        conn = sqlite3.connect(self.db_file)
-        c = conn.cursor()
-        c.execute('SELECT value FROM settings WHERE key = ?', (key,))
-        row = c.fetchone()
-        conn.close()
-        if row:
-            return row[0]
-        return default
-
-    def set_setting(self, key, value):
-        conn = sqlite3.connect(self.db_file)
-        c = conn.cursor()
-        c.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', (key, value))
-        conn.commit()
-        conn.close()
-
-    def get_all_settings(self):
-        conn = sqlite3.connect(self.db_file)
-        c = conn.cursor()
-        c.execute('SELECT key, value FROM settings')
-        rows = c.fetchall()
-        conn.close()
-        return {row[0]: row[1] for row in rows}
-
-# ========================== MÃ HÓA ==========================
-def encrypt_text(text):
-    if not text:
-        return ""
-    return base64.b64encode(text.encode()).decode()
-
-def decrypt_text(encrypted):
-    if not encrypted:
-        return ""
-    return base64.b64decode(encrypted.encode()).decode()
-
-# ========================== PHẦN API FACEBOOK ==========================
-class Requests_facebook:
-    def __init__(self):
-        self._requests = requests.Session()
-        self._requests.headers.update({
-            "User-Agent": "[FBAN/FB4A;FBAV/571.0.0.44.73;FBBV/1023572511;FBDM/{density=1.5,width=540,height=960};FBLC/en_US;FBRV/0;FBCR/Verizon;FBMF/samsung;FBBD/samsung;FBPN/com.facebook.katana;FBDV/SM-S901N;FBSV/9;FBOP/1;FBCA/x86_64:arm64-v8a;]",
-            "Connection": "keep-alive",
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Priority": "u=0",
-            "app-scope-id-header": "77a256c1-5911-48a4-bafd-fa4316c9f941",
-            "x-fb-client-ip": "True",
-            "x-fb-conn-uuid-client": "AS4k/LynmUQ6y62aIVsNWw==",
-            "X-FB-Connection-Type": "WIFI",
-            "x-fb-device-group": "1904",
-            "X-FB-HTTP-Engine": "Tigon/Liger",
-            "X-FB-Net-HNI": "310005",
-            "X-FB-Request-Analytics-Tags": '{"network_tags":{"product":"350685531728","request_category":"graphql","purpose":"fetch","retry_attempt":"0"},"application_tags":"graphservice"}',
-            "x-fb-rmd": "fail=Server:INVALID_MAP,Default:INVALID_MAP;v=;ip=;tkn=;reqTime=1633641062;recvTime=0",
-            "x-fb-server-cluster": "True",
-            "X-FB-SIM-HNI": "310005",
-            "x-graphql-client-library": "graphservice",
-            "x-graphql-request-purpose": "fetch",
-            "X-Meta-USDID": "28266e60-2c0c-48f2-b64d-d25fee3d714e.1785300592.MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAELj5WOTDR3Uvqc5tqJ5lWdL_Mdi5xxeE342NEI82WLzzDIBKX4Q6wQ7hwtZDInM4tf_pkkNKKsoBQo_2cQQbIvQ.MEUCIQCx1YdU9dWWQRQ-bxEA83dBGnCWy5pAm3ed5KQUnoQlSAIgX_ISrCeup82fNh7OBMl-jZQ18eNbmooTjFzt6Ne12XY",
-            "X-Meta-ZCA": "empty_token",
-            "x-tigon-is-retry": "False",
-            "x-zero-eh": "664c0faaac849cb891d0a261fbb72a12",
-            "X-ZERO-STATE": "unknown",
-        })
-        self._url_api = 'https://b-graph.facebook.com/graphql'
-
-    def _login_facebook(self, uid, password, encode_2fa):
-        ts = int(time.time())
-        device = str(uuid.uuid4())
-        client_trace_id = str(uuid.uuid4())
-        waterfall_id = str(uuid.uuid4())
-
-        payload = {
-            "method": "post",
-            "format": "json",
-            "server_timestamps": "true",
-            "locale": "en_US",
-            "purpose": "fetch",
-            "fb_api_req_friendly_name": "CreateOneTimeChallengeNonceCreate",
-            'fb_api_caller_class': 'graphservice',
-            'client_doc_id': '14372771303129768114139595837',
-            'fb_api_client_context': '{"is_background":false}',
-            'variables': r'''{"input":{"app_scoped_device_id":"%s"}}''' % (device),
-            'fb_api_analytics_tags': '["GraphServices"]',
-            'client_trace_id': client_trace_id
-        }
-
-        res = self._requests.post(url=self._url_api, headers={
-            "Authorization": "OAuth 350685531728|62f8ce9f74b12f84c123cc23437a4a32",
-            "X-FB-Friendly-Name": "CreateOneTimeChallengeNonceCreate",
-            "X-ZERO-F-DEVICE-ID": device
-        }, data=payload)
-
-        data = res.json()
-
-        data = {
-            "challenge_nonce": data["data"]["xfb_fb_key_attestation_create_one_time_challenge_nonce"]["challenge_nonce"],
-            "username": uid
-        }
-        data_challenge_nonce = base64.b64encode(
-            json.dumps(data, separators=(",", ":")).encode()
-        ).decode()
-        client_trace_id = str(uuid.uuid4())
-
-        payload = {
-            "method": "post",
-            "format": "json",
-            "server_timestamps": "true",
-            "locale": "en_US",
-            "purpose": "fetch",
-            "fb_api_req_friendly_name": "FbBloksActionRootQuery-com.bloks.www.bloks.caa.login.async.send_login_request",
-            'fb_api_caller_class': 'graphservice',
-            'client_doc_id': '119940804212792425089909966247',
-            'fb_api_client_context': '{"is_background":false}',
-            'variables': r'''{"params":{"params":"{\"params\":\"{\\\"server_params\\\":{\\\"device_id\\\":\\\"%s\\\",\\\"server_login_source\\\":\\\"login\\\",\\\"waterfall_id\\\":\\\"%s\\\",\\\"attestation_result\\\":{\\\"keyHash\\\":\\\"c816e3d25740b8692da6c3e168baf6d38c3e3b855b10f114a6900aa70e386bf2\\\",\\\"signature\\\":\\\"MEUCIQDhOJq8dMQu5S1SWRENyPxV6kMSmaXCAXGuLQnF\\/6wdCAIgBr\\/suDJIvrhXd\\/iWyNlCQUv1pUd8WoEW5pawWtqlpIA=\\\",\\\"data\\\":\\\"%s\\\"},\\\"machine_id\\\":\\\"p4Rpar0qseBOPtkrB_exw55d\\\",\\\"from_native_screen\\\":true,\\\"credential_type\\\":\\\"password\\\",\\\"password\\\":\\\"#PWD_FB4A:0:%s:%s\\\",\\\"try_num\\\":\\\"1\\\",\\\"family_device_id\\\":\\\"%s\\\",\\\"event_flow\\\":\\\"login_manual\\\",\\\"event_step\\\":\\\"home_page\\\",\\\"is_from_logged_in_switcher\\\":false,\\\"contact_point\\\":\\\"%s\\\"}}\"}","bloks_versioning_id":"64b572e5ffae5e9f072424a656577ac0bb01a187d02b7a00bbfb3a08497c3d6f","app_id":"com.bloks.www.bloks.caa.login.async.send_login_request"},"scale":"1.5","nt_context":{"using_white_navbar":true,"styles_id":"a07b73c926a84224348806e6cd486365","pixel_ratio":1.5,"is_push_on":true,"debug_tooling_metadata_token":null,"is_flipper_enabled":false,"theme_params":[{"value":["three_neutral_gray"],"design_system_name":"XMDS"},{"value":[],"design_system_name":"FDS"}],"bloks_version":"64b572e5ffae5e9f072424a656577ac0bb01a187d02b7a00bbfb3a08497c3d6f"}}''' % (device, waterfall_id, data_challenge_nonce, ts, password, device, str(uid)),
-            'fb_api_analytics_tags': '["GraphServices"]',
-            'client_trace_id': client_trace_id
-        }
-
-        res = self._requests.post(url=self._url_api, headers={
-            "Authorization": "OAuth 350685531728|62f8ce9f74b12f84c123cc23437a4a32",
-            "X-FB-Friendly-Name": "FbBloksActionRootQuery-com.bloks.www.bloks.caa.login.async.send_login_request"
-        }, data=payload)
-
-        data = res.text
-        try:
-            two_step_verification_context = data.split(r'''(dkc \\\"two_step_verification_context\\\" \\\"flow_source\\\" \\\"machine_id\\\" \\\"device_id\\\" \\\"should_fallback_to_sms\\\" \\\"family_device_id\\\" \\\"INTERNAL_INFRA_screen_id\\\") (dkc \\\"''')[1].split(r'''\\\"''')[0]
-
-            secret = encode_2fa.replace(" ", "")
-            totp = pyotp.TOTP(secret)
-
-            payload = {
-                "method": "post",
-                "format": "json",
-                "server_timestamps": "true",
-                "locale": "en_US",
-                "purpose": "fetch",
-                "fb_api_req_friendly_name": "FbBloksActionRootQuery-com.bloks.www.two_step_verification.verify_code.async",
-                'fb_api_caller_class': 'graphservice',
-                'client_doc_id': '119940804212792425089909966247',
-                'fb_api_client_context': '{"is_background":false}',
-                'variables': r'''{"params":{"params":"{\"params\":\"{\\\"client_input_params\\\":{\\\"auth_secure_device_id\\\":\\\"\\\",\\\"block_store_machine_id\\\":null,\\\"code\\\":\\\"%s\\\",\\\"should_trust_device\\\":1,\\\"family_device_id\\\":\\\"77a256c1-5911-48a4-bafd-fa4316c9f941\\\",\\\"device_id\\\":\\\"77a256c1-5911-48a4-bafd-fa4316c9f941\\\",\\\"cloud_trust_token\\\":null,\\\"network_bssid\\\":null,\\\"machine_id\\\":\\\"\\\"},\\\"server_params\\\":{\\\"INTERNAL__latency_qpl_marker_id\\\":36707139,\\\"device_id\\\":null,\\\"spectra_reg_login_data\\\":null,\\\"challenge\\\":\\\"totp\\\",\\\"INTERNAL__latency_qpl_instance_id\\\":130518416400274,\\\"two_step_verification_context\\\":\\\"%s\\\",\\\"flow_source\\\":\\\"two_factor_login\\\"}}\"}","bloks_versioning_id":"64b572e5ffae5e9f072424a656577ac0bb01a187d02b7a00bbfb3a08497c3d6f","app_id":"com.bloks.www.two_step_verification.verify_code.async"},"scale":"1.5","nt_context":{"using_white_navbar":true,"styles_id":"a07b73c926a84224348806e6cd486365","pixel_ratio":1.5,"is_push_on":true,"debug_tooling_metadata_token":null,"is_flipper_enabled":false,"theme_params":[{"value":["three_neutral_gray"],"design_system_name":"XMDS"},{"value":[],"design_system_name":"FDS"}],"bloks_version":"64b572e5ffae5e9f072424a656577ac0bb01a187d02b7a00bbfb3a08497c3d6f"}}''' % (totp.now(), two_step_verification_context),
-                'fb_api_analytics_tags': '["GraphServices"]',
-                'client_trace_id': '73b659d1-a3cc-4db4-bc79-892b41b88f2c'
-            }
-            res = self._requests.post(url=self._url_api, headers={
-                "Authorization": "OAuth 350685531728|62f8ce9f74b12f84c123cc23437a4a32",
-                "X-FB-Friendly-Name": "FbBloksActionRootQuery-com.bloks.www.two_step_verification.verify_code.async"
-            }, data=payload)
-            data = res.text
-        except:
-            pass
-
-        accesstoken = data.split(r'''"access_token\\\\\\\":\\\\\\\"''')[1].split(r'''\\\\\\\"''')[0]
-        return accesstoken
-
-    def login_and_get_token(self, email, password, secret_2fa=""):
-        try:
-            token = self._login_facebook(email, password, secret_2fa)
-            return token
-        except Exception as e:
-            print(f"Lỗi đăng nhập: {e}")
-            return None
-
-def generate_session_id(prefix="UFS", suffix="fg-4"):
-    unique_id = uuid.uuid4()
-    return f"{prefix}-{unique_id}-{suffix}"
-
-def generate_fragment(name: str, source: str, duration: float = 0.0):
-    now = time.time()
-    return {
-        'name': name,
-        'source': source,
-        'start_time': now,
-        'end_time': now + duration,
-        'instance_id': random.randint(100000, 999999999)
-    }
-
-def build_attribution(fragments):
-    items = []
-    for f in fragments:
-        item = f"{f['name']},{f['source']},,{f['start_time']},{f['instance_id']},,,,{f['end_time']}"
-        items.append(item)
-    return ';'.join(items)
-
-class AUTO_Action:
-    def __init__(self):
-        self.url = 'https://b-graph.facebook.com/graphql'
-        self._requests = requests.Session()
-        self.id_reaction = {
-            'LIKE': 1635855486666999,
-            'LOVE': 1678524932434102,
-            'CARE': 613557422527858,
-            'HAHA': 115940658764963,
-            'WOW': 478547315650144,
-            'SAD': 908563459236466,
-            'ANGRY': 444813342392137,
-        }
-        self._requests.headers.update({
-            "User-Agent": "[FBAN/FB4A;FBAV/571.0.0.44.73;FBBV/1023572511;FBDM/{density=1.5,width=540,height=960};FBLC/en_US;FBRV/0;FBCR/Verizon;FBMF/samsung;FBBD/samsung;FBPN/com.facebook.katana;FBDV/SM-S901N;FBSV/9;FBOP/1;FBCA/x86_64:arm64-v8a;]",
-            "Connection": "keep-alive",
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Priority": "u=0",
-            "app-scope-id-header": "77a256c1-5911-48a4-bafd-fa4316c9f941",
-            "x-fb-client-ip": "True",
-            "x-fb-conn-uuid-client": "AS4k/LynmUQ6y62aIVsNWw==",
-            "X-FB-Connection-Type": "WIFI",
-            "x-fb-device-group": "1904",
-            "X-FB-HTTP-Engine": "Tigon/Liger",
-            "X-FB-Net-HNI": "310005",
-            "X-FB-Request-Analytics-Tags": '{"network_tags":{"product":"350685531728","request_category":"graphql","purpose":"fetch","retry_attempt":"0"},"application_tags":"graphservice"}',
-            "x-fb-rmd": "fail=Server:INVALID_MAP,Default:INVALID_MAP;v=;ip=;tkn=;reqTime=1633641062;recvTime=0",
-            "x-fb-server-cluster": "True",
-            "X-FB-SIM-HNI": "310005",
-            "x-graphql-client-library": "graphservice",
-            "x-graphql-request-purpose": "fetch",
-            "X-Meta-USDID": "28266e60-2c0c-48f2-b64d-d25fee3d714e.1785300592.MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAELj5WOTDR3Uvqc5tqJ5lWdL_Mdi5xxeE342NEI82WLzzDIBKX4Q6wQ7hwtZDInM4tf_pkkNKKsoBQo_2cQQbIvQ.MEUCIQCx1YdU9dWWQRQ-bxEA83dBGnCWy5pAm3ed5KQUnoQlSAIgX_ISrCeup82fNh7OBMl-jZQ18eNbmooTjFzt6Ne12XY",
-            "X-Meta-ZCA": "empty_token",
-            "x-tigon-is-retry": "False",
-            "x-zero-eh": "664c0faaac849cb891d0a261fbb72a12",
-            "X-ZERO-STATE": "unknown",
-            "X-ZERO-F-DEVICE-ID": '77a256c1-5911-48a4-bafd-fa4316c9f941'
-        })
-
-    def get_info(self, token):
-        client_trace_id = str(uuid.uuid4())
-        payload = {
-            "method": "post",
-            "format": "json",
-            "server_timestamps": "true",
-            "locale": "en_US",
-            "purpose": "fetch",
-            "fb_api_req_friendly_name": "FbStoriesLightBucketsQuery",
-            'fb_api_caller_class': 'graphservice',
-            'client_doc_id': '134400997213594131792470699723',
-            'fb_api_client_context': '{"is_background":false}',
-            'variables': r'''{"video_thumbnail_width":336,"profile_image_size":60,"skip_top_tray_ats_mid_card_offset":true,"story_media_height":960,"skip_inorganic_buckets":true,"story_media_width":540,"use_native_entrypoint_for_stars_on_reels":true,"enable_hd":true,"scale":"1.5","nt_context":{"using_white_navbar":true,"styles_id":"a07b73c926a84224348806e6cd486365","pixel_ratio":1.5,"is_push_on":true,"debug_tooling_metadata_token":null,"is_flipper_enabled":false,"theme_params":[{"value":["three_neutral_gray"],"design_system_name":"XMDS"},{"value":["DARKER_PRIMARY_DEEMPHASIZED_BUTTON_BACKGROUND_TEST"],"design_system_name":"FDS"}],"bloks_version":"64b572e5ffae5e9f072424a656577ac0bb01a187d02b7a00bbfb3a08497c3d6f"},"use_server_thumbnail":true,"enable_content_sharing_in_notes":true,"enable_uses_suggested_lyrics":true,"is_final_ranking_score_enabled":true,"enable_gif_note":true,"fbstory_tray_preview_height":295,"msqrd_supported_capabilities":[{"value":"multiplane_disabled","name":"multiplane"},{"value":"world_tracker_enabled","name":"world_tracker"},{"value":"xray_disabled","name":"xray"},{"value":"world_tracking_disabled","name":"world_tracking"},{"value":"half_float_render_pass_enabled","name":"half_float_render_pass"},{"value":"multiple_render_targets_enabled","name":"multiple_render_targets"},{"value":"vertex_texture_fetch_enabled","name":"vertex_texture_fetch"},{"value":"render_settings_high_enabled","name":"render_settings_high"},{"value":"body_tracking_enabled","name":"body_tracking"},{"value":"gyroscope_enabled","name":"gyroscope"},{"value":"geoanchor_disabled","name":"geoanchor"},{"value":"scene_depth_disabled","name":"scene_depth"},{"value":"182,202","name":"supported_beta_sdk_versions"},{"value":"segmentation_enabled","name":"segmentation"},{"value":"hand_tracking_enabled","name":"hand_tracking"},{"value":"real_scale_estimation_disabled","name":"real_scale_estimation"},{"value":"hair_segmentation_disabled","name":"hair_segmentation"},{"value":"depth_shader_read_enabled","name":"depth_shader_read"},{"value":"etc2_compression","name":"compression"},{"value":"0","name":"face_tracker_version"},{"value":"149.0,150.0,151.0,152.0,153.0,154.0,155.0,156.0,157.0,158.0,159.0,160.0,161.0,162.0,163.0,164.0,165.0,166.0,167.0,168.0,169.0,170.0,171.0,172.0,173.0,174.0,175.0,176.0,177.0,178.0,179.0,180.0,181.0,182.0,183.0,184.0,185.0,186.0,187.0,188.0,189.0,190.0,191.0,192.0,193.0,194.0,195.0,196.0,197.0,198.0,199.0,200.0,201.0,202.0","name":"supported_sdk_versions"}],"min_story_page_size_from_client":4,"enable_status_consumption":true,"should_include_first_media":true,"video_thumbnail_height":336,"fetch_bucket_content_hash":true,"should_fetch_midcard_ranking_tracking_string":true,"fbstory_tray_sizing_type":"cover-fill-cropped","should_fetch_model_for_thumbnail_frame":true,"fbstory_tray_preview_width":166,"enable_cix_screen_rollout":true,"client_request_id":"4175cf24-7ea8-4a9a-8b1e-91f9f0da9077","is_hybrid_tray_enabled":true,"should_fetch_is_trending_bucket_field":true,"page_profile_image_size_experiment":60,"should_include_production_pog_data":true,"should_include_expiration_time":true,"should_include_feedback_summary":true,"should_include_live_media":true,"should_include_live_tile_metadata":true,"show_production_pog_image":true,"unified_stories_buckets_paginated_for_light_query_first":6,"should_fetch_profile_navigation_info":true,"should_skip_feedback_total_count":true,"should_include_secondary_text_for_non_self_pog":true,"enable_easter_egg_v2":true,"include_inform_treatment":true,"compose_surface":"STORIES"}''',
-            'fb_api_analytics_tags': '["GraphServices"]',
-            'client_trace_id': client_trace_id
-        }
-        res = self._requests.post(url=self.url, headers={
-            "Authorization": f"OAuth {token}",
-            "X-FB-Friendly-Name": "FbStoriesLightBucketsQuery",
-        }, data=payload)
-        try:
-            res_json = res.json()
-        except:
-            return None, "Lỗi phân tích JSON (có thể token hỏng)"
-        if "errors" in res_json:
-            for err in res_json["errors"]:
-                if "access_token" in err.get("message", "").lower():
-                    return None, "Token đã hết hạn hoặc không hợp lệ"
-                return None, err.get("message", "Lỗi GraphQL")
-        user_id = res_json.get("data", {}).get("me", {}).get("id")
-        if user_id:
-            return user_id, "OK"
-        return None, "Không tìm thấy user_id trong phản hồi (có thể token hỏng)"
-
-    def auto_reaction(self, post_id, reaction_type, token, actor_id):
-        raw = f"feedback:{post_id}"
-        feedback_id = base64.b64encode(raw.encode()).decode()
-        fragments = [
-            generate_fragment("NewsFeedFragment", "native_newsfeed", duration=55.0),
-            generate_fragment("PermalinkDialogFragment", "story_view", duration=0.0)
-        ]
-        attribution_str = build_attribution(fragments)
-        session_id = generate_session_id()
-        ts = int(time.time())
-        client_trace_id = str(uuid.uuid4())
-        variables = {
-            "profile_image_size": 60,
-            "input": {
-                "tracking": None,
-                "session_id": session_id,
-                "feedback_source": "native_newsfeed",
-                "feedback_referrer": "native_newsfeed",
-                "feedback_id": feedback_id,
-                "feedback_reaction_id": self.id_reaction[reaction_type],
-                "downstream_share_session_id": None,
-                "downstream_share_session_start_time": None,
-                "downstream_share_session_origin_uri": None,
-                "nectar_module": "newsfeed_ufi",
-                "attribution_id_v2": attribution_str,
-                "actor_id": actor_id,
-                "downstream_share_session_navigation_events_count": [
-                    {"name": "APP_BACKGROUNDED", "count": 0},
-                    {"name": "APP_FOREGROUNDED", "count": 0}
-                ],
-                "action_timestamp": ts
-            },
-            "is_comment_sharing_enabled": True
-        }
-        payload = {
-            "method": "post",
-            "format": "json",
-            "server_timestamps": "true",
-            "locale": "en_US",
-            "purpose": "fetch",
-            "fb_api_req_friendly_name": "ViewerReactionsMutation",
-            'fb_api_caller_class': 'graphservice',
-            'client_doc_id': '285778409311568856348218907304',
-            'fb_api_client_context': json.dumps({"is_background": False}),
-            'variables': json.dumps(variables),
-            'fb_api_analytics_tags': '["GraphServices"]',
-            'client_trace_id': client_trace_id
-        }
-        res = self._requests.post(url=self.url, headers={
-            "Authorization": f"OAuth {token}",
-            "X-FB-Friendly-Name": "ViewerReactionsMutation",
-        }, data=payload)
-        try:
-            result = res.json()
-        except:
-            return False
-        if "errors" in result:
-            return False
-        feedback = result.get("data", {}).get("feedback_react", {}).get("feedback", {})
-        if feedback.get("viewer_feedback_reaction_key") is not None:
-            return True
-        else:
-            return False
-
-    def auto_cmt(self, post_id, text, token, actor_id):
-        raw = f"feedback:{post_id}"
-        feedback_id = base64.b64encode(raw.encode()).decode()
-        fragments = [
-            generate_fragment("NewsFeedFragment", "native_newsfeed", duration=55.0),
-            generate_fragment("PermalinkDialogFragment", "story_view", duration=0.0)
-        ]
-        attribution_str = build_attribution(fragments)
-        session_id = generate_session_id()
-        ts = int(time.time())
-        client_trace_id = str(uuid.uuid4())
-        idempotence_token = str(uuid.uuid4())
-
-        variables = {
-            "query_for_can_be_invited_by_viewer": True,
-            "image_medium_width": 270,
-            "image_low_height": 2048,
-            "image_medium_height": 2048,
-            "profile_image_size": 60,
-            "media_type": "image/x-auto",
-            "image_high_width": 540,
-            "input": {
-                "tracking": None,
-                "skip_link_usage_quota_validation": False,
-                "session_id": session_id,
-                "privacy_type": "DEFAULT_PRIVACY",
-                "feedback_source": "feedback_comments",
-                "vod_video_timestamp": 0,
-                "downstream_share_session_id": None,
-                "downstream_share_session_start_time": None,
-                "downstream_share_session_origin_uri": None,
-                "nectar_module": "newsfeed_ufi",
-                "actor_id": actor_id,
-                "attribution_id_v2": attribution_str,
-                "action_timestamp": ts,
-                "ad_imp_token": None,
-                "message": {
-                    "text": text,
-                    "ranges": []
-                },
-                "feedback_referrer": "native_newsfeed",
-                "feedback_id": feedback_id,
-                "idempotence_token": idempotence_token,
-                "entry_point": "TAP_FOOTER_COMMENT",
-                "downstream_share_navigation_events_count": [
-                    {"name": "APP_BACKGROUNDED", "count": 0},
-                    {"name": "APP_FOREGROUNDED", "count": 0}
-                ]
-            },
-            "enable_participation_questionnaire": True,
-            "enable_reactions_dock_message": True,
-            "image_low_width": 180,
-            "enable_user_signals_in_comments": True,
-            "enable_comment_shares": True,
-            "nt_context": {
-                "using_white_navbar": True,
-                "styles_id": "a07b73c926a84224348806e6cd486365",
-                "pixel_ratio": 1.5,
-                "is_push_on": True,
-                "debug_tooling_metadata_token": None,
-                "is_flipper_enabled": False,
-                "theme_params": [
-                    {"value": ["three_neutral_gray"], "design_system_name": "XMDS"},
-                    {"value": ["DARKER_PRIMARY_DEEMPHASIZED_BUTTON_BACKGROUND_TEST"], "design_system_name": "FDS"}
-                ],
-                "bloks_version": "64b572e5ffae5e9f072424a656577ac0bb01a187d02b7a00bbfb3a08497c3d6f"
-            },
-            "fetch_presence_eligible": True,
-            "image_high_height": 2048,
-            "fetch_privacy_value_for_pending_approval_comment": True,
-            "fetch_privacy_value_for_declined_comment": True,
-            "should_fetch_pinned_comment": True,
-            "enable_story_ring": True,
-            "should_fetch_content_owner_reaction": True,
-            "group_member_action_source": "GROUP_COMMENT",
-            "feedback_source": "NEWS_FEED",
-            "enable_add_friend_in_comments": True,
-            "should_fetch_comments_downvote_fields": True,
-            "size_style": "contain-fit",
-            "enable_identity_badge_v2": True,
-            "enable_comment_identity_badge": True,
-            "profile_pic_media_type": "image/x-auto",
-            "enable_comment_pin_v2": True,
-            "enable_gen_ai_content_transparency_in_comments": True
-        }
-
-        variables_str = json.dumps(variables, ensure_ascii=False)
-        payload = {
-            "method": "post",
-            "format": "json",
-            "server_timestamps": "true",
-            "locale": "en_US",
-            "purpose": "fetch",
-            "fb_api_req_friendly_name": "CommentCreateMutation",
-            "fb_api_caller_class": "graphservice",
-            "client_doc_id": "8474489818219302131872116307",
-            "fb_api_client_context": json.dumps({"is_background": False}),
-            "variables": variables_str,
-            "fb_api_analytics_tags": r'''["nav_attribution_id_v2=%s","GraphServices","surface_hierarchy=FeedbackFragment,story_feedback_flyout,null;SimpleUFIPopoverFragment,story_feedback_flyout,null;NewsFeedFragment,native_newsfeed,null;FbChromeFragment,unknown,null;FbMainTabActivity,native_newsfeed,null","visitation_id=null","session_id=%s"]''' % (attribution_str,session_id),
-            "client_trace_id": client_trace_id
-        }
-        res = self._requests.post(url=self.url, headers={
-            "Authorization": f"OAuth {token}",
-            "X-FB-Friendly-Name": "CommentCreateMutation",
-        }, data=payload)
-        try:
-            result = res.json()
-        except:
-            return False
-        if "errors" in result:
-            return False
-        else:
-            comment_data = result.get("data", {}).get("comment_create", {}).get("comment")
-            if comment_data and comment_data.get("id"):
-                return True
-            else:
-                return False
-
-# ========================== PHẦN TTC ==========================
-class requests_ttc:
-    def __init__(self):
-        self.httpx = requests.Session()
-
-    def get_accout(self, access_token, url="https://tuongtaccheo.com/logintoken.php"):
-        data = {"access_token": access_token}
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
-        }
-        response = self.httpx.post(url, data=data, headers=headers)
-        if response.json()['status'] == "success":
-            cookie = response.headers['Set-Cookie']
-            main_cookie = cookie.split(';')[0]
-            return response.json()['data'], main_cookie
-        else:
-            return "Sai access_token hoặc tài khoản không tồn tại", ""
-
-    def get_jobs_like_vip(self, cookie, uid, url="https://tuongtaccheo.com/kiemtien/likepostvipcheo/getpost.php"):
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3",
-            "Cookie": cookie,
-            "Content-Type": "application/x-www-form-urlencoded",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-        response = self.httpx.get(url, params={'nickchay': uid}, headers=headers)
-        return response.json()
-
-    def get_jobs_like_re(self, cookie, uid, url="https://tuongtaccheo.com/kiemtien/likepostvipre/getpost.php"):
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3",
-            "Cookie": cookie,
-            "Content-Type": "application/x-www-form-urlencoded",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-        response = self.httpx.get(url, headers=headers)
-        return response.json()
-
-    def get_jobs_camxu_vip(self, cookie, uid, url="https://tuongtaccheo.com/kiemtien/camxucvipcheo/getpost.php"):
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3",
-            "Cookie": cookie,
-            "Content-Type": "application/x-www-form-urlencoded",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-        response = self.httpx.get(url, params={'nickchay': uid}, headers=headers)
-        return response.json()
-
-    def get_jobs_camxu_re(self, cookie, uid, url="https://tuongtaccheo.com/kiemtien/camxucvipre/getpost.php"):
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3",
-            "Cookie": cookie,
-            "Content-Type": "application/x-www-form-urlencoded",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-        response = self.httpx.get(url, params={'nickchay': uid}, headers=headers)
-        return response.json()
-
-    def get_jobs_comment(self, cookie, uid, url="https://tuongtaccheo.com/kiemtien/cmtcheo/getpost.php"):
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3",
-            "Cookie": cookie,
-            "Content-Type": "application/x-www-form-urlencoded",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-        response = self.httpx.get(url, params={'nickchay': uid}, headers=headers)
-        return response.json()
-
-    def get_coin_jobs_like_vip(self, idpost, uid, cookie, url="https://tuongtaccheo.com/kiemtien/likepostvipcheo/nhantien.php"):
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3",
-            "Cookie": cookie,
-            "Content-Type": "application/x-www-form-urlencoded",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-        data = {"id": f"{idpost}", "nickchay": uid}
-        response = self.httpx.post(url, headers=headers, data=data)
-        return response.json()
-
-    def get_coin_jobs_like_re(self, idpost, uid, cookie, url="https://tuongtaccheo.com/kiemtien/likepostvipre/nhantien.php"):
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3",
-            "Cookie": cookie,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-        data = {"id": f"{idpost}"}
-        response = self.httpx.post(url, headers=headers, data=data)
-        return response.json()
-
-    def get_coin_jobs_camxu_vip(self, type, idpost, uid, cookie, url="https://tuongtaccheo.com/kiemtien/camxucvipcheo/nhantien.php"):
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3",
-            "Cookie": cookie,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-        data = {"id": f"{idpost}", "loaicx": type, "nickchay": uid}
-        response = self.httpx.post(url, headers=headers, data=data)
-        return response.json()
-
-    def get_coin_jobs_camxu_re(self, type, idpost, uid, cookie, url="https://tuongtaccheo.com/kiemtien/camxucvipre/nhantien.php"):
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3",
-            "Cookie": cookie,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-        data = {"id": f"{idpost}", "loaicx": type, "nickchay": uid}
-        response = self.httpx.post(url, headers=headers, data=data)
-        return response.json()
-
-    def get_coin_jobs_comment(self, idpost, uid, cookie, url="https://tuongtaccheo.com/kiemtien/cmtcheo/nhantien.php"):
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3",
-            "Cookie": cookie,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-        data = {"id": f"{idpost}", "nickchay": uid}
-        response = self.httpx.post(url, headers=headers, data=data)
-        return response.json()
-
-# ========================== PHẦN GUI (TIẾNG VIỆT) ==========================
 class JobWorker(QThread):
-    log_signal = pyqtSignal(str)
-    progress_signal = pyqtSignal(int, int)
-    finished_signal = pyqtSignal()
-    status_update = pyqtSignal(str, str)
+    """Qt thread wrapper around one core-owned account runtime."""
 
-    def __init__(self, accounts, ttc_cookie, ttc_uid, settings):
-        super().__init__()
-        self.accounts = accounts
-        self.ttc_cookie = ttc_cookie
-        self.ttc_uid = ttc_uid
-        self.settings = settings
-        self._stop = False
-        self.ttc = requests_ttc()
-        self.fb_action = AUTO_Action()
+    event_signal = pyqtSignal(str, object)
 
-    def stop(self):
-        self._stop = True
+    def __init__(self, profile_id, auth_token, account, config,
+                 runtime_factory=None, parent=None):
+        super().__init__(parent)
+        self.profile_id = str(profile_id)
+        self.account = dict(account)
+        self.account_key = core.facebook_account_key(self.account)
+        self.auth_token = str(auth_token)
+        self.config = dict(config)
+        self.runtime_factory = runtime_factory or core.TTCAccountRuntime
+        self.stop_event = threading.Event()
+        self.runtime = None
+        self.result = None
+        self.error = None
+
+    def request_stop(self):
+        self.stop_event.set()
+        if self.runtime is not None:
+            self.runtime.request_stop()
+
+    stop = request_stop
+
+    def _forward_event(self, event):
+        self.event_signal.emit(self.account_key, dict(event))
 
     def run(self):
-        total_jobs = 0
-        job_counter = 0
-        self.log_signal.emit("[THÔNG BÁO] Bắt đầu chạy job...")
+        try:
+            self.runtime = self.runtime_factory(
+                profile_id=self.profile_id,
+                auth_token=self.auth_token,
+                account=dict(self.account),
+                config=dict(self.config),
+                worker_id=f"{self.profile_id}:{self.account_key[-12:]}",
+                stop_event=self.stop_event,
+                event_callback=self._forward_event,
+            )
+            self.result = self.runtime.run()
+        except Exception as exc:
+            self.error = exc
+            self._forward_event({
+                "type": "error",
+                "message": str(exc),
+                "stage": "worker",
+            })
 
-        job_types = []
-        if self.settings.get('like_vip'):
-            job_types.append(('like_vip', self.ttc.get_jobs_like_vip, self.ttc.get_coin_jobs_like_vip))
-        if self.settings.get('like_re'):
-            job_types.append(('like_re', self.ttc.get_jobs_like_re, self.ttc.get_coin_jobs_like_re))
-        if self.settings.get('camxuc_vip'):
-            job_types.append(('camxuc_vip', self.ttc.get_jobs_camxu_vip, self.ttc.get_coin_jobs_camxu_vip))
-        if self.settings.get('camxuc_re'):
-            job_types.append(('camxuc_re', self.ttc.get_jobs_camxu_re, self.ttc.get_coin_jobs_camxu_re))
-        if self.settings.get('comment'):
-            job_types.append(('comment', self.ttc.get_jobs_comment, self.ttc.get_coin_jobs_comment))
 
-        if not job_types:
-            self.log_signal.emit("[LỖI] Không có loại job nào được chọn.")
-            self.finished_signal.emit()
-            return
+class CoreOperationWorker(QThread):
+    result_ready = pyqtSignal(object)
+    error_ready = pyqtSignal(str)
 
-        for acc in self.accounts:
-            if self._stop:
-                break
-            uid = acc['uid']
-            token = acc['token']
-            self.log_signal.emit(f"[THÔNG BÁO] Đang xử lý tài khoản UID: {uid}")
-            self.status_update.emit(uid, "Đang chạy")
+    def __init__(self, operation, parent=None):
+        super().__init__(parent)
+        self.operation = operation
 
-            for job_type, get_jobs_func, get_coin_func in job_types:
-                if self._stop:
-                    break
-                self.log_signal.emit(f"[THÔNG BÁO] Đang lấy job {job_type} cho UID {uid}")
-                try:
-                    jobs_response = get_jobs_func(self.ttc_cookie, uid)
-                except Exception as e:
-                    self.log_signal.emit(f"[LỖI] Không thể lấy job {job_type}: {e}")
-                    continue
+    def run(self):
+        try:
+            self.result_ready.emit(self.operation())
+        except Exception as exc:
+            self.error_ready.emit(str(exc))
 
-                jobs = jobs_response.get('data', []) if isinstance(jobs_response, dict) else []
-                if not jobs:
-                    self.log_signal.emit(f"[CẢNH BÁO] Không có job {job_type} nào cho UID {uid}")
-                    continue
-
-                self.log_signal.emit(f"[THÔNG BÁO] Tìm thấy {len(jobs)} job {job_type} cho UID {uid}")
-                for job in jobs:
-                    if self._stop:
-                        break
-                    job_counter += 1
-                    total_jobs += 1
-                    self.progress_signal.emit(job_counter, total_jobs)
-
-                    post_id = job.get('idpost')
-                    if not post_id:
-                        continue
-
-                    try:
-                        if job_type.startswith('like'):
-                            reaction_type = 'LIKE'
-                            self.fb_action.auto_reaction(post_id, reaction_type, token, uid)
-                            self.log_signal.emit(f"[OK] Đã like bài viết {post_id}")
-                        elif job_type.startswith('camxuc'):
-                            emotion_type = job.get('loaicx', 'LIKE')
-                            self.fb_action.auto_reaction(post_id, emotion_type, token, uid)
-                            self.log_signal.emit(f"[OK] Đã cảm xúc {emotion_type} lên bài viết {post_id}")
-                        elif job_type == 'comment':
-                            comment_text = job.get('noidung', 'Bài viết hay!')
-                            self.fb_action.auto_cmt(post_id, comment_text, token, uid)
-                            self.log_signal.emit(f"[OK] Đã comment vào bài viết {post_id}")
-                    except Exception as e:
-                        self.log_signal.emit(f"[LỖI] Không thực hiện được hành động: {e}")
-                        continue
-
-                    try:
-                        if job_type in ['like_vip', 'like_re']:
-                            result = get_coin_func(post_id, uid, self.ttc_cookie)
-                        elif job_type in ['camxuc_vip', 'camxuc_re']:
-                            emotion_type = job.get('loaicx', 'LIKE')
-                            result = get_coin_func(emotion_type, post_id, uid, self.ttc_cookie)
-                        elif job_type == 'comment':
-                            result = get_coin_func(post_id, uid, self.ttc_cookie)
-                        self.log_signal.emit(f"[OK] Đã nhận coin cho bài viết {post_id}")
-                    except Exception as e:
-                        self.log_signal.emit(f"[LỖI] Không thể nhận coin: {e}")
-
-                    if not self._stop:
-                        time.sleep(self.settings.get('delay_between_jobs', 10))
-
-                    if job_counter % self.settings.get('jobs_before_rest', 20) == 0:
-                        rest = self.settings.get('rest_delay', 120)
-                        self.log_signal.emit(f"[THÔNG BÁO] Nghỉ {rest} giây...")
-                        time.sleep(rest)
-
-            self.status_update.emit(uid, "Hoàn thành")
-
-        self.log_signal.emit("[THÔNG BÁO] Job runner kết thúc.")
-        self.finished_signal.emit()
 
 class AccountCard(QGroupBox):
     run_clicked = pyqtSignal(str)
     settings_clicked = pyqtSignal(str)
     delete_clicked = pyqtSignal(str)
 
-    def __init__(self, account_data, parent=None):
+    def __init__(self, account_key, account, enabled=True, parent=None):
         super().__init__(parent)
-        self.account_data = account_data
-        self.uid = account_data['uid']
-        self.token = account_data['token']
-        self.is_running = False
-        self.initUI()
-        self.update_info()
+        self.account_key = account_key
+        self.account = dict(account)
+        self._running = False
+        self._build()
+        self.update_account(account, enabled)
 
-    def initUI(self):
-        self.setTitle(f"Tài khoản {self.uid}")
-        self.setStyleSheet("""
-            QGroupBox {
-                color: #ffffff;
-                border: 2px solid #555;
-                border-radius: 8px;
-                margin-top: 12px;
-                background-color: #3a3a3a;
-                padding: 10px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px;
-                color: #4a6fa5;
-                font-weight: bold;
-            }
-            QLabel { color: #ffffff; }
-            QPushButton {
-                background-color: #4a6fa5;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 5px 12px;
-                font-weight: bold;
-            }
-            QPushButton:hover { background-color: #5a8ab5; }
-            QPushButton:pressed { background-color: #3a5f85; }
-            QPushButton:disabled { background-color: #555; color: #aaa; }
-        """)
+    def _build(self):
+        layout = QGridLayout(self)
+        self.identity_label = QLabel()
+        self.uid_label = QLabel("UID: chưa resolve")
+        self.jobs_label = QLabel("Session: 0 job | 0 xu")
+        self.status_label = QLabel("Trạng thái: Idle")
+        self.enabled_label = QLabel()
 
-        layout = QGridLayout()
-        self.name_label = QLabel("Tên: ...")
-        self.uid_label = QLabel(f"UID: {self.uid}")
-        self.jobs_label = QLabel("Việc đã làm: 0")
-        self.status_label = QLabel("Trạng thái: Nhàn rỗi")
-        self.status_label.setStyleSheet("color: #aaa;")
+        layout.addWidget(self.identity_label, 0, 0, 1, 2)
+        layout.addWidget(self.enabled_label, 0, 2)
+        layout.addWidget(self.uid_label, 1, 0)
+        layout.addWidget(self.jobs_label, 1, 1)
+        layout.addWidget(self.status_label, 1, 2)
 
-        layout.addWidget(self.name_label, 0, 0)
-        layout.addWidget(self.uid_label, 0, 1)
-        layout.addWidget(self.jobs_label, 1, 0)
-        layout.addWidget(self.status_label, 1, 1)
+        self.run_button = QPushButton("▶ Chạy")
+        self.settings_button = QPushButton("⚙ Cài đặt")
+        self.delete_button = QPushButton("✕ Xóa")
+        self.delete_button.setObjectName("dangerButton")
+        self.run_button.clicked.connect(lambda: self.run_clicked.emit(self.account_key))
+        self.settings_button.clicked.connect(
+            lambda: self.settings_clicked.emit(self.account_key)
+        )
+        self.delete_button.clicked.connect(lambda: self.delete_clicked.emit(self.account_key))
+        layout.addWidget(self.run_button, 2, 0)
+        layout.addWidget(self.settings_button, 2, 1)
+        layout.addWidget(self.delete_button, 2, 2)
 
-        self.run_btn = QPushButton("▶ Chạy")
-        self.run_btn.clicked.connect(self.on_run)
-        self.settings_btn = QPushButton("⚙ Cài đặt")
-        self.settings_btn.clicked.connect(self.on_settings)
-        self.delete_btn = QPushButton("✕ Xóa")
-        self.delete_btn.clicked.connect(self.on_delete)
-        self.delete_btn.setStyleSheet("background-color: #c0392b;")
-        self.delete_btn.setFixedWidth(60)
+    def update_account(self, account, enabled):
+        self.account = dict(account)
+        self.identity_label.setText(f"Tài khoản: {_identity(account)}")
+        self.enabled_label.setText("Start All: ON" if enabled else "Start All: OFF")
+        self.enabled_label.setStyleSheet(
+            "color: #7ee787;" if enabled else "color: #9aa4b2;"
+        )
 
-        layout.addWidget(self.run_btn, 2, 0)
-        layout.addWidget(self.settings_btn, 2, 1)
-        layout.addWidget(self.delete_btn, 2, 2)
-        self.setLayout(layout)
+    def set_runtime(self, status=None, uid=None, jobs=None, coin=None):
+        if status is not None:
+            self.status_label.setText(f"Trạng thái: {status}")
+        if uid:
+            self.uid_label.setText(f"UID: {uid}")
+        if jobs is not None or coin is not None:
+            current_jobs = 0 if jobs is None else int(jobs)
+            current_coin = 0 if coin is None else int(coin)
+            self.jobs_label.setText(
+                f"Session: {current_jobs} job | {core.format_coin(current_coin)} xu"
+            )
 
-    def update_info(self):
-        name = self.account_data.get('name', '...')
-        self.name_label.setText(f"Tên: {name}")
-        jobs = self.account_data.get('jobs_done', 0)
-        self.jobs_label.setText(f"Việc đã làm: {jobs}")
-
-    def set_running(self, running):
-        self.is_running = running
-        if running:
-            self.run_btn.setText("⏹ Dừng")
-            self.run_btn.setStyleSheet("background-color: #e67e22;")
-            self.status_label.setText("Trạng thái: Đang chạy")
-            self.status_label.setStyleSheet("color: #f1c40f;")
+    def set_running(self, running, stopping=False):
+        self._running = bool(running)
+        if stopping:
+            self.run_button.setText("Đang dừng…")
+            self.run_button.setEnabled(False)
+            self.set_runtime(status="Stopping")
+        elif running:
+            self.run_button.setText("⏹ Dừng")
+            self.run_button.setEnabled(True)
+            self.set_runtime(status="Running")
         else:
-            self.run_btn.setText("▶ Chạy")
-            self.run_btn.setStyleSheet("background-color: #4a6fa5;")
-            self.status_label.setText("Trạng thái: Nhàn rỗi")
-            self.status_label.setStyleSheet("color: #aaa;")
+            self.run_button.setText("▶ Chạy")
+            self.run_button.setEnabled(True)
 
-    def set_status(self, status):
-        self.status_label.setText(f"Trạng thái: {status}")
+    def set_mutation_enabled(self, enabled):
+        self.settings_button.setEnabled(enabled)
+        self.delete_button.setEnabled(enabled)
 
-    def on_run(self):
-        self.run_clicked.emit(self.uid)
 
-    def on_settings(self):
-        self.settings_clicked.emit(self.uid)
+class AddAccountDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Thêm Facebook account")
+        self.resize(560, 390)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.mode = QComboBox()
+        self.mode.addItem("Login một account", "login")
+        self.mode.addItem("Token thủ công", "manual")
+        self.mode.addItem("Batch UID|PASSWORD|2FA", "batch")
+        self.email = QLineEdit()
+        self.password = QLineEdit()
+        self.password.setEchoMode(QLineEdit.Password)
+        self.secret = QLineEdit()
+        self.secret.setEchoMode(QLineEdit.Password)
+        self.token = QLineEdit()
+        self.token.setEchoMode(QLineEdit.Password)
+        self.batch = QPlainTextEdit()
+        self.batch.setPlaceholderText("UID|PASSWORD|2FA,UID|PASSWORD|2FA")
+        form.addRow("Cách thêm:", self.mode)
+        form.addRow("UID / email:", self.email)
+        form.addRow("Password:", self.password)
+        form.addRow("2FA:", self.secret)
+        form.addRow("Facebook token:", self.token)
+        form.addRow("Danh sách batch:", self.batch)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.mode.currentIndexChanged.connect(self._sync_mode)
+        self._sync_mode()
 
-    def on_delete(self):
-        self.delete_clicked.emit(self.uid)
+    def _sync_mode(self):
+        mode = self.mode.currentData()
+        for widget in (self.email, self.password, self.secret):
+            widget.setEnabled(mode == "login")
+        self.token.setEnabled(mode == "manual")
+        self.batch.setEnabled(mode == "batch")
 
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("TTC Job Runner - Đăng nhập Facebook")
-        self.setGeometry(100, 100, 950, 800)
-        self.setStyleSheet("background-color: #2b2b2b;")
-
-        # Khởi tạo database
-        self.db = Database()
-        self.load_db_settings()  # load ttc_token
-
-        # Khởi tạo settings mặc định (sẽ bị ghi đè bởi DB)
-        self.settings = {
-            'like_vip': False,
-            'like_re': False,
-            'camxuc_vip': False,
-            'camxuc_re': False,
-            'comment': False,
-            'delay_between_jobs': 10,
-            'jobs_before_rest': 20,
-            'rest_delay': 120
+    def values(self):
+        return {
+            "mode": self.mode.currentData(),
+            "email": self.email.text().strip(),
+            "password": self.password.text(),
+            "secret": self.secret.text().strip(),
+            "token": self.token.text().strip(),
+            "batch": self.batch.toPlainText(),
         }
 
-        # Load cài đặt từ DB (ghi đè các giá trị có trong DB)
-        self.load_settings_from_db()
 
-        self.accounts = []
+class AccountSettingsDialog(QDialog):
+    def __init__(self, account, enabled, parent=None):
+        super().__init__(parent)
+        self.action = None
+        self.account = dict(account)
+        self.setWindowTitle("Cài đặt Facebook account")
+        self.resize(520, 360)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        form.addRow("Identity:", QLabel(_identity(account)))
+        form.addRow("Token:", QLabel(core.preview_token(account.get("token", ""))))
+        self.email = QLineEdit(str(account.get("email", "")))
+        self.token = QLineEdit()
+        self.token.setEchoMode(QLineEdit.Password)
+        self.token.setPlaceholderText("Để trống để giữ token hiện tại")
+        self.password = QLineEdit()
+        self.password.setEchoMode(QLineEdit.Password)
+        self.password.setPlaceholderText("Để trống để giữ password hiện tại")
+        self.secret = QLineEdit()
+        self.secret.setEchoMode(QLineEdit.Password)
+        self.secret.setPlaceholderText("Để trống để giữ 2FA hiện tại")
+        self.clear_password = QCheckBox("Xóa password đã lưu")
+        self.clear_secret = QCheckBox("Xóa 2FA đã lưu")
+        self.enabled = QCheckBox("Bật account cho Start All")
+        self.enabled.setChecked(enabled)
+        form.addRow("UID / email:", self.email)
+        form.addRow("Token mới:", self.token)
+        form.addRow("Password mới:", self.password)
+        form.addRow("", self.clear_password)
+        form.addRow("2FA mới:", self.secret)
+        form.addRow("", self.clear_secret)
+        form.addRow("", self.enabled)
+        layout.addLayout(form)
+
+        row = QHBoxLayout()
+        save_button = QPushButton("Lưu")
+        relogin_button = QPushButton("Login / relogin lấy token")
+        close_button = QPushButton("Đóng")
+        save_button.clicked.connect(lambda: self._finish("save"))
+        relogin_button.clicked.connect(lambda: self._finish("relogin"))
+        close_button.clicked.connect(self.reject)
+        row.addWidget(save_button)
+        row.addWidget(relogin_button)
+        row.addStretch()
+        row.addWidget(close_button)
+        layout.addLayout(row)
+
+    def _finish(self, action):
+        self.action = action
+        self.accept()
+
+    def updates(self):
+        updates = {"email": self.email.text().strip()}
+        if self.token.text().strip():
+            updates["token"] = self.token.text().strip()
+        if self.clear_password.isChecked():
+            updates["password"] = ""
+        elif self.password.text():
+            updates["password"] = self.password.text()
+        if self.clear_secret.isChecked():
+            updates["secret"] = ""
+        elif self.secret.text():
+            updates["secret"] = self.secret.text().strip()
+        return updates
+
+
+class ProfileDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Tạo TTC profile")
+        layout = QFormLayout(self)
+        self.name = QLineEdit()
+        self.token = QLineEdit()
+        self.token.setEchoMode(QLineEdit.Password)
+        layout.addRow("Tên profile:", self.name)
+        layout.addRow("TTC token:", self.token)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, runtime_factory=None, core_module=None):
+        super().__init__()
+        self.core = core_module or core
+        self.runtime_factory = runtime_factory
+        self.workers = {}
+        self.pending_starts = set()
+        self._start_generation = 0
+        self.profile_lease = None
+        self.profile_id = None
+        self.profile = None
+        self.accounts_by_key = {}
         self.account_widgets = {}
-        self.ttc_cookie = None
-        self.ttc_uid = None
-        self.ttc = requests_ttc()
-        self.worker = None
-        self.running_uids = set()
-        self._loading = True  # Cờ để bỏ qua lưu khi đang load
+        self.session_metrics = {}
+        self.resolved_uids = {}
+        self._operations = set()
+        self._loading = False
+        self._closing = False
 
-        # Tạo UI trước
-        self.initUI()
-        self.apply_styles()
+        self.setWindowTitle("TTC Auto Tool — Multi-worker")
+        self.resize(1040, 780)
+        self._build_ui()
+        self._apply_styles()
+        self.reload_from_core()
 
-        # Sau khi UI đã tạo, cập nhật các checkbox và spinbox từ self.settings
-        self.load_settings_to_ui()
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        self.tabs = QTabWidget()
+        root.addWidget(self.tabs)
 
-        # Kết nối tín hiệu SAU KHI đã load xong UI, tránh trigger lưu sai
-        self.cb_like_vip.stateChanged.connect(self.on_settings_changed)
-        self.cb_like_re.stateChanged.connect(self.on_settings_changed)
-        self.cb_camxuc_vip.stateChanged.connect(self.on_settings_changed)
-        self.cb_camxuc_re.stateChanged.connect(self.on_settings_changed)
-        self.cb_comment.stateChanged.connect(self.on_settings_changed)
-        self.spin_delay_jobs.valueChanged.connect(self.on_settings_changed)
-        self.spin_jobs_before_rest.valueChanged.connect(self.on_settings_changed)
-        self.spin_rest_delay.valueChanged.connect(self.on_settings_changed)
-
-        self._loading = False  # Kết thúc quá trình load
-
-        # Load tài khoản từ DB
-        self.load_accounts_from_db()
-
-        # Log trạng thái ban đầu để debug
-        self.log(f"[DEBUG] Settings sau khi load: {self.settings}")
-
-    def load_db_settings(self):
-        """Load TTC token từ DB"""
-        self.ttc_token = self.db.get_setting('ttc_token', '')
-
-    def load_settings_from_db(self):
-        """Đọc tất cả cài đặt từ DB và cập nhật self.settings"""
-        stored = self.db.get_all_settings()
-        # Cập nhật từng key nếu có trong stored
-        for key in self.settings.keys():
-            str_key = key  # vì key là string
-            if str_key in stored:
-                # Chuyển đổi giá trị từ string sang kiểu phù hợp
-                value = stored[str_key]
-                if isinstance(self.settings[key], bool):
-                    self.settings[key] = value == 'True'
-                elif isinstance(self.settings[key], int):
-                    self.settings[key] = int(value)
-                # Nếu là kiểu khác thì giữ nguyên
-        # Log để debug
-        print(f"[DEBUG] Loaded settings from DB: {self.settings}")
-
-    def save_settings_to_db(self):
-        """Lưu toàn bộ self.settings vào DB"""
-        if self._loading:
-            return  # Không lưu trong khi đang load
-        for key, value in self.settings.items():
-            # Chuyển đổi giá trị sang string
-            self.db.set_setting(key, str(value))
-        print(f"[DEBUG] Saved settings to DB: {self.settings}")
-
-    def load_accounts_from_db(self):
-        """Load tài khoản từ DB và hiển thị lên UI"""
-        db_accounts = self.db.get_all_accounts()
-        for acc in db_accounts:
-            # Giải mã mật khẩu và secret nếu cần (không lưu vào memory, chỉ dùng token)
-            uid = acc['uid']
-            token = acc['token']
-            name = acc['name'] if acc['name'] else uid
-            jobs_done = acc['jobs_done']
-
-            if not token:
-                continue  # bỏ qua account không có token
-
-            acc_data = {
-                'uid': uid,
-                'token': token,
-                'name': name,
-                'jobs_done': jobs_done,
-                'email': acc['email']  # lưu thêm để tham khảo
-            }
-            self.accounts.append(acc_data)
-            self.add_account_card(acc_data)
-
-    def initUI(self):
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
-
-        self.tab_widget = QTabWidget()
-        main_layout.addWidget(self.tab_widget)
-
-        # ----- Tab Tài khoản -----
         accounts_tab = QWidget()
         accounts_layout = QVBoxLayout(accounts_tab)
+        profile_row = QHBoxLayout()
+        profile_row.addWidget(QLabel("TTC profile:"))
+        self.profile_combo = QComboBox()
+        self.profile_combo.currentIndexChanged.connect(self._profile_changed)
+        profile_row.addWidget(self.profile_combo, 1)
+        self.new_profile_button = QPushButton("＋ Tạo")
+        self.rename_profile_button = QPushButton("Đổi tên")
+        self.copy_accounts_button = QPushButton("Sao chép FB")
+        self.delete_profile_button = QPushButton("Xóa profile")
+        self.delete_profile_button.setObjectName("dangerButton")
+        self.refresh_button = QPushButton("↻")
+        self.new_profile_button.clicked.connect(self.create_profile)
+        self.rename_profile_button.clicked.connect(self.rename_profile)
+        self.copy_accounts_button.clicked.connect(self.copy_accounts)
+        self.delete_profile_button.clicked.connect(self.delete_profile)
+        self.refresh_button.clicked.connect(self.reload_from_core)
+        for button in (
+            self.new_profile_button,
+            self.rename_profile_button,
+            self.copy_accounts_button,
+            self.delete_profile_button,
+            self.refresh_button,
+        ):
+            profile_row.addWidget(button)
+        accounts_layout.addLayout(profile_row)
 
-        add_layout = QHBoxLayout()
-        self.add_account_btn = QPushButton("➕ Thêm tài khoản Facebook")
-        self.add_account_btn.clicked.connect(self.show_add_account_dialog)
-        add_layout.addWidget(self.add_account_btn)
-        add_layout.addStretch()
-        accounts_layout.addLayout(add_layout)
+        add_row = QHBoxLayout()
+        self.add_account_button = QPushButton("＋ Thêm Facebook")
+        self.add_account_button.clicked.connect(self.add_account)
+        self.aggregate_label = QLabel("Active: 0 | Tổng session: 0 job")
+        add_row.addWidget(self.add_account_button)
+        add_row.addStretch()
+        add_row.addWidget(self.aggregate_label)
+        accounts_layout.addLayout(add_row)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setStyleSheet("QScrollArea { border: none; background-color: #2b2b2b; }")
         self.cards_container = QWidget()
         self.cards_layout = QVBoxLayout(self.cards_container)
         self.cards_layout.setAlignment(Qt.AlignTop)
-        self.cards_layout.setSpacing(10)
         scroll.setWidget(self.cards_container)
-        accounts_layout.addWidget(scroll)
+        accounts_layout.addWidget(scroll, 1)
 
-        self.progress = QProgressBar()
-        self.progress.setValue(0)
-        accounts_layout.addWidget(self.progress)
+        run_row = QHBoxLayout()
+        self.start_all_button = QPushButton("▶ Chạy tất cả đã bật")
+        self.stop_all_button = QPushButton("⏹ Dừng tất cả")
+        self.start_all_button.clicked.connect(self.start_all)
+        self.stop_all_button.clicked.connect(self.stop_all)
+        run_row.addWidget(self.start_all_button)
+        run_row.addWidget(self.stop_all_button)
+        run_row.addStretch()
+        accounts_layout.addLayout(run_row)
+        self.tabs.addTab(accounts_tab, "Tài khoản")
 
-        control_layout = QHBoxLayout()
-        self.start_all_btn = QPushButton("▶ Chạy tất cả")
-        self.start_all_btn.clicked.connect(self.start_all)
-        self.stop_all_btn = QPushButton("⏹ Dừng tất cả")
-        self.stop_all_btn.clicked.connect(self.stop_all)
-        self.stop_all_btn.setEnabled(False)
-        control_layout.addWidget(self.start_all_btn)
-        control_layout.addWidget(self.stop_all_btn)
-        control_layout.addStretch()
-        accounts_layout.addLayout(control_layout)
-
-        accounts_tab.setLayout(accounts_layout)
-        self.tab_widget.addTab(accounts_tab, "Tài khoản")
-
-        # ----- Tab Logs -----
         logs_tab = QWidget()
         logs_layout = QVBoxLayout(logs_tab)
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setFont(QFont("Consolas", 10))
-        self.log_text.setStyleSheet("background-color: #1e1e1e; color: #ffffff;")
+        clear_button = QPushButton("Xóa log")
+        clear_button.clicked.connect(self.log_text.clear)
         logs_layout.addWidget(self.log_text)
-        clear_log_btn = QPushButton("Xóa log")
-        clear_log_btn.clicked.connect(lambda: self.log_text.clear())
-        logs_layout.addWidget(clear_log_btn)
-        logs_tab.setLayout(logs_layout)
-        self.tab_widget.addTab(logs_tab, "Nhật ký")
+        logs_layout.addWidget(clear_button)
+        self.tabs.addTab(logs_tab, "Nhật ký")
 
-        # ----- Tab Cài đặt -----
         settings_tab = QWidget()
         settings_layout = QVBoxLayout(settings_tab)
+        token_group = QGroupBox("TTC profile hiện tại")
+        token_row = QHBoxLayout(token_group)
+        self.profile_summary = QLabel("Chưa có profile")
+        self.update_ttc_token_button = QPushButton("Cập nhật TTC token")
+        self.balance_button = QPushButton("Kiểm tra số dư")
+        self.jobs_button = QPushButton("Xem jobs")
+        self.update_ttc_token_button.clicked.connect(self.update_ttc_token)
+        self.balance_button.clicked.connect(self.check_balance)
+        self.jobs_button.clicked.connect(self.view_jobs)
+        token_row.addWidget(self.profile_summary, 1)
+        token_row.addWidget(self.update_ttc_token_button)
+        token_row.addWidget(self.balance_button)
+        token_row.addWidget(self.jobs_button)
+        settings_layout.addWidget(token_group)
 
-        ttc_group = QGroupBox("Token truy cập TTC")
-        ttc_group.setStyleSheet("QGroupBox { color: #ffffff; border: 1px solid #555; border-radius: 5px; margin-top: 10px; }")
-        ttc_layout = QHBoxLayout()
-        self.ttc_token_edit = QLineEdit()
-        self.ttc_token_edit.setPlaceholderText("Nhập token truy cập TTC")
-        self.ttc_token_edit.setStyleSheet("background-color: #3c3c3c; color: #ffffff; border: 1px solid #555;")
-        if hasattr(self, 'ttc_token'):
-            self.ttc_token_edit.setText(self.ttc_token)
-        ttc_layout.addWidget(self.ttc_token_edit)
-        self.ttc_login_btn = QPushButton("Đăng nhập")
-        self.ttc_login_btn.clicked.connect(self.login_ttc)
-        ttc_layout.addWidget(self.ttc_login_btn)
-        ttc_group.setLayout(ttc_layout)
-        settings_layout.addWidget(ttc_group)
+        config_group = QGroupBox("Cấu hình chạy production core")
+        config_grid = QGridLayout(config_group)
+        self.job_types_combo = QComboBox()
+        self.job_types_combo.addItem("Like", ("like_facebook",))
+        self.job_types_combo.addItem("Comment", ("like_poster",))
+        self.job_types_combo.addItem("Both", ("like_facebook", "like_poster"))
+        self.continuous_check = QCheckBox("Chạy liên tục")
+        self.skip_hidden_check = QCheckBox("Bỏ comment bị ẩn")
+        self.max_jobs_spin = self._spin(1, 100000)
+        config_grid.addWidget(QLabel("Loại job"), 0, 0)
+        config_grid.addWidget(self.job_types_combo, 0, 1)
+        config_grid.addWidget(QLabel("Max job/account"), 0, 2)
+        config_grid.addWidget(self.max_jobs_spin, 0, 3)
+        config_grid.addWidget(self.continuous_check, 1, 0, 1, 2)
+        config_grid.addWidget(self.skip_hidden_check, 1, 2, 1, 2)
 
-        job_group = QGroupBox("Loại công việc")
-        job_group.setStyleSheet("QGroupBox { color: #ffffff; border: 1px solid #555; border-radius: 5px; margin-top: 10px; }")
-        job_layout = QVBoxLayout()
-        self.cb_like_vip = QCheckBox("Like VIP")
-        self.cb_like_re = QCheckBox("Like RE")
-        self.cb_camxuc_vip = QCheckBox("Cảm xúc VIP")
-        self.cb_camxuc_re = QCheckBox("Cảm xúc RE")
-        self.cb_comment = QCheckBox("Comment")
-        # Không connect tín hiệu ở đây, sẽ connect sau khi load
-        for cb in [self.cb_like_vip, self.cb_like_re, self.cb_camxuc_vip,
-                   self.cb_camxuc_re, self.cb_comment]:
-            cb.setStyleSheet("color: #ffffff; background-color: #3a3a3a; padding: 5px; border-radius: 3px;")
-            job_layout.addWidget(cb)
-        job_group.setLayout(job_layout)
-        settings_layout.addWidget(job_group)
-
-        delay_group = QGroupBox("Cài đặt độ trễ")
-        delay_group.setStyleSheet("QGroupBox { color: #ffffff; border: 1px solid #555; border-radius: 5px; margin-top: 10px; }")
-        delay_layout = QVBoxLayout()
-        h1 = QHBoxLayout()
-        h1.addWidget(QLabel("Khoảng cách giữa các job (giây):"))
-        self.spin_delay_jobs = QSpinBox()
-        self.spin_delay_jobs.setMinimum(10)
-        self.spin_delay_jobs.setValue(10)
-        self.spin_delay_jobs.setStyleSheet("background-color: #3c3c3c; color: #ffffff; border: 1px solid #555;")
-        h1.addWidget(self.spin_delay_jobs)
-        delay_layout.addLayout(h1)
-
-        h2 = QHBoxLayout()
-        h2.addWidget(QLabel("Số job trước khi nghỉ:"))
-        self.spin_jobs_before_rest = QSpinBox()
-        self.spin_jobs_before_rest.setMinimum(20)
-        self.spin_jobs_before_rest.setValue(20)
-        self.spin_jobs_before_rest.setStyleSheet("background-color: #3c3c3c; color: #ffffff; border: 1px solid #555;")
-        h2.addWidget(self.spin_jobs_before_rest)
-        delay_layout.addLayout(h2)
-
-        h3 = QHBoxLayout()
-        h3.addWidget(QLabel("Thời gian nghỉ (giây):"))
-        self.spin_rest_delay = QSpinBox()
-        self.spin_rest_delay.setMinimum(120)
-        self.spin_rest_delay.setValue(120)
-        self.spin_rest_delay.setStyleSheet("background-color: #3c3c3c; color: #ffffff; border: 1px solid #555;")
-        h3.addWidget(self.spin_rest_delay)
-        delay_layout.addLayout(h3)
-
-        delay_group.setLayout(delay_layout)
-        settings_layout.addWidget(delay_group)
+        self.config_spins = {}
+        rows = (
+            ("like_batch", "Burst Like", 1),
+            ("comment_batch", "Burst Comment", 1),
+            ("like_delay", "Delay Like (s)", 0),
+            ("comment_delay", "Delay Comment (s)", 0),
+            ("failed_delay", "Delay lỗi (s)", 0),
+            ("account_delay", "Stagger account (s)", 0),
+        )
+        for row_index, (key, label, minimum) in enumerate(rows, start=2):
+            minimum_spin = self._spin(minimum, 86400)
+            maximum_spin = self._spin(minimum, 86400)
+            self.config_spins[key + "_min"] = minimum_spin
+            self.config_spins[key + "_max"] = maximum_spin
+            config_grid.addWidget(QLabel(label), row_index, 0)
+            config_grid.addWidget(minimum_spin, row_index, 1)
+            config_grid.addWidget(QLabel("đến"), row_index, 2)
+            config_grid.addWidget(maximum_spin, row_index, 3)
+        self.save_config_button = QPushButton("Lưu cấu hình")
+        self.save_config_button.clicked.connect(self.save_run_config)
+        config_grid.addWidget(self.save_config_button, len(rows) + 2, 0, 1, 4)
+        settings_layout.addWidget(config_group)
         settings_layout.addStretch()
+        self.tabs.addTab(settings_tab, "Cài đặt")
 
-        settings_tab.setLayout(settings_layout)
-        self.tab_widget.addTab(settings_tab, "Cài đặt")
+    @staticmethod
+    def _spin(minimum, maximum):
+        widget = QSpinBox()
+        widget.setRange(minimum, maximum)
+        return widget
 
-    def apply_styles(self):
+    def _apply_styles(self):
         self.setStyleSheet("""
-            QMainWindow { background-color: #2b2b2b; }
-            QTabWidget::pane { border: 1px solid #555; background-color: #2b2b2b; }
-            QTabBar::tab {
-                background-color: #3c3c3c; color: #ddd; padding: 6px 12px;
-                margin-right: 2px; border-top-left-radius: 4px; border-top-right-radius: 4px;
+            QMainWindow, QWidget { background: #20242a; color: #e6edf3; }
+            QTabWidget::pane, QGroupBox { border: 1px solid #44505f; }
+            QGroupBox { border-radius: 7px; margin-top: 9px; padding-top: 9px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 9px; padding: 0 4px; }
+            QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QComboBox {
+                background: #2d333b; color: #e6edf3; border: 1px solid #57606a;
+                border-radius: 4px; padding: 5px;
             }
-            QTabBar::tab:selected { background-color: #4a6fa5; color: white; }
-            QTabBar::tab:hover { background-color: #5a8ab5; }
-            QLabel { color: #ffffff; }
-            QLineEdit, QTextEdit, QSpinBox {
-                background-color: #3c3c3c; color: #ffffff; border: 1px solid #555; border-radius: 3px; padding: 5px;
-            }
-            QPushButton {
-                background-color: #4a6fa5; color: white; border: none; border-radius: 4px; padding: 6px 12px; font-weight: bold;
-            }
-            QPushButton:hover { background-color: #5a8ab5; }
-            QPushButton:pressed { background-color: #3a5f85; }
-            QPushButton:disabled { background-color: #555; color: #aaa; }
-            QProgressBar {
-                background-color: #3c3c3c; color: white; border: 1px solid #555; border-radius: 4px; text-align: center;
-            }
-            QProgressBar::chunk { background-color: #4a6fa5; border-radius: 4px; }
-            QCheckBox {
-                color: #ffffff;
-                background-color: #3a3a3a;
-                padding: 5px;
-                border-radius: 3px;
-            }
-            QMessageBox {
-                background-color: #2b2b2b;
-                color: #ffffff;
-            }
-            QMessageBox QLabel {
-                color: #ffffff;
-            }
-            QMessageBox QPushButton {
-                background-color: #4a6fa5;
-                color: white;
-                min-width: 80px;
-                padding: 5px;
-            }
-            QMessageBox QPushButton:hover {
-                background-color: #5a8ab5;
-            }
+            QPushButton { background: #316dca; color: white; border: 0;
+                border-radius: 4px; padding: 6px 10px; }
+            QPushButton:hover { background: #4184e4; }
+            QPushButton:disabled { background: #444c56; color: #9aa4b2; }
+            QPushButton#dangerButton { background: #b62324; }
+            QTabBar::tab { background: #2d333b; padding: 7px 14px; }
+            QTabBar::tab:selected { background: #316dca; }
         """)
 
-    def show_add_account_dialog(self):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Thêm tài khoản Facebook")
-        dialog.setModal(True)
-        dialog.setFixedSize(500, 250)
-        dialog.setStyleSheet("QDialog { background-color: #2b2b2b; }")
+    def log(self, message, account_key=None):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        prefix = ""
+        if account_key:
+            account = self.accounts_by_key.get(account_key, {})
+            prefix = f"[{_identity(account)}] "
+        self.log_text.append(f"[{timestamp}] {prefix}{message}")
 
-        layout = QVBoxLayout(dialog)
-        layout.addWidget(QLabel("Email / Số điện thoại:"))
-        self.email_edit = QLineEdit()
-        self.email_edit.setPlaceholderText("Nhập email/số điện thoại đăng nhập Facebook")
-        self.email_edit.setStyleSheet("background-color: #3c3c3c; color: #ffffff; border: 1px solid #555;")
-        layout.addWidget(self.email_edit)
-
-        layout.addWidget(QLabel("Mật khẩu:"))
-        self.pwd_edit = QLineEdit()
-        self.pwd_edit.setEchoMode(QLineEdit.Password)
-        self.pwd_edit.setPlaceholderText("Nhập mật khẩu Facebook")
-        self.pwd_edit.setStyleSheet("background-color: #3c3c3c; color: #ffffff; border: 1px solid #555;")
-        layout.addWidget(self.pwd_edit)
-
-        layout.addWidget(QLabel("Mã bí mật 2FA (tùy chọn):"))
-        self.secret_edit = QLineEdit()
-        self.secret_edit.setPlaceholderText("Để trống nếu không có 2FA")
-        self.secret_edit.setStyleSheet("background-color: #3c3c3c; color: #ffffff; border: 1px solid #555;")
-        layout.addWidget(self.secret_edit)
-
-        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        btn_box.accepted.connect(self.add_account_from_login)
-        btn_box.rejected.connect(dialog.reject)
-        layout.addWidget(btn_box)
-        dialog.exec_()
-
-    def add_account_from_login(self):
-        email = self.email_edit.text().strip()
-        password = self.pwd_edit.text().strip()
-        secret = self.secret_edit.text().strip()
-
-        if not email or not password:
-            QMessageBox.warning(self, "Lỗi", "Vui lòng nhập email và mật khẩu.")
+    def reload_from_core(self):
+        if self.workers or self.pending_starts:
+            self.log("Không reload dữ liệu khi run-group đang active.")
             return
-
-        self.log(f"[THÔNG BÁO] Đang đăng nhập Facebook cho {email}...")
         try:
-            fb_login = Requests_facebook()
-            token = fb_login.login_and_get_token(email, password, secret)
-            if not token:
-                QMessageBox.critical(self, "Lỗi", "Đăng nhập thất bại. Kiểm tra thông tin hoặc 2FA.")
-                return
+            data = self.core.load_database()
+        except Exception as exc:
+            QMessageBox.critical(self, "Lỗi dữ liệu", str(exc))
+            return
+        self._loading = True
+        try:
+            previous_id = self.profile_id
+            profiles = data.get("profiles", [])
+            valid_ids = {item["profile_id"] for item in profiles}
+            selected_id = previous_id if previous_id in valid_ids else data.get("active_profile_id")
+            self.profile_combo.blockSignals(True)
+            self.profile_combo.clear()
+            for profile in profiles:
+                count = len(profile.get("fb_accounts", []))
+                self.profile_combo.addItem(
+                    f"{profile['name']} — {count} Facebook", profile["profile_id"]
+                )
+            index = self.profile_combo.findData(selected_id)
+            if index >= 0:
+                self.profile_combo.setCurrentIndex(index)
+            self.profile_combo.blockSignals(False)
+            self.profile_id = selected_id if selected_id in valid_ids else None
+            self.profile = self.core.get_profile(data, self.profile_id)
+            self._render_profile()
+        finally:
+            self._loading = False
+        self._update_controls()
 
-            fb_action = AUTO_Action()
-            uid, msg = fb_action.get_info(token)
-            if not uid:
-                QMessageBox.critical(self, "Lỗi", f"Token không hợp lệ: {msg}")
-                return
+    def _render_profile(self):
+        while self.cards_layout.count():
+            item = self.cards_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.account_widgets = {}
+        self.accounts_by_key = {}
 
-            name = uid
-            if any(acc['uid'] == uid for acc in self.accounts):
-                QMessageBox.warning(self, "Lỗi", "Tài khoản đã tồn tại.")
-                return
+        if self.profile is None:
+            self.profile_summary.setText("Chưa có TTC profile")
+            self._set_run_config_widgets(self.core.normalize_run_config())
+            return
+        config = self.core.normalize_run_config(self.profile.get("run_config"))
+        selected = set(self.core.selected_account_keys(self.profile))
+        for account in self.profile.get("fb_accounts", []):
+            key = self.core.facebook_account_key(account)
+            if not key:
+                continue
+            self.accounts_by_key[key] = dict(account)
+            card = AccountCard(key, account, key in selected)
+            card.run_clicked.connect(self.on_run_account)
+            card.settings_clicked.connect(self.open_account_settings)
+            card.delete_clicked.connect(self.delete_account)
+            self.cards_layout.addWidget(card)
+            self.account_widgets[key] = card
+            metrics = self.session_metrics.get(key, {})
+            card.set_runtime(
+                uid=self.resolved_uids.get(key),
+                jobs=metrics.get("jobs_succeeded", 0),
+                coin=metrics.get("session_coin", 0),
+            )
+        self.profile_summary.setText(
+            f"{self.profile['name']} | TTC token "
+            f"{self.core.preview_token(self.profile.get('auth_token', ''))} | "
+            f"{len(self.accounts_by_key)} Facebook"
+        )
+        self._set_run_config_widgets(config)
 
-            # Mã hóa và lưu vào DB
-            password_enc = encrypt_text(password)
-            secret_enc = encrypt_text(secret)
-            self.db.add_account(email, password_enc, secret_enc, token, uid, name)
+    def _set_run_config_widgets(self, config):
+        wanted = tuple(config["job_types"])
+        index = next(
+            (i for i in range(self.job_types_combo.count())
+             if set(self.job_types_combo.itemData(i)) == set(wanted)),
+            2,
+        )
+        self.job_types_combo.setCurrentIndex(index)
+        self.continuous_check.setChecked(config["continuous"])
+        self.skip_hidden_check.setChecked(config["skip_hidden_comments"])
+        self.max_jobs_spin.setValue(config["max_jobs_per_acc"])
+        for key, spin in self.config_spins.items():
+            spin.setValue(config[key])
 
-            acc_data = {
-                'uid': uid,
-                'token': token,
-                'name': name,
-                'jobs_done': 0,
-                'email': email
-            }
-            self.accounts.append(acc_data)
-            self.add_account_card(acc_data)
-            self.log(f"[OK] Đã thêm tài khoản Facebook UID: {uid}")
-            QMessageBox.information(self, "Thành công", f"Đã thêm tài khoản UID: {uid}")
+    def _profile_changed(self):
+        if self._loading or self.workers or self.pending_starts:
+            return
+        profile_id = self.profile_combo.currentData()
+        if not profile_id:
+            return
+        try:
+            self.core.select_profile_as_default(profile_id)
+            self.profile_id = profile_id
+            self.reload_from_core()
+        except Exception as exc:
+            QMessageBox.critical(self, "Không thể chọn profile", str(exc))
 
-        except Exception as e:
-            self.log(f"[LỖI] Lỗi đăng nhập: {e}")
-            QMessageBox.critical(self, "Lỗi", f"Lỗi: {e}")
+    def create_profile(self):
+        if not self._mutation_allowed():
+            return
+        dialog = ProfileDialog(self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        try:
+            profile = self.core.create_profile_record(
+                dialog.name.text().strip(), dialog.token.text().strip()
+            )
+            self.profile_id = profile["profile_id"]
+            self.reload_from_core()
+        except Exception as exc:
+            QMessageBox.critical(self, "Không thể tạo profile", str(exc))
 
-    def add_account_card(self, acc_data):
-        card = AccountCard(acc_data)
-        card.run_clicked.connect(self.on_run_account)
-        card.settings_clicked.connect(self.on_settings_account)
-        card.delete_clicked.connect(self.on_delete_account)
-        self.cards_layout.addWidget(card)
-        self.account_widgets[acc_data['uid']] = card
+    def rename_profile(self):
+        if not self._mutation_allowed(require_profile=True):
+            return
+        name, accepted = QInputDialog.getText(
+            self, "Đổi tên profile", "Tên mới:", text=self.profile["name"]
+        )
+        if accepted:
+            try:
+                self.core.rename_profile(self.profile_id, name)
+                self.reload_from_core()
+            except Exception as exc:
+                QMessageBox.critical(self, "Không thể đổi tên", str(exc))
 
-    def on_run_account(self, uid):
-        if uid in self.running_uids:
-            self.stop_account(uid)
+    def update_ttc_token(self):
+        if not self._mutation_allowed(require_profile=True):
+            return
+        token, accepted = QInputDialog.getText(
+            self, "Cập nhật TTC token", "TTC token:", QLineEdit.Password
+        )
+        if accepted:
+            try:
+                self.core.update_profile_auth_token_manual(self.profile_id, token)
+                self.reload_from_core()
+            except Exception as exc:
+                QMessageBox.critical(self, "Không thể cập nhật token", str(exc))
+
+    def delete_profile(self):
+        if not self._mutation_allowed(require_profile=True):
+            return
+        answer = QMessageBox.question(
+            self, "Xóa TTC profile",
+            f"Xóa profile {self.profile['name']} và toàn bộ account thuộc profile?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            _deleted, active_id = self.core.delete_profile(self.profile_id)
+            self.profile_id = active_id
+            self.reload_from_core()
+        except Exception as exc:
+            QMessageBox.critical(self, "Không thể xóa profile", str(exc))
+
+    def copy_accounts(self):
+        if not self._mutation_allowed(require_profile=True):
+            return
+        data = self.core.load_database()
+        sources = [
+            item for item in data.get("profiles", [])
+            if item["profile_id"] != self.profile_id
+        ]
+        if not sources:
+            QMessageBox.information(self, "Sao chép", "Không có profile nguồn khác.")
+            return
+        labels = [f"{item['name']} — {len(item.get('fb_accounts', []))} Facebook" for item in sources]
+        label, accepted = QInputDialog.getItem(
+            self, "Sao chép Facebook", "Profile nguồn:", labels, 0, False
+        )
+        if not accepted:
+            return
+        source = sources[labels.index(label)]
+        try:
+            result = self.core.copy_facebook_account_records(
+                source["profile_id"], self.profile_id
+            )
+            self.reload_from_core()
+            QMessageBox.information(
+                self, "Sao chép",
+                f"Đã sao chép {result['copied']}; bỏ qua trùng {result['skipped']}.",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Không thể sao chép", str(exc))
+
+    def add_account(self):
+        if not self._mutation_allowed(require_profile=True):
+            return
+        dialog = AddAccountDialog(self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        values = dialog.values()
+        try:
+            if values["mode"] == "manual":
+                self.core.add_manual_account_record(self.profile_id, values["token"])
+                self.reload_from_core()
+            elif values["mode"] == "login":
+                if not values["email"] or not values["password"]:
+                    raise ValueError("UID/email và password không được để trống.")
+                self._run_operation(
+                    "Login Facebook",
+                    lambda: self.core.add_login_account(
+                        self.profile_id,
+                        values["email"], values["password"], values["secret"],
+                    ),
+                    self._account_operation_finished,
+                )
+            else:
+                self.core.parse_facebook_login_batch(values["batch"])
+                self._run_operation(
+                    "Batch login Facebook",
+                    lambda: self.core.batch_login_accounts(
+                        self.profile_id, values["batch"]
+                    ),
+                    self._account_operation_finished,
+                )
+        except Exception as exc:
+            QMessageBox.critical(self, "Không thể thêm account", str(exc))
+
+    def _account_operation_finished(self, result):
+        if result is False:
+            QMessageBox.warning(self, "Facebook", "Thao tác Facebook không thành công.")
+        self.reload_from_core()
+
+    def open_account_settings(self, account_key):
+        if not self._mutation_allowed(require_profile=True):
+            return
+        account = self.accounts_by_key.get(account_key)
+        if account is None:
+            return
+        enabled = account_key in set(self.core.selected_account_keys(self.profile))
+        dialog = AccountSettingsDialog(account, enabled, self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        if dialog.action == "save":
+            try:
+                self.core.update_account_record(
+                    self.profile_id,
+                    account_key,
+                    dialog.updates(),
+                    enabled=dialog.enabled.isChecked(),
+                )
+                self.reload_from_core()
+            except Exception as exc:
+                QMessageBox.critical(self, "Không thể lưu account", str(exc))
+        elif dialog.action == "relogin":
+            password = dialog.password.text() or None
+            secret = dialog.secret.text().strip() or None
+            self._run_operation(
+                "Relogin Facebook",
+                lambda: self.core.relogin_account_record(
+                    self.profile_id, account_key, password=password, secret=secret
+                ),
+                self._account_operation_finished,
+            )
+
+    def delete_account(self, account_key):
+        if not self._mutation_allowed(require_profile=True):
+            return
+        account = self.accounts_by_key.get(account_key)
+        if account is None:
+            return
+        answer = QMessageBox.question(
+            self, "Xóa Facebook account", f"Xóa {_identity(account)}?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer == QMessageBox.Yes:
+            try:
+                self.core.delete_account_record(self.profile_id, account_key)
+                self.reload_from_core()
+            except Exception as exc:
+                QMessageBox.critical(self, "Không thể xóa account", str(exc))
+
+    def save_run_config(self):
+        if not self._mutation_allowed(require_profile=True):
+            return
+        updates = {
+            "job_types": list(self.job_types_combo.currentData()),
+            "continuous": self.continuous_check.isChecked(),
+            "max_jobs_per_acc": self.max_jobs_spin.value(),
+            "skip_hidden_comments": self.skip_hidden_check.isChecked(),
+        }
+        updates.update({key: spin.value() for key, spin in self.config_spins.items()})
+        try:
+            self.core.update_profile_run_config(self.profile_id, updates)
+            self.reload_from_core()
+            self.log("Đã lưu cấu hình chạy qua production core.")
+        except Exception as exc:
+            QMessageBox.critical(self, "Cấu hình không hợp lệ", str(exc))
+
+    def check_balance(self):
+        if not self._network_operation_allowed():
+            return
+        self._run_operation(
+            "Kiểm tra số dư",
+            lambda: self.core.get_profile_balance(self.profile_id),
+            lambda result: QMessageBox.information(
+                self, "Số dư TTC",
+                f"TTC: {result.get('user', '')}\nSố dư: {result.get('balance')} xu",
+            ),
+        )
+
+    def view_jobs(self):
+        if not self._network_operation_allowed():
+            return
+        self._run_operation(
+            "Xem jobs",
+            lambda: self.core.get_profile_jobs_preview(self.profile_id),
+            self._show_jobs_result,
+        )
+
+    def _show_jobs_result(self, result):
+        jobs = result.get("jobs", [])
+        lines = [f"UID: {result.get('uid')} | Tổng jobs: {len(jobs)}"]
+        for index, wrapper in enumerate(jobs[:50], start=1):
+            job = wrapper.get("_ttc_job", wrapper)
+            lines.append(
+                f"{index}. {job.get('action_group', job.get('type', 'unknown'))} | "
+                f"{job.get('job_id', 'N/A')} | object {job.get('object_id', 'N/A')}"
+            )
+        QMessageBox.information(self, "Jobs TTC", "\n".join(lines))
+
+    def _run_operation(self, label, operation, on_success):
+        worker = CoreOperationWorker(operation, self)
+        self._operations.add(worker)
+        self._update_controls()
+        self.log(f"{label} đang chạy nền…")
+        worker.result_ready.connect(on_success)
+        worker.result_ready.connect(lambda _result: self.log(f"{label} hoàn tất."))
+        worker.error_ready.connect(
+            lambda message: QMessageBox.critical(self, label, message)
+        )
+        worker.error_ready.connect(lambda message: self.log(f"{label}: {message}"))
+        worker.finished.connect(lambda: self._operation_finished(worker))
+        worker.start()
+
+    def _operation_finished(self, worker):
+        self._operations.discard(worker)
+        worker.deleteLater()
+        self._update_controls()
+        if (self._closing and not self._operations
+                and not self.workers and not self.pending_starts):
+            QTimer.singleShot(0, self.close)
+
+    def on_run_account(self, account_key):
+        worker = self.workers.get(account_key)
+        if worker is not None:
+            self.stop_account(account_key)
         else:
-            self.start_account(uid)
+            self.start_account(account_key)
 
-    def start_account(self, uid):
-        acc = next((a for a in self.accounts if a['uid'] == uid), None)
-        if not acc:
+    def _ensure_profile_lease(self):
+        if self.profile_lease is not None:
+            if self.profile_lease.profile_id != self.profile_id:
+                raise RuntimeError("Run-group đang giữ lease của profile khác.")
             return
-        if not self.ttc_cookie:
-            QMessageBox.warning(self, "Lỗi", "Vui lòng đăng nhập TTC trước.")
-            return
-        if not any([self.settings.get('like_vip'), self.settings.get('like_re'),
-                    self.settings.get('camxuc_vip'), self.settings.get('camxuc_re'),
-                    self.settings.get('comment')]):
-            QMessageBox.warning(self, "Lỗi", "Chưa chọn loại job trong cài đặt.")
-            return
+        lease = self.core.ProfileRunLease(self.profile_id)
+        lease.acquire()
+        self.profile_lease = lease
+        self.log(f"Đã giữ profile run lease cho {self.profile['name']}.")
 
-        card = self.account_widgets.get(uid)
-        if card:
+    def start_account(self, account_key):
+        if account_key in self.workers:
+            return False
+        if self.profile_id is None:
+            return False
+        try:
+            profile = self.core.get_profile_snapshot(self.profile_id)
+            config = self.core.normalize_run_config(profile.get("run_config"))
+            account = next(
+                (item for item in profile.get("fb_accounts", [])
+                 if self.core.facebook_account_key(item) == account_key),
+                None,
+            )
+            if account is None or not str(account.get("token", "")).strip():
+                raise ValueError("Facebook account/token không còn hợp lệ.")
+            if not str(profile.get("auth_token", "")).strip():
+                raise ValueError("TTC profile chưa có token.")
+            self._ensure_profile_lease()
+        except Exception as exc:
+            QMessageBox.critical(self, "Không thể chạy account", str(exc))
+            self._release_group_if_idle()
+            return False
+
+        self.pending_starts.discard(account_key)
+        worker = JobWorker(
+            self.profile_id,
+            profile["auth_token"],
+            account,
+            config,
+            runtime_factory=self.runtime_factory,
+            parent=self,
+        )
+        worker.event_signal.connect(self._on_worker_event)
+        worker.finished.connect(
+            lambda key=account_key, current=worker: self._on_worker_finished(key, current)
+        )
+        self.workers[account_key] = worker
+        self.session_metrics[account_key] = {
+            "jobs_succeeded": 0, "session_coin": 0, "balance": None
+        }
+        card = self.account_widgets.get(account_key)
+        if card is not None:
             card.set_running(True)
-        self.running_uids.add(uid)
+            card.set_runtime(jobs=0, coin=0)
+        worker.start()
+        self.log("Worker đã start.", account_key)
+        self._update_controls()
+        return True
 
-        if self.worker is None or not self.worker.isRunning():
-            selected = [a for a in self.accounts if a['uid'] in self.running_uids]
-            self.worker = JobWorker(selected, self.ttc_cookie, self.ttc_uid, self.settings)
-            self.worker.log_signal.connect(self.log)
-            self.worker.progress_signal.connect(self.update_progress)
-            self.worker.finished_signal.connect(self.on_worker_finished)
-            self.worker.status_update.connect(self.update_account_status)
-            self.worker.start()
-            self.start_all_btn.setEnabled(False)
-            self.stop_all_btn.setEnabled(True)
-
-    def stop_account(self, uid):
-        if uid in self.running_uids:
-            self.running_uids.remove(uid)
-            card = self.account_widgets.get(uid)
-            if card:
-                card.set_running(False)
-            if not self.running_uids and self.worker and self.worker.isRunning():
-                self.worker.stop()
-                self.worker = None
-                self.start_all_btn.setEnabled(True)
-                self.stop_all_btn.setEnabled(False)
-
-    def on_settings_account(self, uid):
-        acc = next((a for a in self.accounts if a['uid'] == uid), None)
-        if not acc:
+    def stop_account(self, account_key):
+        if account_key in self.pending_starts:
+            self.pending_starts.discard(account_key)
+            self._release_group_if_idle()
+            self._update_controls()
             return
-        QMessageBox.information(self, "Thông tin tài khoản", f"UID: {acc['uid']}\nToken: {acc['token'][:20]}...")
-
-    def on_delete_account(self, uid):
-        reply = QMessageBox.question(self, 'Xác nhận', f'Xóa tài khoản {uid}?',
-                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply == QMessageBox.Yes:
-            self.stop_account(uid)
-            self.accounts = [a for a in self.accounts if a['uid'] != uid]
-            self.db.delete_account(uid)
-            card = self.account_widgets.pop(uid, None)
-            if card:
-                self.cards_layout.removeWidget(card)
-                card.deleteLater()
+        worker = self.workers.get(account_key)
+        if worker is None:
+            return
+        worker.request_stop()
+        card = self.account_widgets.get(account_key)
+        if card is not None:
+            card.set_running(True, stopping=True)
+        self.log("Đã gửi cooperative Stop; current job sẽ kết thúc an toàn.", account_key)
 
     def start_all(self):
-        if not self.ttc_cookie:
-            QMessageBox.warning(self, "Lỗi", "Vui lòng đăng nhập TTC trước.")
+        if self.profile_id is None:
             return
-        if not any([self.settings.get('like_vip'), self.settings.get('like_re'),
-                    self.settings.get('camxuc_vip'), self.settings.get('camxuc_re'),
-                    self.settings.get('comment')]):
-            QMessageBox.warning(self, "Lỗi", "Chưa chọn loại job trong cài đặt.")
+        try:
+            profile = self.core.get_profile_snapshot(self.profile_id)
+            config = self.core.normalize_run_config(profile.get("run_config"))
+            accounts = self.core.selected_accounts(profile)
+        except Exception as exc:
+            QMessageBox.critical(self, "Không thể Start All", str(exc))
             return
-
-        selected = [a for a in self.accounts if a['uid']]
-        if not selected:
-            QMessageBox.warning(self, "Lỗi", "Không có tài khoản hợp lệ.")
+        candidates = [
+            item for item in accounts
+            if self.core.facebook_account_key(item) not in self.workers
+            and self.core.facebook_account_key(item) not in self.pending_starts
+        ]
+        if not candidates:
             return
+        self._start_generation += 1
+        generation = self._start_generation
+        cumulative_delay = 0
+        for index, account in enumerate(candidates):
+            key = self.core.facebook_account_key(account)
+            if index > 0:
+                cumulative_delay += random.randint(
+                    config["account_delay_min"], config["account_delay_max"]
+                )
+            if cumulative_delay <= 0:
+                self.start_account(key)
+                continue
+            self.pending_starts.add(key)
+            QTimer.singleShot(
+                cumulative_delay * 1000,
+                lambda current_key=key, token=generation: self._launch_pending(
+                    current_key, token
+                ),
+            )
+        self._update_controls()
 
-        for acc in selected:
-            self.running_uids.add(acc['uid'])
-            card = self.account_widgets.get(acc['uid'])
-            if card:
-                card.set_running(True)
-
-        self.worker = JobWorker(selected, self.ttc_cookie, self.ttc_uid, self.settings)
-        self.worker.log_signal.connect(self.log)
-        self.worker.progress_signal.connect(self.update_progress)
-        self.worker.finished_signal.connect(self.on_worker_finished)
-        self.worker.status_update.connect(self.update_account_status)
-        self.worker.start()
-        self.start_all_btn.setEnabled(False)
-        self.stop_all_btn.setEnabled(True)
+    def _launch_pending(self, account_key, generation):
+        if generation != self._start_generation or account_key not in self.pending_starts:
+            return
+        self.pending_starts.discard(account_key)
+        self.start_account(account_key)
+        self._release_group_if_idle()
 
     def stop_all(self):
-        if self.worker and self.worker.isRunning():
-            self.worker.stop()
-            self.worker = None
-        for uid in list(self.running_uids):
-            self.stop_account(uid)
-        self.start_all_btn.setEnabled(True)
-        self.stop_all_btn.setEnabled(False)
+        self._start_generation += 1
+        self.pending_starts.clear()
+        for account_key in list(self.workers):
+            self.stop_account(account_key)
+        self._release_group_if_idle()
+        self._update_controls()
 
-    def on_worker_finished(self):
-        self.start_all_btn.setEnabled(True)
-        self.stop_all_btn.setEnabled(False)
-        self.progress.setValue(0)
-        self.log("[THÔNG BÁO] Worker kết thúc.")
-        for uid in list(self.running_uids):
-            self.stop_account(uid)
-        self.running_uids.clear()
+    def _on_worker_event(self, account_key, event):
+        event_type = event.get("type")
+        message = event.get("message", "")
+        card = self.account_widgets.get(account_key)
+        if event_type == "identity":
+            self.resolved_uids[account_key] = event.get("uid")
+            if card is not None:
+                card.set_runtime(uid=event.get("uid"))
+        if event_type in {"job_succeeded", "completion", "status"}:
+            metrics = self.session_metrics.setdefault(account_key, {})
+            for field in ("jobs_succeeded", "session_coin", "balance"):
+                if field in event and event[field] is not None:
+                    metrics[field] = event[field]
+            if card is not None:
+                card.set_runtime(
+                    status=event.get("status"),
+                    jobs=metrics.get("jobs_succeeded", 0),
+                    coin=metrics.get("session_coin", 0),
+                )
+        if message and event_type not in {"completion"}:
+            self.log(message, account_key)
+        self._update_aggregate()
 
-    def update_account_status(self, uid, status):
-        card = self.account_widgets.get(uid)
-        if card:
-            card.set_status(status)
-            if status == "Hoàn thành":
-                card.set_running(False)
-                if uid in self.running_uids:
-                    self.running_uids.remove(uid)
-
-    def update_progress(self, current, total):
-        self.progress.setMaximum(total if total > 0 else 1)
-        self.progress.setValue(current)
-
-    def login_ttc(self):
-        token = self.ttc_token_edit.text().strip()
-        if not token:
-            QMessageBox.warning(self, "Lỗi", "Vui lòng nhập token TTC.")
+    def _on_worker_finished(self, account_key, worker):
+        if self.workers.get(account_key) is not worker:
             return
-        self.log("[THÔNG BÁO] Đang đăng nhập TTC...")
-        try:
-            data, cookie = self.ttc.get_accout(token)
-            if cookie:
-                self.ttc_cookie = cookie
-                self.ttc_uid = data.get('uid') if isinstance(data, dict) else None
-                self.db.set_setting('ttc_token', token)
-                self.log(f"[THÔNG BÁO] Đăng nhập TTC thành công. UID: {self.ttc_uid}")
-                QMessageBox.information(self, "Thành công", "Đăng nhập TTC thành công.")
+        self.workers.pop(account_key, None)
+        if isinstance(worker.result, dict):
+            self.session_metrics[account_key] = dict(worker.result)
+        card = self.account_widgets.get(account_key)
+        if card is not None:
+            card.set_running(False)
+            if worker.error is not None:
+                card.set_runtime(status="Error")
+            elif worker.stop_event.is_set():
+                card.set_runtime(status="Stopped")
             else:
-                self.log(f"[LỖI] Đăng nhập TTC thất bại: {data}")
-                QMessageBox.critical(self, "Lỗi", f"Đăng nhập thất bại: {data}")
-        except Exception as e:
-            self.log(f"[LỖI] Lỗi đăng nhập TTC: {e}")
-            QMessageBox.critical(self, "Lỗi", f"Lỗi: {e}")
+                card.set_runtime(status="Completed")
+            metrics = self.session_metrics.get(account_key, {})
+            card.set_runtime(
+                jobs=metrics.get("jobs_succeeded", 0),
+                coin=metrics.get("session_coin", 0),
+            )
+        worker.deleteLater()
+        self.log("Worker đã finished và cleanup.", account_key)
+        self._release_group_if_idle()
+        self._update_controls()
+        if self._closing and not self.workers and not self.pending_starts:
+            QTimer.singleShot(0, self.close)
 
-    def load_settings_to_ui(self):
-        """Cập nhật giao diện từ self.settings"""
-        self.cb_like_vip.setChecked(self.settings.get('like_vip', False))
-        self.cb_like_re.setChecked(self.settings.get('like_re', False))
-        self.cb_camxuc_vip.setChecked(self.settings.get('camxuc_vip', False))
-        self.cb_camxuc_re.setChecked(self.settings.get('camxuc_re', False))
-        self.cb_comment.setChecked(self.settings.get('comment', False))
-        self.spin_delay_jobs.setValue(self.settings.get('delay_between_jobs', 10))
-        self.spin_jobs_before_rest.setValue(self.settings.get('jobs_before_rest', 20))
-        self.spin_rest_delay.setValue(self.settings.get('rest_delay', 120))
-        print(f"[DEBUG] UI updated with settings: {self.settings}")
-
-    def on_settings_changed(self):
-        """Xử lý khi bất kỳ control settings thay đổi"""
-        # Nếu đang trong quá trình load thì bỏ qua
-        if self._loading:
+    def _release_group_if_idle(self):
+        if self.workers or self.pending_starts or self.profile_lease is None:
             return
-        # Cập nhật self.settings từ UI
-        self.settings['like_vip'] = self.cb_like_vip.isChecked()
-        self.settings['like_re'] = self.cb_like_re.isChecked()
-        self.settings['camxuc_vip'] = self.cb_camxuc_vip.isChecked()
-        self.settings['camxuc_re'] = self.cb_camxuc_re.isChecked()
-        self.settings['comment'] = self.cb_comment.isChecked()
-        self.settings['delay_between_jobs'] = self.spin_delay_jobs.value()
-        self.settings['jobs_before_rest'] = self.spin_jobs_before_rest.value()
-        self.settings['rest_delay'] = self.spin_rest_delay.value()
-        # Lưu ngay vào DB
-        self.save_settings_to_db()
-        print(f"[DEBUG] Settings changed: {self.settings}")
+        self.profile_lease.release()
+        self.profile_lease = None
+        self.log("Đã release profile run lease sau worker cuối.")
 
-    def log(self, msg):
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.log_text.append(f"[{timestamp}] {msg}")
+    def _update_aggregate(self):
+        jobs = sum(
+            int(metrics.get("jobs_succeeded", 0))
+            for metrics in self.session_metrics.values()
+        )
+        self.aggregate_label.setText(
+            f"Active: {len(self.workers)} | Pending: {len(self.pending_starts)} | "
+            f"Tổng session: {jobs} job"
+        )
+
+    def _update_controls(self):
+        active = bool(self.workers or self.pending_starts)
+        busy = active or bool(self._operations)
+        has_profile = self.profile_id is not None
+        self.stop_all_button.setEnabled(active)
+        self.start_all_button.setEnabled(has_profile and not self._operations)
+        for widget in (
+            self.profile_combo,
+            self.new_profile_button,
+            self.rename_profile_button,
+            self.copy_accounts_button,
+            self.delete_profile_button,
+            self.refresh_button,
+            self.add_account_button,
+            self.update_ttc_token_button,
+            self.save_config_button,
+            self.balance_button,
+            self.jobs_button,
+            self.job_types_combo,
+            self.continuous_check,
+            self.skip_hidden_check,
+            self.max_jobs_spin,
+            *self.config_spins.values(),
+        ):
+            widget.setEnabled(not busy and (has_profile or widget is self.new_profile_button))
+        for card in self.account_widgets.values():
+            card.set_mutation_enabled(not busy)
+        self._update_aggregate()
+
+    def _mutation_allowed(self, require_profile=False):
+        if self.workers or self.pending_starts or self.profile_lease is not None:
+            QMessageBox.warning(
+                self, "Profile đang chạy",
+                "Hãy dừng toàn bộ worker trước khi thay đổi profile/account/config.",
+            )
+            return False
+        if self._operations:
+            QMessageBox.warning(
+                self, "Thao tác đang chạy",
+                "Hãy chờ thao tác nền hiện tại hoàn tất trước khi thay đổi dữ liệu.",
+            )
+            return False
+        if require_profile and self.profile_id is None:
+            QMessageBox.warning(self, "Chưa có profile", "Hãy tạo TTC profile trước.")
+            return False
+        return True
+
+    def _network_operation_allowed(self):
+        if not self._mutation_allowed(require_profile=True):
+            return False
+        return True
 
     def closeEvent(self, event):
-        if self.worker and self.worker.isRunning():
-            reply = QMessageBox.question(self, 'Xác nhận', 'Job đang chạy. Bạn có muốn thoát?',
-                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            if reply == QMessageBox.Yes:
-                self.worker.stop()
-                self.worker.wait()
-                event.accept()
-            else:
-                event.ignore()
-        else:
+        if not self.workers and not self.pending_starts and not self._operations:
+            self._release_group_if_idle()
             event.accept()
+            return
+        if not self._closing:
+            answer = QMessageBox.question(
+                self, "Thoát",
+                "Worker/thao tác nền đang chạy. Gửi cooperative Stop và thoát "
+                "sau khi tất cả thread finished?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                event.ignore()
+                return
+            self._closing = True
+            self.stop_all()
+        event.ignore()
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setStyle('Fusion')
+    app.setStyle("Fusion")
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())

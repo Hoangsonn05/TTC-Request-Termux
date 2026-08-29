@@ -333,6 +333,8 @@ class MainWindow(QMainWindow):
         self.resolved_uids = {}
         self._operations = set()
         self._loading = False
+        self._config_loading = False
+        self._config_dirty = False
         self._closing = False
 
         self.setWindowTitle("TTC Auto Tool — Multi-worker")
@@ -432,30 +434,30 @@ class MainWindow(QMainWindow):
         token_row.addWidget(self.jobs_button)
         settings_layout.addWidget(token_group)
 
-        config_group = QGroupBox("Cấu hình chạy production core")
+        config_group = QGroupBox("Cấu hình chạy")
         config_grid = QGridLayout(config_group)
         self.job_types_combo = QComboBox()
-        self.job_types_combo.addItem("Like", ("like_facebook",))
-        self.job_types_combo.addItem("Comment", ("like_poster",))
-        self.job_types_combo.addItem("Both", ("like_facebook", "like_poster"))
+        self.job_types_combo.addItem("Chỉ Like", ("like_facebook",))
+        self.job_types_combo.addItem("Chỉ Comment", ("like_poster",))
+        self.job_types_combo.addItem("Like + Comment", ("like_facebook", "like_poster"))
         self.continuous_check = QCheckBox("Chạy liên tục")
-        self.skip_hidden_check = QCheckBox("Bỏ comment bị ẩn")
+        self.skip_hidden_check = QCheckBox("Bỏ qua comment bị ẩn")
         self.max_jobs_spin = self._spin(1, 100000)
-        config_grid.addWidget(QLabel("Loại job"), 0, 0)
+        config_grid.addWidget(QLabel("Loại nhiệm vụ"), 0, 0)
         config_grid.addWidget(self.job_types_combo, 0, 1)
-        config_grid.addWidget(QLabel("Max job/account"), 0, 2)
+        config_grid.addWidget(QLabel("Số nhiệm vụ tối đa / tài khoản"), 0, 2)
         config_grid.addWidget(self.max_jobs_spin, 0, 3)
         config_grid.addWidget(self.continuous_check, 1, 0, 1, 2)
         config_grid.addWidget(self.skip_hidden_check, 1, 2, 1, 2)
 
         self.config_spins = {}
         rows = (
-            ("like_batch", "Burst Like", 1),
-            ("comment_batch", "Burst Comment", 1),
-            ("like_delay", "Delay Like (s)", 0),
-            ("comment_delay", "Delay Comment (s)", 0),
-            ("failed_delay", "Delay lỗi (s)", 0),
-            ("account_delay", "Stagger account (s)", 0),
+            ("like_batch", "Số Like mỗi lượt", 1),
+            ("comment_batch", "Số Comment mỗi lượt", 1),
+            ("like_delay", "Nghỉ giữa các Like (giây)", 0),
+            ("comment_delay", "Nghỉ giữa các Comment (giây)", 0),
+            ("failed_delay", "Nghỉ sau job lỗi (giây)", 0),
+            ("account_delay", "Giãn cách khởi chạy tài khoản (giây)", 0),
         )
         for row_index, (key, label, minimum) in enumerate(rows, start=2):
             minimum_spin = self._spin(minimum, 86400)
@@ -468,7 +470,15 @@ class MainWindow(QMainWindow):
             config_grid.addWidget(maximum_spin, row_index, 3)
         self.save_config_button = QPushButton("Lưu cấu hình")
         self.save_config_button.clicked.connect(self.save_run_config)
-        config_grid.addWidget(self.save_config_button, len(rows) + 2, 0, 1, 4)
+        self.config_status_label = QLabel()
+        config_grid.addWidget(self.config_status_label, len(rows) + 2, 0, 1, 3)
+        config_grid.addWidget(self.save_config_button, len(rows) + 2, 3)
+        self.job_types_combo.currentIndexChanged.connect(self._mark_config_dirty)
+        self.continuous_check.toggled.connect(self._mark_config_dirty)
+        self.skip_hidden_check.toggled.connect(self._mark_config_dirty)
+        self.max_jobs_spin.valueChanged.connect(self._mark_config_dirty)
+        for spin in self.config_spins.values():
+            spin.valueChanged.connect(self._mark_config_dirty)
         settings_layout.addWidget(config_group)
         settings_layout.addStretch()
         self.tabs.addTab(settings_tab, "Cài đặt")
@@ -579,18 +589,32 @@ class MainWindow(QMainWindow):
         self._set_run_config_widgets(config)
 
     def _set_run_config_widgets(self, config):
-        wanted = tuple(config["job_types"])
-        index = next(
-            (i for i in range(self.job_types_combo.count())
-             if set(self.job_types_combo.itemData(i)) == set(wanted)),
-            2,
-        )
-        self.job_types_combo.setCurrentIndex(index)
-        self.continuous_check.setChecked(config["continuous"])
-        self.skip_hidden_check.setChecked(config["skip_hidden_comments"])
-        self.max_jobs_spin.setValue(config["max_jobs_per_acc"])
-        for key, spin in self.config_spins.items():
-            spin.setValue(config[key])
+        self._config_loading = True
+        try:
+            wanted = tuple(config["job_types"])
+            index = next(
+                (i for i in range(self.job_types_combo.count())
+                 if set(self.job_types_combo.itemData(i)) == set(wanted)),
+                2,
+            )
+            self.job_types_combo.setCurrentIndex(index)
+            self.continuous_check.setChecked(config["continuous"])
+            self.skip_hidden_check.setChecked(config["skip_hidden_comments"])
+            self.max_jobs_spin.setValue(config["max_jobs_per_acc"])
+            for key, spin in self.config_spins.items():
+                spin.setValue(config[key])
+        finally:
+            self._config_loading = False
+        self._config_dirty = False
+        self.config_status_label.setText("")
+        self.save_config_button.setText("Lưu cấu hình")
+
+    def _mark_config_dirty(self, *_):
+        if self._loading or self._config_loading:
+            return
+        self._config_dirty = True
+        self.config_status_label.setText("Có thay đổi chưa lưu")
+        self.save_config_button.setText("Lưu cấu hình")
 
     def _profile_changed(self):
         if self._loading or self.workers or self.pending_starts:
@@ -791,12 +815,30 @@ class MainWindow(QMainWindow):
             "skip_hidden_comments": self.skip_hidden_check.isChecked(),
         }
         updates.update({key: spin.value() for key, spin in self.config_spins.items()})
+        self.config_status_label.setText("Đang lưu cấu hình...")
+        self.save_config_button.setEnabled(False)
+        QApplication.processEvents()
         try:
-            self.core.update_profile_run_config(self.profile_id, updates)
+            current = self.core.normalize_run_config(self.profile.get("run_config"))
+            expected = self.core.normalize_run_config({**current, **updates})
+            saved = self.core.update_profile_run_config(self.profile_id, updates)
             self.reload_from_core()
+            if self.profile is None:
+                raise RuntimeError("Không thể tải lại TTC profile sau khi lưu cấu hình.")
+            persisted = self.core.normalize_run_config(self.profile.get("run_config"))
+            if persisted != saved or persisted != expected:
+                raise RuntimeError("Cấu hình lưu lại không khớp với dữ liệu production core.")
+            self._config_dirty = False
+            self.config_status_label.setText("✓ Cấu hình đã được lưu vào dữ liệu core")
+            self.save_config_button.setText("✓ Đã lưu")
             self.log("Đã lưu cấu hình chạy qua production core.")
         except Exception as exc:
-            QMessageBox.critical(self, "Cấu hình không hợp lệ", str(exc))
+            self._config_dirty = True
+            self.config_status_label.setText("✕ Lưu cấu hình thất bại")
+            self.save_config_button.setText("Lưu cấu hình")
+            QMessageBox.critical(self, "Không thể lưu cấu hình", str(exc))
+        finally:
+            self.save_config_button.setEnabled(True)
 
     def check_balance(self):
         if not self._network_operation_allowed():

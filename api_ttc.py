@@ -354,9 +354,11 @@ def normalize_job(job_type: str, raw_data: dict) -> dict:
         link = raw_link.strip() if isinstance(raw_link, str) else ""
     post_id = ""
     if job_type in TTC_DIRECT_POST_ID_JOB_TYPES:
-        post_id = _strict_required_text(raw_data.get("idfb"), "idfb")
-        if re.fullmatch(r"[0-9]+", post_id) is None:
-            raise ValueError("invalid idfb")
+        raw_post_id = raw_data.get("idfb")
+        if isinstance(raw_post_id, str):
+            candidate_post_id = raw_post_id.strip()
+            if re.fullmatch(r"[0-9]+", candidate_post_id) is not None:
+                post_id = candidate_post_id
     action_group = get_action_group(job_type)
 
     # Supported application jobs keep claim ID and executor target independent.
@@ -3614,6 +3616,18 @@ def get_facebook_post_id(url):
             print(f"{failure}; đã hết {max_attempts} lần thử.")
     return None
 
+
+def _resolve_ttc_facebook_post_id(job):
+    """Use a valid direct ID first, otherwise resolve the normalized object."""
+    if job.get("ttc_source") in TTC_DIRECT_POST_ID_JOB_TYPES:
+        post_id = job.get("post_id")
+        if isinstance(post_id, str) and re.fullmatch(r"[0-9]+", post_id) is not None:
+            print(f"{Fore.GREEN}{Style.BRIGHT}✅ Post ID: {post_id}{Style.RESET_ALL}")
+            return post_id
+
+    object_id = job.get("object_id")
+    return get_facebook_post_id(f"https://www.facebook.com/{object_id}")
+
 # ---------- Hàm đếm delay ----------
 def countdown(seconds, message="Chờ"):
     for i in range(seconds, 0, -1):
@@ -4933,15 +4947,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                 )
                 action_succeeded = False
                 try:
-                    ttc_source = original_job.get("ttc_source")
-                    if ttc_source in TTC_DIRECT_POST_ID_JOB_TYPES:
-                        post_id = original_job.get("post_id")
-                        if (not isinstance(post_id, str)
-                                or re.fullmatch(r"[0-9]+", post_id) is None):
-                            raise ValueError("TTC direct Post ID is invalid")
-                        print(f"{Fore.GREEN}{Style.BRIGHT}✅ Post ID: {post_id}{Style.RESET_ALL}")
-                    else:
-                        post_id = get_facebook_post_id(f"https://www.facebook.com/{object_id}")
+                    post_id = _resolve_ttc_facebook_post_id(original_job)
                     if post_id is not None and int(post_id) > 0:
                         if type_ == "like_facebook":
                             print_info(f"Đang thực hiện {reaction} trên Facebook object {object_id}")

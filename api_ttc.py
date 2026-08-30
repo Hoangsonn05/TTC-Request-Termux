@@ -1187,6 +1187,17 @@ class TTCClient:
     # configure_facebook_uid()
     # ------------------------------------------------------------------
 
+    def bind_facebook_uid(self, uid: str) -> None:
+        """Bind a Facebook UID to this client's GET/CLAIM requests locally."""
+        if not self._authenticated:
+            raise TTCAuthError("[TTC] Chưa đăng nhập trước khi bind UID.")
+        self._configured_facebook_uid = None
+        try:
+            uid = _strict_required_text(uid, "Facebook UID")
+        except ValueError as exc:
+            raise ValueError("[TTC] UID Facebook phải là chuỗi không rỗng.") from exc
+        self._configured_facebook_uid = uid
+
     def configure_facebook_uid(self, uid: str) -> None:
         """Đặt UID Facebook cho tài khoản TTC.
 
@@ -1242,7 +1253,7 @@ class TTCClient:
                 f"[TTC] Server không xác nhận UID Facebook. Response: {body[:200]!r}"
             )
 
-        self._configured_facebook_uid = uid
+        self.bind_facebook_uid(uid)
 
     # ------------------------------------------------------------------
     # get_account_info()
@@ -1280,7 +1291,7 @@ class TTCClient:
             raise TTCAuthError("[TTC] Chưa đăng nhập trước khi fetch_jobs.")
         if self._configured_facebook_uid is None:
             raise TTCResponseError(
-                "[TTC] Chưa có UID Facebook được server xác nhận trước khi fetch_jobs."
+                "[TTC] Chưa bind UID Facebook cho request trước khi fetch_jobs."
             )
         if job_type not in TTC_ENDPOINTS:
             raise ValueError(f"[TTC] job_type không hợp lệ: {job_type!r}")
@@ -1574,7 +1585,7 @@ class TTCClient:
         if job_type in _TTC_NICKCHAY_JOB_TYPES:
             if self._configured_facebook_uid is None:
                 raise TTCResponseError(
-                    "[TTC] Chưa có UID Facebook được server xác nhận trước khi claim_reward."
+                    "[TTC] Chưa bind UID Facebook cho request trước khi claim_reward."
                 )
             payload["nickchay"] = self._configured_facebook_uid
 
@@ -1776,6 +1787,11 @@ class API_TTC:
 
     def set_facebook_uid(self, uid):
         result = self._client.set_uid(uid)
+        self._facebook_uid = str(uid).strip()
+        return result
+
+    def bind_facebook_uid(self, uid):
+        result = self._client.bind_facebook_uid(uid)
         self._facebook_uid = str(uid).strip()
         return result
 
@@ -5126,7 +5142,8 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                  like_delay_range=(10, 10), comment_delay_range=(10, 10),
                  failed_delay_range=(10, 10), skip_hidden_comments=True,
                  stop_event=None, event_callback=None, metrics=None,
-                 action=None, transaction_sleep_fn=None):
+                 action=None, transaction_sleep_fn=None,
+                 configure_remote_uid=True):
     global total_coin
     enabled_types = normalize_job_types(job_types)
     transaction_sleep_fn = transaction_sleep_fn or time.sleep
@@ -5145,7 +5162,10 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
         return 0
     uid = uid.strip()
 
-    api.set_facebook_uid(uid)
+    if configure_remote_uid:
+        api.set_facebook_uid(uid)
+    else:
+        api.bind_facebook_uid(uid)
     print(f"{Fore.CYAN}{Style.BRIGHT}📱 Facebook: {uid}{Style.RESET_ALL}")
     _emit_runtime_event(event_callback, "identity", f"Facebook UID: {uid}", uid=uid)
 
@@ -5341,6 +5361,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                             metrics=metrics,
                             action=do_job,
                             transaction_sleep_fn=transaction_sleep_fn,
+                            configure_remote_uid=configure_remote_uid,
                         )
                         total_done += fallback_done
                     _print_ttc_completion(
@@ -5560,6 +5581,7 @@ class TTCAccountRuntime:
                     metrics=self.metrics,
                     action=self.facebook_action,
                     transaction_sleep_fn=self.transaction_sleep_fn,
+                    configure_remote_uid=False,
                 )
                 if not self.config["continuous"]:
                     break

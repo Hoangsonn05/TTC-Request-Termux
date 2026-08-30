@@ -57,6 +57,7 @@ class JobWorker(QThread):
         self.runtime = None
         self.result = None
         self.error = None
+        self._error_event_forwarded = False
 
     def request_stop(self):
         self.stop_event.set()
@@ -66,7 +67,10 @@ class JobWorker(QThread):
     stop = request_stop
 
     def _forward_event(self, event):
-        self.event_signal.emit(self.profile_id, self.account_key, dict(event))
+        payload = dict(event)
+        if payload.get("type") == "error":
+            self._error_event_forwarded = True
+        self.event_signal.emit(self.profile_id, self.account_key, payload)
 
     def run(self):
         try:
@@ -82,11 +86,12 @@ class JobWorker(QThread):
             self.result = self.runtime.run()
         except Exception as exc:
             self.error = exc
-            self._forward_event({
-                "type": "error",
-                "message": str(exc),
-                "stage": "worker",
-            })
+            if not self._error_event_forwarded:
+                self._forward_event({
+                    "type": "error",
+                    "message": str(exc),
+                    "stage": "worker",
+                })
 
 
 class CoreOperationWorker(QThread):

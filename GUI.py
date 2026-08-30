@@ -484,6 +484,7 @@ class MainWindow(QMainWindow):
         self.completed_profile_metrics = {}
         self.resolved_uids = {}
         self.account_statuses = {}
+        self.active_delays = {}
         self.latest_profile_log = {}
         self.profile_balances = {}
         self.profile_errors = set()
@@ -602,11 +603,17 @@ class MainWindow(QMainWindow):
 
         logs_tab = QWidget()
         logs_layout = QVBoxLayout(logs_tab)
+        active_delays_group = QGroupBox("Đang chờ")
+        active_delays_layout = QVBoxLayout(active_delays_group)
+        self.active_delays_label = QLabel("Không có worker đang chờ.")
+        self.active_delays_label.setWordWrap(True)
+        active_delays_layout.addWidget(self.active_delays_label)
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setFont(QFont("Consolas", 10))
         clear_button = QPushButton("Xóa log")
         clear_button.clicked.connect(self.log_text.clear)
+        logs_layout.addWidget(active_delays_group)
         logs_layout.addWidget(self.log_text)
         logs_layout.addWidget(clear_button)
         self.tabs.addTab(logs_tab, "Nhật ký")
@@ -732,6 +739,26 @@ class MainWindow(QMainWindow):
         if profile_id:
             self.latest_profile_log[profile_id] = formatted
             self._update_profile_card(profile_id)
+
+    def _render_active_delays(self):
+        if not self.active_delays:
+            self.active_delays_label.setText("Không có worker đang chờ.")
+            return
+        lines = []
+        for profile_id, account_key in sorted(self.active_delays):
+            delay = self.active_delays[(profile_id, account_key)]
+            profile = self.profiles_by_id.get(profile_id, {})
+            account = self._account_for_runtime(profile_id, account_key)
+            lines.append(
+                f"[{profile.get('name', profile_id)}][{_identity(account)}] "
+                f"{delay['message']}: {delay['remaining']}s"
+            )
+        self.active_delays_label.setText("\n".join(lines))
+
+    def _clear_active_delay(self, runtime_key):
+        if runtime_key in self.active_delays:
+            self.active_delays.pop(runtime_key, None)
+            self._render_active_delays()
 
     def reload_from_core(self):
         try:
@@ -955,6 +982,11 @@ class MainWindow(QMainWindow):
                 card.set_runtime(status="Pending")
             elif status:
                 card.set_runtime(status=status)
+            delay = self.active_delays.get(runtime_key)
+            if delay is not None:
+                card.set_runtime(
+                    status=f"{delay['message']}: {delay['remaining']}s"
+                )
         self.profile_summary.setText(
             f"{self.profile['name']} | TTC token "
             f"{self.core.preview_token(self.profile.get('auth_token', ''))} | "
@@ -1335,6 +1367,7 @@ class MainWindow(QMainWindow):
             return False
 
         self.pending_starts.discard(runtime_key)
+        self._clear_active_delay(runtime_key)
         worker = JobWorker(
             profile_id,
             profile["auth_token"],
@@ -1375,6 +1408,7 @@ class MainWindow(QMainWindow):
         if worker is None:
             return
         worker.request_stop()
+        self._clear_active_delay(runtime_key)
         self.account_statuses[runtime_key] = "Stopping"
         card = self.account_widgets.get(account_key) if profile_id == self.view_profile_id else None
         if card is not None:
@@ -1494,6 +1528,29 @@ class MainWindow(QMainWindow):
         event_type = event.get("type")
         message = event.get("message", "")
         card = self.account_widgets.get(account_key) if profile_id == self.view_profile_id else None
+        if event_type == "delay":
+            remaining = event.get("remaining")
+            if not isinstance(remaining, int) or isinstance(remaining, bool):
+                return
+            first_tick = runtime_key not in self.active_delays
+            self.active_delays[runtime_key] = {
+                "message": str(message), "remaining": remaining,
+            }
+            self.account_statuses[runtime_key] = f"{message}: {remaining}s"
+            if card is not None:
+                card.set_runtime(status=self.account_statuses[runtime_key])
+            self._render_active_delays()
+            if first_tick:
+                self.log(f"{message}: {remaining}s", account_key, profile_id)
+            self._update_aggregate()
+            self._update_profile_card(profile_id)
+            return
+        if event_type in {"job_started", "completion", "stopped", "error"}:
+            self._clear_active_delay(runtime_key)
+        if event_type == "job_started":
+            self.account_statuses[runtime_key] = "Running"
+            if card is not None:
+                card.set_runtime(status="Running")
         if event_type == "identity":
             self.resolved_uids[runtime_key] = event.get("uid")
             if card is not None:
@@ -1528,6 +1585,7 @@ class MainWindow(QMainWindow):
         runtime_key = self._runtime_key(profile_id, account_key)
         if self.workers.get(runtime_key) is not worker:
             return
+        self._clear_active_delay(runtime_key)
         self.workers.pop(runtime_key, None)
         metrics = dict(self.session_metrics.pop(runtime_key, {}))
         if isinstance(worker.result, dict):

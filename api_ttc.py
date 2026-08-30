@@ -5099,20 +5099,22 @@ def _cooperative_countdown(seconds, message, stop_event=None,
         countdown(seconds, message)
         return True
     seconds = max(0, int(seconds))
-    _emit_runtime_event(
-        event_callback,
-        "delay",
-        f"{message}: {seconds}s",
-        seconds=seconds,
-    )
     wait = getattr(stop_event, "wait", None)
-    if callable(wait):
-        return not bool(wait(seconds))
-    deadline = time.monotonic() + seconds
-    while time.monotonic() < deadline:
+    for remaining in range(seconds, 0, -1):
+        _emit_runtime_event(
+            event_callback,
+            "delay",
+            message,
+            remaining=remaining,
+            seconds=seconds,
+        )
+        if callable(wait):
+            if wait(1):
+                return False
+            continue
         if _runtime_stop_requested(stop_event):
             return False
-        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+        time.sleep(1)
     return not _runtime_stop_requested(stop_event)
 
 

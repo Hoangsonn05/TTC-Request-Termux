@@ -5,7 +5,7 @@ import time
 from datetime import datetime
 
 from PyQt5.QtCore import QThread, QTimer, Qt, pyqtSignal
-from PyQt5.QtGui import QFont
+from PyQt5.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -36,10 +36,72 @@ import api_ttc as core
 
 
 LOG_HISTORY_LIMIT = 4000
+APPLICATION_FONT_SCALE = 1.10
 TOKEN_LIVE = "LIVE"
 TOKEN_DIE = "DIE_TOKEN"
 TOKEN_CHECK_ERROR = "CHECK_ERROR"
 TOKEN_UNKNOWN = "UNKNOWN"
+
+LOG_LEVEL_COLORS = {
+    "info": "#e6edf3",
+    "success": "#7ee787",
+    "warning": "#f2cc60",
+    "error": "#ff7b72",
+    "raw": "#9ecbff",
+    "api": "#79c0ff",
+}
+
+VISIBLE_RUNTIME_STATUSES = {
+    "Running": "Đang chạy",
+    "Pending": "Đang chờ",
+    "Completed": "Hoàn thành",
+    "Stopped": "Đã dừng",
+    "Stopping": "Đang dừng",
+    "Error": "Lỗi",
+    "Idle": "Chưa chạy",
+}
+
+EVENT_LOG_LEVELS = {
+    "job_succeeded": "success",
+    "completion": "success",
+    "error": "error",
+    "delay": "warning",
+    "endpoint_cooldown": "warning",
+    "stopped": "warning",
+    "identity": "info",
+    "status": "info",
+    "balance": "info",
+    "cycle": "info",
+    "job_started": "info",
+    "account_live": "info",
+}
+
+
+def _runtime_status_text(status):
+    return VISIBLE_RUNTIME_STATUSES.get(str(status), str(status))
+
+
+def _normalize_log_level(level):
+    normalized = str(level or "info").strip().casefold()
+    return normalized if normalized in LOG_LEVEL_COLORS else "info"
+
+
+def _event_log_level(event_type, event):
+    explicit = event.get("level")
+    if explicit is not None:
+        return _normalize_log_level(explicit)
+    return EVENT_LOG_LEVELS.get(str(event_type), "info")
+
+
+def _scale_application_font(app, factor=APPLICATION_FONT_SCALE):
+    font = app.font()
+    baseline = font.pointSizeF()
+    if baseline <= 0:
+        baseline = float(font.pointSize())
+    if baseline > 0:
+        font.setPointSizeF(baseline * float(factor))
+        app.setFont(font)
+    return baseline, font.pointSizeF()
 
 
 def _identity(account):
@@ -172,7 +234,7 @@ class AccountCard(QGroupBox):
         self.identity_label = QLabel()
         self.uid_label = QLabel("UID: chưa resolve")
         self.jobs_label = QLabel("Session: 0 job | 0 xu")
-        self.status_label = QLabel("Trạng thái: Idle")
+        self.status_label = QLabel("Trạng thái: Chưa chạy")
         self.token_status_label = QLabel("Token: Chưa kiểm tra")
         self.enabled_label = QLabel()
 
@@ -199,14 +261,16 @@ class AccountCard(QGroupBox):
     def update_account(self, account, enabled):
         self.account = dict(account)
         self.identity_label.setText(f"Tài khoản: {_identity(account)}")
-        self.enabled_label.setText("Start All: ON" if enabled else "Start All: OFF")
+        self.enabled_label.setText(
+            "Chạy tất cả: BẬT" if enabled else "Chạy tất cả: TẮT"
+        )
         self.enabled_label.setStyleSheet(
             "color: #7ee787;" if enabled else "color: #9aa4b2;"
         )
 
     def set_runtime(self, status=None, uid=None, jobs=None, coin=None):
         if status is not None:
-            self.status_label.setText(f"Trạng thái: {status}")
+            self.status_label.setText(f"Trạng thái: {_runtime_status_text(status)}")
         if uid:
             self.uid_label.setText(f"UID: {uid}")
         if jobs is not None or coin is not None:
@@ -301,7 +365,7 @@ class ProfileSummaryCard(QGroupBox):
                        run_tooltip=""):
         self.setTitle("Đang xem" if selected else "")
         self.name_label.setText(f"Profile: {name}")
-        self.status_label.setText(status.upper())
+        self.status_label.setText(_runtime_status_text(status))
         status_colors = {
             "Running": "#7ee787", "Stopping": "#f2cc60",
             "Pending": "#79c0ff", "Error": "#ff7b72", "Idle": "#9aa4b2",
@@ -510,7 +574,7 @@ class AccountSettingsDialog(QDialog):
 
         row = QHBoxLayout()
         save_button = QPushButton("Lưu")
-        relogin_button = QPushButton("Login / relogin lấy token")
+        relogin_button = QPushButton("Đăng nhập lại để lấy token")
         close_button = QPushButton("Đóng")
         save_button.clicked.connect(lambda: self._finish("save"))
         relogin_button.clicked.connect(lambda: self._finish("relogin"))
@@ -614,7 +678,7 @@ class MainWindow(QMainWindow):
         self.live_wait_timer.setInterval(1000)
         self.live_wait_timer.timeout.connect(self._refresh_timed_waits)
 
-        self.setWindowTitle("TTC Auto Tool — Multi-worker")
+        self.setWindowTitle("Công cụ TTC — Nhiều tài khoản")
         self.resize(1040, 780)
         self._build_ui()
         self._apply_styles()
@@ -637,7 +701,7 @@ class MainWindow(QMainWindow):
         overview_layout = QVBoxLayout(self.profile_overview_page)
         overview_toolbar = QHBoxLayout()
         overview_title = QLabel("TỔNG QUAN PROFILE")
-        overview_title.setStyleSheet("font-size: 15px; font-weight: bold;")
+        overview_title.setStyleSheet("font-weight: bold;")
         self.new_profile_button = QPushButton("＋ Tạo profile")
         self.overview_refresh_button = QPushButton("↻")
         self.new_profile_button.clicked.connect(self.create_profile)
@@ -662,7 +726,7 @@ class MainWindow(QMainWindow):
         self.back_to_overview_button = QPushButton("← Tổng quan profile")
         self.back_to_overview_button.clicked.connect(self._show_profile_overview)
         self.detail_title_label = QLabel("Chi tiết profile")
-        self.detail_title_label.setStyleSheet("font-size: 15px; font-weight: bold;")
+        self.detail_title_label.setStyleSheet("font-weight: bold;")
         detail_header.addWidget(self.back_to_overview_button)
         detail_header.addWidget(self.detail_title_label)
         detail_header.addStretch()
@@ -694,7 +758,7 @@ class MainWindow(QMainWindow):
         add_row = QHBoxLayout()
         self.add_account_button = QPushButton("＋ Thêm Facebook")
         self.add_account_button.clicked.connect(self.add_account)
-        self.aggregate_label = QLabel("Active: 0 | Tổng session: 0 job")
+        self.aggregate_label = QLabel("Đang chạy: 0 | Tổng phiên: 0 job")
         add_row.addWidget(self.add_account_button)
         add_row.addStretch()
         add_row.addWidget(self.aggregate_label)
@@ -730,7 +794,11 @@ class MainWindow(QMainWindow):
         active_delays_layout.addWidget(self.active_delays_label)
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setFont(QFont("Consolas", 10))
+        log_font = QFont("Consolas")
+        app_font_size = QApplication.font().pointSizeF()
+        if app_font_size > 0:
+            log_font.setPointSizeF(app_font_size)
+        self.log_text.setFont(log_font)
         self.log_text.document().setMaximumBlockCount(LOG_HISTORY_LIMIT)
         clear_button = QPushButton("Xóa log")
         clear_button.clicked.connect(self.log_text.clear)
@@ -815,18 +883,18 @@ class MainWindow(QMainWindow):
         self.setStyleSheet("""
             QMainWindow, QWidget { background: #20242a; color: #e6edf3; }
             QTabWidget::pane, QGroupBox { border: 1px solid #44505f; }
-            QGroupBox { border-radius: 7px; margin-top: 9px; padding-top: 9px; }
-            QGroupBox::title { subcontrol-origin: margin; left: 9px; padding: 0 4px; }
+            QGroupBox { border-radius: 7px; margin-top: 10px; padding-top: 10px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
             QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QComboBox {
                 background: #2d333b; color: #e6edf3; border: 1px solid #57606a;
-                border-radius: 4px; padding: 5px;
+                border-radius: 4px; padding: 6px;
             }
             QPushButton { background: #316dca; color: white; border: 0;
-                border-radius: 4px; padding: 6px 10px; }
+                border-radius: 4px; padding: 7px 11px; }
             QPushButton:hover { background: #4184e4; }
             QPushButton:disabled { background: #444c56; color: #9aa4b2; }
             QPushButton#dangerButton { background: #b62324; }
-            QTabBar::tab { background: #2d333b; padding: 7px 14px; }
+            QTabBar::tab { background: #2d333b; padding: 8px 15px; }
             QTabBar::tab:selected { background: #316dca; }
         """)
 
@@ -844,6 +912,11 @@ class MainWindow(QMainWindow):
 
     def log(self, message, account_key=None, profile_id=None, level=None):
         timestamp = datetime.now().strftime("%H:%M:%S")
+        masker = getattr(self.core, "_mask_sensitive_text", None)
+        if callable(masker):
+            message = masker(message)
+        else:
+            message = str(message)
         prefix = ""
         profile_id = str(profile_id) if profile_id is not None else None
         profile = self.profiles_by_id.get(profile_id, {}) if profile_id else {}
@@ -855,9 +928,16 @@ class MainWindow(QMainWindow):
         elif account_key:
             account = self.accounts_by_key.get(account_key, {})
             prefix += f"[{_identity(account)}] "
-        level_prefix = f"[{str(level).upper()}] " if level else ""
+        normalized_level = _normalize_log_level(level)
+        level_prefix = f"[{normalized_level.upper()}] " if level else ""
         formatted = f"[{timestamp}] {prefix}{level_prefix}{message}"
-        self.log_text.append(formatted)
+        cursor = self.log_text.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        char_format = QTextCharFormat()
+        char_format.setForeground(QColor(LOG_LEVEL_COLORS[normalized_level]))
+        cursor.insertText(formatted + "\n", char_format)
+        self.log_text.setTextCursor(cursor)
+        self.log_text.ensureCursorVisible()
         if profile_id:
             self.latest_profile_log[profile_id] = formatted
             self._update_profile_card(profile_id)
@@ -1379,7 +1459,7 @@ class MainWindow(QMainWindow):
                 if not values["email"] or not values["password"]:
                     raise ValueError("UID/email và password không được để trống.")
                 self._run_operation(
-                    "Login Facebook",
+                    "Đăng nhập Facebook",
                     lambda: self.core.add_login_account(
                         self.profile_id,
                         values["email"], values["password"], values["secret"],
@@ -1389,7 +1469,7 @@ class MainWindow(QMainWindow):
             else:
                 self.core.parse_facebook_login_batch(values["batch"])
                 self._run_operation(
-                    "Batch login Facebook",
+                    "Đăng nhập Facebook hàng loạt",
                     lambda: self.core.batch_login_accounts(
                         self.profile_id, values["batch"]
                     ),
@@ -1439,11 +1519,20 @@ class MainWindow(QMainWindow):
             password = dialog.password.text() or None
             secret = dialog.secret.text().strip() or None
             self._run_operation(
-                "Relogin Facebook",
+                "Đăng nhập lại Facebook",
                 lambda: self.core.relogin_account_record(
                     self.profile_id, account_key, password=password, secret=secret
                 ),
                 self._account_operation_finished,
+                profile_id=profile_id,
+                account_key=account_key,
+                start_message="Đang đăng nhập lại Facebook để lấy token mới...",
+                success_message=(
+                    "Đăng nhập lại Facebook thành công; đã lấy và lưu token mới."
+                ),
+                failure_message=(
+                    "Đăng nhập lại Facebook thất bại; token cũ vẫn được giữ."
+                ),
             )
 
     def _start_manual_live_check(self, profile_id, account_key, dialog):
@@ -1586,20 +1675,41 @@ class MainWindow(QMainWindow):
             )
         QMessageBox.information(self, "Jobs TTC", "\n".join(lines))
 
-    def _run_operation(self, label, operation, on_success, on_error=None):
+    def _run_operation(self, label, operation, on_success, on_error=None, *,
+                       profile_id=None, account_key=None, start_message=None,
+                       success_message=None, failure_message=None):
         worker = CoreOperationWorker(operation, self)
         self._operations.add(worker)
         self._update_controls()
-        self.log(f"{label} đang chạy nền…")
+        self.log(
+            start_message or f"{label} đang chạy nền…",
+            account_key,
+            profile_id,
+            level="info",
+        )
         worker.result_ready.connect(on_success)
-        worker.result_ready.connect(lambda _result: self.log(f"{label} hoàn tất."))
+        worker.result_ready.connect(
+            lambda _result: self.log(
+                success_message or f"{label} hoàn tất.",
+                account_key,
+                profile_id,
+                level="success",
+            )
+        )
         if on_error is None:
             worker.error_ready.connect(
                 lambda message: QMessageBox.critical(self, label, message)
             )
         else:
             worker.error_ready.connect(on_error)
-        worker.error_ready.connect(lambda message: self.log(f"{label}: {message}"))
+        worker.error_ready.connect(
+            lambda message: self.log(
+                f"{failure_message or label}\nLý do: {message}",
+                account_key,
+                profile_id,
+                level="error",
+            )
+        )
         worker.finished.connect(lambda: self._operation_finished(worker))
         worker.start()
 
@@ -1644,8 +1754,9 @@ class MainWindow(QMainWindow):
         self.profile_runs[profile_id] = run_state
         profile = self.profiles_by_id.get(profile_id, {})
         self.log(
-            f"Đã giữ profile run lease cho {profile.get('name', profile_id)}.",
+            f"Đã giữ quyền chạy cho profile {profile.get('name', profile_id)}.",
             profile_id=profile_id,
+            level="info",
         )
         return run_state
 
@@ -1743,7 +1854,12 @@ class MainWindow(QMainWindow):
             card.set_running(True)
             card.set_runtime(jobs=0, coin=0)
         worker.start()
-        self.log("Worker đã start.", account_key, profile_id)
+        self.log(
+            "Đã bắt đầu lượt chạy tài khoản.",
+            account_key,
+            profile_id,
+            level="info",
+        )
         self._update_controls()
         return True
 
@@ -1773,8 +1889,8 @@ class MainWindow(QMainWindow):
         if card is not None:
             card.set_running(True, stopping=True)
         self.log(
-            "Đã gửi cooperative Stop; current job sẽ kết thúc an toàn.",
-            account_key, profile_id,
+            "Đã yêu cầu dừng; tài khoản sẽ dừng an toàn sau job hiện tại.",
+            account_key, profile_id, level="warning",
         )
         self._update_profile_card(profile_id)
 
@@ -1947,8 +2063,9 @@ class MainWindow(QMainWindow):
         for _runtime_profile_id, account_key in active_keys:
             self.stop_account(account_key, profile_id=profile_id)
         self.log(
-            "Đã yêu cầu dừng run-group profile.",
+            "Đã yêu cầu dừng phiên chạy profile.",
             profile_id=profile_id,
+            level="warning",
         )
         self._release_profile_if_idle(profile_id)
         self._update_controls()
@@ -1984,7 +2101,10 @@ class MainWindow(QMainWindow):
                 if data["status"] == TOKEN_LIVE:
                     card.set_runtime(uid=data["uid"])
             if message:
-                self.log(message, account_key, profile_id)
+                self.log(
+                    message, account_key, profile_id,
+                    level=_event_log_level(event_type, event),
+                )
             self._update_aggregate()
             self._update_profile_card(profile_id)
             return
@@ -2001,7 +2121,10 @@ class MainWindow(QMainWindow):
                 card.set_runtime(status=self.account_statuses[runtime_key])
             self._render_active_delays()
             if first_tick:
-                self.log(f"{message}: {remaining}s", account_key, profile_id)
+                self.log(
+                    f"{message}: {remaining}s", account_key, profile_id,
+                    level="warning",
+                )
             self._update_aggregate()
             self._update_profile_card(profile_id)
             return
@@ -2063,9 +2186,7 @@ class MainWindow(QMainWindow):
                 message,
                 account_key,
                 profile_id,
-                level=event.get("level") if event_type in {
-                    "runtime_log", "facebook_action_result"
-                } else None,
+                level=_event_log_level(event_type, event),
             )
         self._update_aggregate()
         self._update_profile_card(profile_id)
@@ -2105,7 +2226,12 @@ class MainWindow(QMainWindow):
                 coin=metrics.get("session_coin", 0),
             )
         worker.deleteLater()
-        self.log("Worker đã finished và cleanup.", account_key, profile_id)
+        self.log(
+            "Đã kết thúc lượt chạy tài khoản và dọn trạng thái.",
+            account_key,
+            profile_id,
+            level="info",
+        )
         if self._schedule_next_queued(profile_id):
             self._update_controls()
             self._update_profile_card(profile_id)
@@ -2133,7 +2259,11 @@ class MainWindow(QMainWindow):
         self.profile_runs.pop(profile_id, None)
         self._render_active_delays()
         self._ensure_live_wait_timer()
-        self.log("Đã release profile run lease sau worker cuối.", profile_id=profile_id)
+        self.log(
+            "Đã giải phóng quyền chạy profile sau khi tài khoản cuối kết thúc.",
+            profile_id=profile_id,
+            level="info",
+        )
 
     def _update_aggregate(self):
         profile_id = self.view_profile_id
@@ -2141,8 +2271,8 @@ class MainWindow(QMainWindow):
         active = sum(key[0] == profile_id for key in self.workers)
         pending = sum(key[0] == profile_id for key in self.pending_starts)
         self.aggregate_label.setText(
-            f"Active: {active} | Pending: {pending} | "
-            f"Tổng session: {jobs} job | +{core.format_coin(coin)} xu"
+            f"Đang chạy: {active} | Đang chờ: {pending} | "
+            f"Tổng phiên: {jobs} job | +{core.format_coin(coin)} xu"
         )
 
     def _update_controls(self):
@@ -2220,8 +2350,8 @@ class MainWindow(QMainWindow):
         if not self._closing:
             answer = QMessageBox.question(
                 self, "Thoát",
-                "Worker/thao tác nền đang chạy. Gửi cooperative Stop và thoát "
-                "sau khi tất cả thread finished?",
+                "Tài khoản/thao tác nền đang chạy. Yêu cầu dừng và thoát "
+                "sau khi tất cả luồng kết thúc?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             )
             if answer != QMessageBox.Yes:
@@ -2234,6 +2364,7 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    _scale_application_font(app)
     app.setStyle("Fusion")
     window = MainWindow()
     window.show()

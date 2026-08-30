@@ -50,6 +50,10 @@ FB_ACTION_TIMEOUT = (10, 45)
 FB_LOGIN_TIMEOUT = (10, 45)
 NETWORK_RETRY_DELAY = 2
 TTC_CLAIM_RETRY_DELAY = 2
+FACEBOOK_REACTION_TRANSIENT_SUMMARY = "something went wrong"
+FACEBOOK_REACTION_TRANSIENT_DESCRIPTION = (
+    "we're having trouble completing your request. please try again."
+)
 
 # =====================================================================
 # TTC API implementation
@@ -495,6 +499,16 @@ class TTCClaimResult:
             "content_type": self.content_type,
         }
 
+
+@dataclass(frozen=True)
+class FacebookReactionAttemptResult:
+    success: bool
+    classification: str
+    summary: str = ""
+    description: str = ""
+    raw_text: str = ""
+
+
 logger = logging.getLogger(__name__)
 
 # =====================================================================
@@ -586,11 +600,11 @@ def _mask_token(token: str) -> str:
 
 
 _SENSITIVE_FIELD_RE = re.compile(
-    r"(?i)\b(access_token|authorization|cookie|session|token|password|pass|auth)\b\s*[:=]\s*"
+    r"(?i)\b(access_token|authorization|cookie|session|token|password|pass|auth|2fa|secret)\b\s*[:=]\s*"
     r"(\"[^\"]*\"|'[^']*'|[^\s,;&<>]+)"
 )
 _SENSITIVE_JSON_FIELD_RE = re.compile(
-    r"(?i)([\"'](?:access_token|authorization|cookie|session|token|password|pass|auth)[\"']"
+    r"(?i)([\"'](?:access_token|authorization|cookie|session|token|password|pass|auth|2fa|secret)[\"']"
     r"\s*:\s*)(\"[^\"]*\"|'[^']*'|[^\s,;&<>}]+)"
 )
 _MOJIBAKE_MARKERS = (
@@ -601,6 +615,11 @@ _MOJIBAKE_MARKERS = (
 
 def _mask_sensitive_text(value: str) -> str:
     text = str(value or "")
+    text = re.sub(
+        r"(?im)\b(authorization|cookie|set-cookie)\s*[:=]\s*[^\r\n]*",
+        lambda match: f"{match.group(1)}=***",
+        text,
+    )
     text = _SENSITIVE_JSON_FIELD_RE.sub(lambda m: f'{m.group(1)}"***"', text)
     text = _SENSITIVE_FIELD_RE.sub(lambda m: f"{m.group(1)}=***", text)
     text = re.sub(r"(?i)(access_token|cookie|session|token)=\S+", r"\1=***", text)
@@ -3598,6 +3617,11 @@ class AUTO_Action:
         self._requests = requests.Session()
         self._log_fn = log_fn
         self.last_comment_evidence = _facebook_comment_response_evidence(None)
+        self.last_reaction_evidence = {
+            "success": False,
+            "classification": "NOT_ATTEMPTED",
+            "attempts": 0,
+        }
         self.id_reaction = {
             'LIKE': 1635855486666999,
             'LOVE': 1678524932434102,
@@ -3755,6 +3779,108 @@ class AUTO_Action:
     def close(self):
         self._requests.close()
 
+    @staticmethod
+    def _reaction_error_text(error):
+        if not isinstance(error, dict):
+            return "", ""
+        summary = _safe_display_message(error.get("summary"), limit=300)
+        description = _safe_display_message(error.get("description"), limit=500)
+        return summary, description
+
+    @staticmethod
+    def _is_transient_reaction_error(summary, description):
+        normalized_summary = " ".join(str(summary or "").casefold().split())
+        normalized_description = " ".join(
+            str(description or "").casefold().split()
+        )
+        return (
+            normalized_summary == FACEBOOK_REACTION_TRANSIENT_SUMMARY
+            or FACEBOOK_REACTION_TRANSIENT_DESCRIPTION in normalized_description
+        )
+
+    def _reaction_attempt(self, payload, token):
+        try:
+            response = self._requests.post(url=self.url, headers={
+                "Authorization": f"OAuth {token}",
+                "X-FB-Friendly-Name": "ViewerReactionsMutation",
+            }, data=payload, timeout=FB_ACTION_TIMEOUT)
+        except requests.RequestException as exc:
+            return FacebookReactionAttemptResult(
+                False,
+                "NETWORK_UNKNOWN",
+                description=_safe_display_message(
+                    _mask_sensitive_text(str(exc)), limit=500
+                ),
+            )
+
+        response_text = str(getattr(response, "text", "") or "")
+        try:
+            result = response.json()
+        except (TypeError, ValueError) as exc:
+            return FacebookReactionAttemptResult(
+                False,
+                "PARSE_ERROR",
+                description=_safe_display_message(str(exc), limit=300),
+                raw_text=response_text[:500],
+            )
+        if not isinstance(result, dict):
+            return FacebookReactionAttemptResult(
+                False,
+                "PARSE_ERROR",
+                description="Facebook trả về dữ liệu reaction không hợp lệ.",
+                raw_text=response_text[:500],
+            )
+
+        errors = result.get("errors")
+        if errors is not None:
+            if not isinstance(errors, list):
+                errors = []
+            error_texts = [
+                self._reaction_error_text(item)
+                for item in errors
+                if isinstance(item, dict)
+            ]
+            error_texts = [pair for pair in error_texts if any(pair)]
+            summary, description = error_texts[0] if error_texts else ("", "")
+            classification = (
+                "TRANSIENT_RESPONSE"
+                if error_texts and all(
+                    self._is_transient_reaction_error(item_summary, item_description)
+                    for item_summary, item_description in error_texts
+                )
+                else "NON_RETRYABLE_RESPONSE"
+            )
+            raw_text = "\n".join(
+                " — ".join(part for part in pair if part)
+                for pair in error_texts
+            )
+            if not raw_text:
+                raw_text = _safe_display_message(response_text, limit=500)
+            return FacebookReactionAttemptResult(
+                False,
+                classification,
+                summary=summary,
+                description=description,
+                raw_text=raw_text,
+            )
+
+        data = result.get("data")
+        feedback_react = data.get("feedback_react") if isinstance(data, dict) else None
+        feedback = (
+            feedback_react.get("feedback")
+            if isinstance(feedback_react, dict)
+            else None
+        )
+        if isinstance(feedback, dict) and (
+                feedback.get("viewer_feedback_reaction_key") is not None):
+            return FacebookReactionAttemptResult(True, "SUCCESS")
+        return FacebookReactionAttemptResult(
+            False,
+            "NON_RETRYABLE_RESPONSE",
+            description="Phản hồi Facebook thiếu dữ liệu xác nhận reaction.",
+            raw_text=_safe_display_message(response_text, limit=500),
+        )
+
     def auto_reaction(self, post_id, reaction_type, token, actor_id):
         raw = f"feedback:{post_id}"
         feedback_id = base64.b64encode(raw.encode()).decode()
@@ -3803,31 +3929,51 @@ class AUTO_Action:
             'fb_api_analytics_tags': '["GraphServices"]',
             'client_trace_id': client_trace_id
         }
-        try:
-            res = self._requests.post(url=self.url, headers={
-                "Authorization": f"OAuth {token}",
-                "X-FB-Friendly-Name": "ViewerReactionsMutation",
-            }, data=payload, timeout=FB_ACTION_TIMEOUT)
-        except requests.RequestException as exc:
-            self._log(f"Facebook reaction timeout/lỗi mạng: {exc}; outcome unknown", "error")
-            return False
-        try:
-            result = res.json()
-        except:
-            self._log("Lỗi parse JSON phản hồi Facebook reaction.", "error")
-            self._log(res.text[:500], "raw")
-            return False
-        if "errors" in result:
-            for err in result["errors"]:
-                self._log(f"{err.get('summary')}: {err.get('description')}", "error")
-            return False
-        feedback = result.get("data", {}).get("feedback_react", {}).get("feedback", {})
-        if feedback.get("viewer_feedback_reaction_key") is not None:
-            self._log("Reaction thành công!", "success")
-            return True
-        else:
-            self._log("Reaction không thành công hoặc phản hồi thiếu dữ liệu.", "warning")
-            return False
+        attempts = 0
+        attempt_result = None
+        while attempts < 2:
+            attempts += 1
+            attempt_result = self._reaction_attempt(payload, token)
+            if attempt_result.raw_text:
+                label = "Facebook thử lại" if attempts == 2 else "Facebook"
+                self._log(f"{label}:\n{attempt_result.raw_text}", "raw")
+            if attempt_result.success:
+                break
+            if not (
+                attempts == 1
+                and attempt_result.classification == "TRANSIENT_RESPONSE"
+            ):
+                break
+            details = " — ".join(
+                part for part in (
+                    attempt_result.summary,
+                    attempt_result.description,
+                ) if part
+            )
+            details_text = f": {details}" if details else ""
+            if details_text and details_text[-1] not in ".!?":
+                details_text += "."
+            self._log(
+                f"Facebook {reaction_type} trả lỗi tạm thời"
+                f"{details_text} "
+                f"Thử lại reaction 1 lần sau {NETWORK_RETRY_DELAY} giây.",
+                "warning",
+            )
+            time.sleep(NETWORK_RETRY_DELAY)
+
+        self.last_reaction_evidence = {
+            "success": bool(attempt_result and attempt_result.success),
+            "classification": (
+                attempt_result.classification if attempt_result is not None
+                else "NOT_ATTEMPTED"
+            ),
+            "attempts": attempts,
+            "summary": attempt_result.summary if attempt_result is not None else "",
+            "description": (
+                attempt_result.description if attempt_result is not None else ""
+            ),
+        }
+        return self.last_reaction_evidence["success"]
 
     def auto_cmt(self, post_id, text, token, actor_id):
         self.last_comment_evidence = _facebook_comment_response_evidence(None)
@@ -3947,7 +4093,12 @@ class AUTO_Action:
             return False
         if "errors" in result:
             for err in result["errors"]:
-                self._log(f"{err.get('summary')}: {err.get('description')}", "error")
+                summary, description = self._reaction_error_text(err)
+                raw_text = " — ".join(
+                    part for part in (summary, description) if part
+                )
+                if raw_text:
+                    self._log(f"Facebook:\n{raw_text}", "raw")
             return False
         else:
             comment_data = result.get("data", {}).get("comment_create", {}).get("comment")
@@ -5585,6 +5736,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                     object_id=object_id,
                 )
                 action_succeeded = False
+                action_failure_decision_logged = False
                 try:
                     post_id = _resolve_ttc_facebook_post_id(
                         original_job,
@@ -5602,20 +5754,65 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                             action_succeeded = do_job.auto_reaction(
                                 post_id, reaction, fb_token, uid
                             )
+                            reaction_evidence = getattr(
+                                do_job, "last_reaction_evidence", {}
+                            )
+                            if not isinstance(reaction_evidence, dict):
+                                reaction_evidence = {}
+                            reaction_attempts = reaction_evidence.get("attempts", 1)
+                            if (
+                                not isinstance(reaction_attempts, int)
+                                or isinstance(reaction_attempts, bool)
+                            ):
+                                reaction_attempts = 1
+                            if action_succeeded:
+                                reaction_message = (
+                                    f"{reaction} thành công sau 1 lần thử lại."
+                                    if reaction_attempts == 2
+                                    else f"{reaction} thành công."
+                                )
+                                reaction_level = "success"
+                            elif reaction_attempts == 2:
+                                reaction_message = (
+                                    f"{reaction} vẫn thất bại sau 1 lần thử lại; "
+                                    "bỏ qua job này."
+                                )
+                                reaction_level = "error"
+                                action_failure_decision_logged = True
+                            elif reaction_evidence.get("classification") == "NETWORK_UNKNOWN":
+                                reaction_message = (
+                                    f"{reaction} gặp lỗi mạng; kết quả phản ứng chưa xác định "
+                                    "nên không thử lại; bỏ qua job này."
+                                )
+                                reaction_level = "error"
+                                action_failure_decision_logged = True
+                            elif reaction_evidence.get("classification") == "PARSE_ERROR":
+                                reaction_message = (
+                                    f"Không đọc được phản hồi Facebook cho {reaction}; "
+                                    "không thử lại; bỏ qua job này."
+                                )
+                                reaction_level = "error"
+                                action_failure_decision_logged = True
+                            else:
+                                reaction_message = (
+                                    f"{reaction} thất bại; bỏ qua job này."
+                                )
+                                reaction_level = "error"
+                                action_failure_decision_logged = True
                             _emit_runtime_event(
                                 event_callback,
                                 "facebook_action_result",
-                                (
-                                    f"Facebook {reaction} thành công."
-                                    if action_succeeded
-                                    else f"Facebook {reaction} thất bại."
-                                ),
-                                level="success" if action_succeeded else "warning",
+                                reaction_message,
+                                level=reaction_level,
                                 action="reaction",
                                 reaction_type=reaction,
                                 object_id=object_id,
                                 post_id=str(post_id),
                                 success=bool(action_succeeded),
+                                classification=reaction_evidence.get(
+                                    "classification", ""
+                                ),
+                                attempts=reaction_attempts,
                             )
                         else:
                             _runtime_log(
@@ -5631,16 +5828,18 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                                 event_callback,
                                 "facebook_action_result",
                                 (
-                                    "Facebook Comment thành công."
+                                    "Comment thành công."
                                     if action_succeeded
-                                    else "Facebook Comment thất bại."
+                                    else "Comment thất bại; bỏ qua job này."
                                 ),
-                                level="success" if action_succeeded else "warning",
+                                level="success" if action_succeeded else "error",
                                 action="comment",
                                 object_id=object_id,
                                 post_id=str(post_id),
                                 success=bool(action_succeeded),
                             )
+                            if not action_succeeded:
+                                action_failure_decision_logged = True
                             comment_evidence = getattr(do_job, "last_comment_evidence", None)
                             if not isinstance(comment_evidence, dict):
                                 comment_evidence = {}
@@ -5815,19 +6014,19 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                                 terminal_printer=print_warning,
                                 claim_reason=result.get("reason", ""),
                             )
-                else:
+                elif not action_failure_decision_logged:
                     _runtime_log(
-                        event_callback, "warning",
+                        event_callback, "error",
                         f"[{idx}/{total_jobs}] {job_type_display} | Thao tác Facebook thất bại; "
-                        "bỏ qua gửi kết quả TTC.",
-                        terminal_printer=print_warning,
+                        "bỏ qua job này.",
+                        terminal_printer=print_error,
                         job_id=original_job.get("job_id", ""),
                     )
 
         if idx < total_jobs:
             if _runtime_stop_requested(stop_event):
                 _emit_runtime_event(
-                    event_callback, "stopped", "Đã dừng sau current job.",
+                    event_callback, "stopped", "Đã dừng sau job hiện tại.",
                     jobs_succeeded=total_done,
                 )
                 break
@@ -5839,7 +6038,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
             if not _cooperative_countdown(
                     delay, f"Chờ job {idx+1}", stop_event, event_callback):
                 _emit_runtime_event(
-                    event_callback, "stopped", "Delay đã được ngắt để dừng.",
+                    event_callback, "stopped", "Đã ngắt thời gian chờ để dừng.",
                     jobs_succeeded=total_done,
                 )
                 break
@@ -5972,7 +6171,7 @@ class TTCAccountRuntime:
             status = "Stopped" if _runtime_stop_requested(self.stop_event) else "Completed"
             self._handle_event({
                 "type": "status",
-                "message": status,
+                "message": "Đã dừng" if status == "Stopped" else "Hoàn thành",
                 "status": status,
                 **self.metrics,
             })

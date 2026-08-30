@@ -5521,6 +5521,10 @@ class TTCAccountRuntime:
                 self.metrics["balance"] = _parse_strict_integer(
                     account_info.get("balance")
                 )
+                self._handle_event({
+                    "type": "balance",
+                    "balance": self.metrics["balance"],
+                })
 
             cycle = 1
             while not _runtime_stop_requested(self.stop_event):

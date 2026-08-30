@@ -36,11 +36,52 @@ import api_ttc as core
 
 
 LOG_HISTORY_LIMIT = 4000
+TOKEN_LIVE = "LIVE"
+TOKEN_DIE = "DIE_TOKEN"
+TOKEN_CHECK_ERROR = "CHECK_ERROR"
+TOKEN_UNKNOWN = "UNKNOWN"
 
 
 def _identity(account):
     email = str(account.get("email", "")).strip()
     return email or f"Manual token {core.preview_token(account.get('token', ''))}"
+
+
+def _token_status_text(status, compact=False):
+    status = str(status or TOKEN_UNKNOWN).upper()
+    if status == TOKEN_LIVE:
+        return "LIVE"
+    if status == TOKEN_DIE:
+        return "DIE" if compact else "DIE TOKEN"
+    if status == TOKEN_CHECK_ERROR:
+        return "Lỗi check"
+    return "Chưa kiểm tra"
+
+
+def _normalize_live_result(result):
+    if isinstance(result, dict):
+        data = dict(result)
+    else:
+        to_dict = getattr(result, "to_dict", None)
+        data = dict(to_dict()) if callable(to_dict) else {
+            "status": getattr(result, "status", TOKEN_CHECK_ERROR),
+            "uid": getattr(result, "uid", None),
+            "reason": getattr(result, "reason", ""),
+            "http_status": getattr(result, "http_status", None),
+        }
+    status = str(data.get("status") or TOKEN_CHECK_ERROR).upper()
+    uid = data.get("uid")
+    uid = uid.strip() if isinstance(uid, str) and uid.strip() else None
+    if status == TOKEN_LIVE and not uid:
+        status = TOKEN_CHECK_ERROR
+    if status not in {TOKEN_LIVE, TOKEN_DIE, TOKEN_CHECK_ERROR, TOKEN_UNKNOWN}:
+        status = TOKEN_CHECK_ERROR
+    return {
+        "status": status,
+        "uid": uid,
+        "reason": str(data.get("reason") or ""),
+        "http_status": data.get("http_status"),
+    }
 
 
 class JobWorker(QThread):
@@ -132,6 +173,7 @@ class AccountCard(QGroupBox):
         self.uid_label = QLabel("UID: chưa resolve")
         self.jobs_label = QLabel("Session: 0 job | 0 xu")
         self.status_label = QLabel("Trạng thái: Idle")
+        self.token_status_label = QLabel("Token: Chưa kiểm tra")
         self.enabled_label = QLabel()
 
         layout.addWidget(self.identity_label, 0, 0, 1, 2)
@@ -139,6 +181,7 @@ class AccountCard(QGroupBox):
         layout.addWidget(self.uid_label, 1, 0)
         layout.addWidget(self.jobs_label, 1, 1)
         layout.addWidget(self.status_label, 1, 2)
+        layout.addWidget(self.token_status_label, 2, 0, 1, 3)
 
         self.run_button = QPushButton("▶ Chạy")
         self.settings_button = QPushButton("⚙ Cài đặt")
@@ -149,9 +192,9 @@ class AccountCard(QGroupBox):
             lambda: self.settings_clicked.emit(self.account_key)
         )
         self.delete_button.clicked.connect(lambda: self.delete_clicked.emit(self.account_key))
-        layout.addWidget(self.run_button, 2, 0)
-        layout.addWidget(self.settings_button, 2, 1)
-        layout.addWidget(self.delete_button, 2, 2)
+        layout.addWidget(self.run_button, 3, 0)
+        layout.addWidget(self.settings_button, 3, 1)
+        layout.addWidget(self.delete_button, 3, 2)
 
     def update_account(self, account, enabled):
         self.account = dict(account)
@@ -172,6 +215,21 @@ class AccountCard(QGroupBox):
             self.jobs_label.setText(
                 f"Session: {current_jobs} job | {core.format_coin(current_coin)} xu"
             )
+
+    def set_token_status(self, status):
+        status = str(status or TOKEN_UNKNOWN).upper()
+        self.token_status_label.setText(
+            f"Token: {_token_status_text(status, compact=True)}"
+        )
+        colors = {
+            TOKEN_LIVE: "#7ee787",
+            TOKEN_DIE: "#ff7b72",
+            TOKEN_CHECK_ERROR: "#f2cc60",
+            TOKEN_UNKNOWN: "#9aa4b2",
+        }
+        self.token_status_label.setStyleSheet(
+            f"color: {colors.get(status, colors[TOKEN_UNKNOWN])};"
+        )
 
     def set_running(self, running, stopping=False):
         self._running = bool(running)
@@ -238,6 +296,8 @@ class ProfileSummaryCard(QGroupBox):
     def update_summary(self, *, name, status, account_count, active_count,
                        pending_count, jobs, coin_text, balance_text, identities,
                        latest_log, live_status, selected, run_text, run_enabled,
+                       token_live_count=0, token_die_count=0,
+                       token_error_count=0, token_unknown_count=0,
                        run_tooltip=""):
         self.setTitle("Đang xem" if selected else "")
         self.name_label.setText(f"Profile: {name}")
@@ -252,10 +312,19 @@ class ProfileSummaryCard(QGroupBox):
         self.run_button.setText(run_text)
         self.run_button.setEnabled(run_enabled)
         self.run_button.setToolTip(run_tooltip)
-        pending_text = f" | Chờ: {pending_count}" if pending_count else ""
-        self.count_label.setText(
-            f"FB: {account_count} | Đang chạy: {active_count}{pending_text}"
-        )
+        count_parts = [
+            f"FB: {account_count}",
+            f"Live: {token_live_count}",
+            f"Die token: {token_die_count}",
+        ]
+        if token_error_count:
+            count_parts.append(f"Lỗi check: {token_error_count}")
+        if token_unknown_count:
+            count_parts.append(f"Chưa check: {token_unknown_count}")
+        count_parts.append(f"Đang chạy: {active_count}")
+        if pending_count:
+            count_parts.append(f"Chờ: {pending_count}")
+        self.count_label.setText(" | ".join(count_parts))
         self.session_label.setText(
             f"Session: {jobs} job | +{coin_text} xu"
         )
@@ -264,7 +333,7 @@ class ProfileSummaryCard(QGroupBox):
             f"Đang chạy: {identities}" if identities else "Đang chạy: —"
         )
         self.log_label.setText(
-            f"Log mới nhất: {latest_log or 'Chưa có log trong phiên này'}"
+            f"Log : {latest_log or 'Chưa có log trong phiên này'}"
         )
         self.live_status_label.setText(
             f"Đang chờ: {live_status}" if live_status else "Đang chờ: —"
@@ -394,7 +463,9 @@ class AddAccountDialog(QDialog):
 
 
 class AccountSettingsDialog(QDialog):
-    def __init__(self, account, enabled, parent=None):
+    check_live_clicked = pyqtSignal()
+
+    def __init__(self, account, enabled, live_state=None, parent=None):
         super().__init__(parent)
         self.action = None
         self.account = dict(account)
@@ -427,6 +498,16 @@ class AccountSettingsDialog(QDialog):
         form.addRow("", self.enabled)
         layout.addLayout(form)
 
+        live_row = QHBoxLayout()
+        self.live_status_label = QLabel()
+        self.check_live_button = QPushButton("✓ Kiểm tra LIVE token")
+        self.check_live_button.clicked.connect(self.check_live_clicked.emit)
+        live_row.addWidget(QLabel("Trạng thái token:"))
+        live_row.addWidget(self.live_status_label, 1)
+        live_row.addWidget(self.check_live_button)
+        layout.addLayout(live_row)
+        self.set_live_result(live_state or {"status": TOKEN_UNKNOWN})
+
         row = QHBoxLayout()
         save_button = QPushButton("Lưu")
         relogin_button = QPushButton("Login / relogin lấy token")
@@ -443,6 +524,27 @@ class AccountSettingsDialog(QDialog):
     def _finish(self, action):
         self.action = action
         self.accept()
+
+    def set_live_checking(self, checking):
+        self.check_live_button.setEnabled(not checking)
+        self.check_live_button.setText(
+            "Đang kiểm tra…" if checking else "✓ Kiểm tra LIVE token"
+        )
+
+    def set_live_result(self, result):
+        data = _normalize_live_result(result)
+        status = data["status"]
+        if status == TOKEN_LIVE:
+            text = f"Token LIVE — UID {data['uid']}"
+        elif status == TOKEN_DIE:
+            text = "Token DIE / hết hạn"
+        elif status == TOKEN_CHECK_ERROR:
+            reason = data["reason"] or "Không xác minh được token"
+            text = f"Không xác minh được token — {reason}"
+        else:
+            text = "Chưa kiểm tra"
+        self.live_status_label.setText(text)
+        self.set_live_checking(False)
 
     def updates(self):
         updates = {"email": self.email.text().strip()}
@@ -495,6 +597,7 @@ class MainWindow(QMainWindow):
         self.completed_profile_metrics = {}
         self.resolved_uids = {}
         self.account_statuses = {}
+        self.account_live_states = {}
         self.active_delays = {}
         self.endpoint_cooldowns = {}
         self.profile_account_delays = {}
@@ -924,17 +1027,51 @@ class MainWindow(QMainWindow):
             coin += int(metrics.get("session_coin", 0))
         return jobs, coin
 
+    def _profile_token_counts(self, profile_id):
+        profile = self.profiles_by_id.get(profile_id, {})
+        selected_keys = self.core.selected_account_keys(profile)
+        counts = {
+            TOKEN_LIVE: 0,
+            TOKEN_DIE: 0,
+            TOKEN_CHECK_ERROR: 0,
+            TOKEN_UNKNOWN: 0,
+        }
+        for account_key in selected_keys:
+            state = self.account_live_states.get(
+                self._runtime_key(profile_id, account_key), {}
+            )
+            status = str(state.get("status") or TOKEN_UNKNOWN).upper()
+            if status not in counts:
+                status = TOKEN_UNKNOWN
+            counts[status] += 1
+        return counts
+
+    def _reset_account_live_state(self, profile_id, account_key):
+        runtime_key = self._runtime_key(profile_id, account_key)
+        self.account_live_states[runtime_key] = {
+            "status": TOKEN_UNKNOWN,
+            "uid": None,
+            "reason": "",
+            "checked_at": None,
+        }
+        card = (
+            self.account_widgets.get(account_key)
+            if profile_id == self.view_profile_id else None
+        )
+        if card is not None:
+            card.set_token_status(TOKEN_UNKNOWN)
+
     def _profile_status(self, profile_id, active_keys, pending_keys):
         run_state = self.profile_runs.get(profile_id)
         if run_state is not None:
             if run_state["stopping"]:
                 return "Stopping"
             if any(self.workers[key].stop_event.is_set() for key in active_keys):
-                return "Stopping"
+                return "Đang Dừng"
             if active_keys:
-                return "Running"
+                return "Đang Chạy"
             if pending_keys:
-                return "Pending"
+                return "Đang chờ chuyển Tk"
         if profile_id in self.profile_errors:
             return "Error"
         return "Idle"
@@ -960,6 +1097,7 @@ class MainWindow(QMainWindow):
             "—" if balance is None else f"{self.core.format_coin(balance)} xu"
         )
         status = self._profile_status(profile_id, active_keys, pending_keys)
+        token_counts = self._profile_token_counts(profile_id)
         if status == "Stopping":
             run_text = "Đang dừng…"
             run_enabled = False
@@ -991,6 +1129,10 @@ class MainWindow(QMainWindow):
             identities=", ".join(identities),
             latest_log=self.latest_profile_log.get(profile_id),
             live_status=self._profile_live_status(profile_id),
+            token_live_count=token_counts[TOKEN_LIVE],
+            token_die_count=token_counts[TOKEN_DIE],
+            token_error_count=token_counts[TOKEN_CHECK_ERROR],
+            token_unknown_count=token_counts[TOKEN_UNKNOWN],
             selected=profile_id == self.view_profile_id,
             run_text=run_text,
             run_enabled=run_enabled,
@@ -1062,6 +1204,8 @@ class MainWindow(QMainWindow):
             self.cards_layout.addWidget(card)
             self.account_widgets[key] = card
             runtime_key = self._runtime_key(self.view_profile_id, key)
+            live_state = self.account_live_states.get(runtime_key, {})
+            card.set_token_status(live_state.get("status", TOKEN_UNKNOWN))
             metrics = self.session_metrics.get(
                 runtime_key, self.account_last_metrics.get(runtime_key, {})
             )
@@ -1266,7 +1410,17 @@ class MainWindow(QMainWindow):
         if account is None:
             return
         enabled = account_key in set(self.core.selected_account_keys(self.profile))
-        dialog = AccountSettingsDialog(account, enabled, self)
+        profile_id = self.profile_id
+        runtime_key = self._runtime_key(profile_id, account_key)
+        dialog = AccountSettingsDialog(
+            account,
+            enabled,
+            live_state=self.account_live_states.get(runtime_key),
+            parent=self,
+        )
+        dialog.check_live_clicked.connect(
+            lambda: self._start_manual_live_check(profile_id, account_key, dialog)
+        )
         if dialog.exec_() != QDialog.Accepted:
             return
         if dialog.action == "save":
@@ -1277,6 +1431,7 @@ class MainWindow(QMainWindow):
                     dialog.updates(),
                     enabled=dialog.enabled.isChecked(),
                 )
+                self.account_live_states.pop(runtime_key, None)
                 self.reload_from_core()
             except Exception as exc:
                 QMessageBox.critical(self, "Không thể lưu account", str(exc))
@@ -1290,6 +1445,53 @@ class MainWindow(QMainWindow):
                 ),
                 self._account_operation_finished,
             )
+
+    def _start_manual_live_check(self, profile_id, account_key, dialog):
+        if self._operations:
+            return
+        dialog.set_live_checking(True)
+        self._run_operation(
+            "Kiểm tra LIVE token",
+            lambda: self.core.check_facebook_token(profile_id, account_key),
+            lambda result: self._manual_live_check_finished(
+                profile_id, account_key, dialog, result
+            ),
+            on_error=lambda message: self._manual_live_check_failed(
+                profile_id, account_key, dialog, message
+            ),
+        )
+
+    def _manual_live_check_finished(self, profile_id, account_key, dialog, result):
+        data = _normalize_live_result(result)
+        runtime_key = self._runtime_key(profile_id, account_key)
+        state = {**data, "checked_at": time.time()}
+        self.account_live_states[runtime_key] = state
+        if data["status"] == TOKEN_LIVE:
+            self.resolved_uids[runtime_key] = data["uid"]
+            message = f"Facebook token LIVE | UID: {data['uid']}"
+        elif data["status"] == TOKEN_DIE:
+            message = "Facebook token DIE"
+        else:
+            message = f"Check Facebook token lỗi: {data['reason']}"
+        dialog.set_live_result(data)
+        card = (
+            self.account_widgets.get(account_key)
+            if profile_id == self.view_profile_id else None
+        )
+        if card is not None:
+            card.set_token_status(data["status"])
+            if data["status"] == TOKEN_LIVE:
+                card.set_runtime(uid=data["uid"])
+        self.log(message, account_key, profile_id)
+        self._update_profile_card(profile_id)
+
+    def _manual_live_check_failed(self, profile_id, account_key, dialog, message):
+        self._manual_live_check_finished(
+            profile_id,
+            account_key,
+            dialog,
+            {"status": TOKEN_CHECK_ERROR, "reason": str(message)},
+        )
 
     def delete_account(self, account_key):
         if not self._mutation_allowed(require_profile=True):
@@ -1384,16 +1586,19 @@ class MainWindow(QMainWindow):
             )
         QMessageBox.information(self, "Jobs TTC", "\n".join(lines))
 
-    def _run_operation(self, label, operation, on_success):
+    def _run_operation(self, label, operation, on_success, on_error=None):
         worker = CoreOperationWorker(operation, self)
         self._operations.add(worker)
         self._update_controls()
         self.log(f"{label} đang chạy nền…")
         worker.result_ready.connect(on_success)
         worker.result_ready.connect(lambda _result: self.log(f"{label} hoàn tất."))
-        worker.error_ready.connect(
-            lambda message: QMessageBox.critical(self, label, message)
-        )
+        if on_error is None:
+            worker.error_ready.connect(
+                lambda message: QMessageBox.critical(self, label, message)
+            )
+        else:
+            worker.error_ready.connect(on_error)
         worker.error_ready.connect(lambda message: self.log(f"{label}: {message}"))
         worker.finished.connect(lambda: self._operation_finished(worker))
         worker.start()
@@ -1513,6 +1718,7 @@ class MainWindow(QMainWindow):
 
         self.pending_starts.discard(runtime_key)
         self._clear_runtime_waits(runtime_key)
+        self._reset_account_live_state(profile_id, account_key)
         worker = JobWorker(
             profile_id,
             profile["auth_token"],
@@ -1604,6 +1810,10 @@ class MainWindow(QMainWindow):
         ]
         if not candidates:
             return False
+        for account in candidates:
+            self._reset_account_live_state(
+                profile_id, self.core.facebook_account_key(account)
+            )
         self.log(
             "Đã yêu cầu chạy tất cả account đang bật.",
             profile_id=profile_id,
@@ -1761,6 +1971,23 @@ class MainWindow(QMainWindow):
         event_type = event.get("type")
         message = event.get("message", "")
         card = self.account_widgets.get(account_key) if profile_id == self.view_profile_id else None
+        if event_type == "account_live":
+            data = _normalize_live_result(event)
+            self.account_live_states[runtime_key] = {
+                **data,
+                "checked_at": time.time(),
+            }
+            if data["status"] == TOKEN_LIVE:
+                self.resolved_uids[runtime_key] = data["uid"]
+            if card is not None:
+                card.set_token_status(data["status"])
+                if data["status"] == TOKEN_LIVE:
+                    card.set_runtime(uid=data["uid"])
+            if message:
+                self.log(message, account_key, profile_id)
+            self._update_aggregate()
+            self._update_profile_card(profile_id)
+            return
         if event_type == "delay":
             remaining = event.get("remaining")
             if not isinstance(remaining, int) or isinstance(remaining, bool):

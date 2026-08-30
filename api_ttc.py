@@ -3532,6 +3532,66 @@ def _is_comment_pending_approval(evidence):
     )
 
 
+FACEBOOK_LIVE = "LIVE"
+FACEBOOK_DIE_TOKEN = "DIE_TOKEN"
+FACEBOOK_CHECK_ERROR = "CHECK_ERROR"
+
+
+@dataclass(frozen=True)
+class FacebookLiveCheckResult:
+    status: str
+    uid: str = None
+    reason: str = ""
+    http_status: int = None
+
+    def to_dict(self):
+        return {
+            "status": self.status,
+            "uid": self.uid,
+            "reason": self.reason,
+            "http_status": self.http_status,
+        }
+
+
+def _normalize_facebook_live_result(result):
+    if isinstance(result, FacebookLiveCheckResult):
+        status = result.status
+        uid = result.uid
+        reason = result.reason
+        http_status = result.http_status
+    elif isinstance(result, dict):
+        status = result.get("status")
+        uid = result.get("uid")
+        reason = result.get("reason", "")
+        http_status = result.get("http_status")
+    else:
+        return FacebookLiveCheckResult(
+            FACEBOOK_CHECK_ERROR,
+            reason="Kết quả kiểm tra Facebook token không hợp lệ.",
+        )
+
+    status = str(status or "").strip().upper()
+    uid = uid.strip() if isinstance(uid, str) and uid.strip() else None
+    reason = _safe_display_message(_mask_sensitive_text(reason))
+    if not isinstance(http_status, int) or isinstance(http_status, bool):
+        http_status = None
+    if status == FACEBOOK_LIVE and uid:
+        return FacebookLiveCheckResult(
+            status, uid, reason or "Facebook token LIVE", http_status
+        )
+    if status == FACEBOOK_DIE_TOKEN:
+        return FacebookLiveCheckResult(
+            status,
+            reason=reason or "Facebook token đã hết hạn hoặc không hợp lệ.",
+            http_status=http_status,
+        )
+    return FacebookLiveCheckResult(
+        FACEBOOK_CHECK_ERROR,
+        reason=reason or "Không thể xác minh Facebook token.",
+        http_status=http_status,
+    )
+
+
 class AUTO_Action:
     def __init__(self, log_fn=None):
         self.url = 'https://b-graph.facebook.com/graphql'
@@ -3589,7 +3649,7 @@ class AUTO_Action:
         }
         printers.get(level, print_info)(message)
 
-    def get_info(self, token):
+    def check_live(self, token):
         client_trace_id = str(uuid.uuid4())
         payload = {
             "method": "post",
@@ -3620,22 +3680,80 @@ class AUTO_Action:
                     )
                     time.sleep(NETWORK_RETRY_DELAY)
                     continue
-                return None, f"Facebook get_info timeout/lỗi mạng: {exc}"
+                return FacebookLiveCheckResult(
+                    FACEBOOK_CHECK_ERROR,
+                    reason=_safe_display_message(_mask_sensitive_text(
+                        f"Facebook get_info timeout/lỗi mạng: {exc}"
+                    )),
+                )
+        http_status = getattr(res, "status_code", None)
+        if not isinstance(http_status, int) or isinstance(http_status, bool):
+            http_status = None
         try:
             res_json = res.json()
-        except:
-            return None, "Lỗi parse JSON (Có thể token die or Acc bị cp 282)"
+        except (TypeError, ValueError) as exc:
+            return FacebookLiveCheckResult(
+                FACEBOOK_CHECK_ERROR,
+                reason=_safe_display_message(_mask_sensitive_text(
+                    f"Lỗi parse JSON khi kiểm tra Facebook token: {exc}"
+                )),
+                http_status=http_status,
+            )
+        if not isinstance(res_json, dict):
+            return FacebookLiveCheckResult(
+                FACEBOOK_CHECK_ERROR,
+                reason="Facebook trả về dữ liệu identity không hợp lệ.",
+                http_status=http_status,
+            )
         if "errors" in res_json:
-            for err in res_json["errors"]:
-                if "access_token" in err.get("message", "").lower():
-                    return None, "Token đã die (hết hạn hoặc không hợp lệ)"
-                return None, err.get("message", "Lỗi GraphQL")
+            errors = res_json.get("errors")
+            if not isinstance(errors, list):
+                errors = []
+            messages = []
+            for err in errors:
+                if not isinstance(err, dict):
+                    continue
+                message = str(err.get("message") or "").strip()
+                if message:
+                    messages.append(message)
+                if "access_token" in message.lower():
+                    return FacebookLiveCheckResult(
+                        FACEBOOK_DIE_TOKEN,
+                        reason="Facebook token đã hết hạn hoặc không hợp lệ.",
+                        http_status=http_status,
+                    )
+            return FacebookLiveCheckResult(
+                FACEBOOK_CHECK_ERROR,
+                reason=_safe_display_message(_mask_sensitive_text(
+                    messages[0] if messages else "Lỗi GraphQL không xác định."
+                )),
+                http_status=http_status,
+            )
         response_data = res_json.get("data") if isinstance(res_json, dict) else None
         me = response_data.get("me") if isinstance(response_data, dict) else None
         user_id = me.get("id") if isinstance(me, dict) else None
         if isinstance(user_id, str) and user_id.strip():
-            return user_id.strip(), "OK"
-        return None, "Không tìm thấy user_id trong response (có thể token die)"
+            return FacebookLiveCheckResult(
+                FACEBOOK_LIVE,
+                uid=user_id.strip(),
+                reason="Facebook token LIVE",
+                http_status=http_status,
+            )
+        return FacebookLiveCheckResult(
+            FACEBOOK_CHECK_ERROR,
+            reason="Không tìm thấy user_id trong Facebook identity response.",
+            http_status=http_status,
+        )
+
+    def get_info(self, token):
+        """Compatibility adapter for existing CLI and external callers."""
+        result = self.check_live(token)
+        if result.status == FACEBOOK_LIVE:
+            return result.uid, "OK"
+        return None, result.reason
+
+    def close(self):
+        self._requests.close()
 
     def auto_reaction(self, post_id, reaction_type, token, actor_id):
         raw = f"feedback:{post_id}"
@@ -5227,7 +5345,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                  failed_delay_range=(10, 10), skip_hidden_comments=True,
                  stop_event=None, event_callback=None, metrics=None,
                  action=None, transaction_sleep_fn=None,
-                 configure_remote_uid=True):
+                 configure_remote_uid=True, facebook_live_result=None):
     global total_coin
     enabled_types = normalize_job_types(job_types)
     transaction_sleep_fn = transaction_sleep_fn or time.sleep
@@ -5258,12 +5376,42 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
     set_action_log = getattr(do_job, "set_log_fn", None)
     if event_callback is not None and callable(set_action_log):
         set_action_log(action_log)
-    uid, msg = do_job.get_info(fb_token)
-    if not isinstance(uid, str) or not uid.strip():
-        print("ERROR:" + msg)
-        _emit_runtime_event(event_callback, "error", msg, stage="facebook_identity")
+    preflight_performed = facebook_live_result is None
+    if not preflight_performed:
+        live_result = _normalize_facebook_live_result(facebook_live_result)
+    else:
+        check_live = getattr(do_job, "check_live", None)
+        if callable(check_live):
+            live_result = _normalize_facebook_live_result(check_live(fb_token))
+        else:
+            # Compatibility for injected legacy actions. A missing UID is
+            # ambiguous, so it must never be promoted to DIE_TOKEN.
+            uid, message = do_job.get_info(fb_token)
+            live_result = _normalize_facebook_live_result({
+                "status": FACEBOOK_LIVE if isinstance(uid, str) and uid.strip()
+                else FACEBOOK_CHECK_ERROR,
+                "uid": uid,
+                "reason": "Facebook token LIVE" if isinstance(uid, str) and uid.strip()
+                else message,
+            })
+        _emit_runtime_event(
+            event_callback,
+            "account_live",
+            (
+                f"Facebook token LIVE | UID: {live_result.uid}"
+                if live_result.status == FACEBOOK_LIVE
+                else "Facebook token DIE; bỏ qua account này."
+                if live_result.status == FACEBOOK_DIE_TOKEN
+                else f"Check Facebook token lỗi: {live_result.reason}; bỏ qua lượt account này."
+            ),
+            status=live_result.status,
+            uid=live_result.uid,
+            reason=live_result.reason,
+            http_status=live_result.http_status,
+        )
+    if live_result.status != FACEBOOK_LIVE:
         return 0
-    uid = uid.strip()
+    uid = live_result.uid
 
     if configure_remote_uid:
         api.set_facebook_uid(uid)
@@ -5570,6 +5718,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                             action=do_job,
                             transaction_sleep_fn=transaction_sleep_fn,
                             configure_remote_uid=configure_remote_uid,
+                            facebook_live_result=live_result,
                         )
                         total_done += fallback_done
                     _print_ttc_completion(
@@ -5836,8 +5985,42 @@ class TTCAccountRuntime:
             })
             raise
         finally:
-            if self.api is not None:
-                self.api.close()
+            try:
+                if self.facebook_action is not None:
+                    close_action = getattr(self.facebook_action, "close", None)
+                    if callable(close_action):
+                        close_action()
+            finally:
+                if self.api is not None:
+                    self.api.close()
+
+
+def check_facebook_token(profile_id, account_key, action_factory=None):
+    """Check the latest persisted token without TTC login or account mutation."""
+    profile = get_profile_snapshot(profile_id)
+    account = next(
+        (
+            item for item in profile.get("fb_accounts", [])
+            if facebook_account_key(item) == account_key
+        ),
+        None,
+    )
+    if account is None:
+        raise KeyError("Không tìm thấy Facebook account")
+    token = str(account.get("token") or "").strip()
+    if not token:
+        raise ValueError("Facebook account chưa có token.")
+
+    action = (action_factory or AUTO_Action)()
+    try:
+        check_live = getattr(action, "check_live", None)
+        if not callable(check_live):
+            raise TypeError("Facebook action không hỗ trợ kiểm tra LIVE token.")
+        return _normalize_facebook_live_result(check_live(token))
+    finally:
+        close_action = getattr(action, "close", None)
+        if callable(close_action):
+            close_action()
 
 
 def get_profile_balance(profile_id):

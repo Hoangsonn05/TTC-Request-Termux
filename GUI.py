@@ -469,15 +469,7 @@ class MainWindow(QMainWindow):
         self.runtime_factory = runtime_factory
         self.workers = {}
         self.pending_starts = set()
-        self.run_queue = []
-        self._run_config = None
-        self._stopping_profiles = set()
-        self._next_account_profile_id = None
-        self._next_account_timer = QTimer(self)
-        self._next_account_timer.setSingleShot(True)
-        self._next_account_timer.timeout.connect(self._launch_next_queued)
-        self.profile_lease = None
-        self.run_profile_id = None
+        self.profile_runs = {}
         self.view_profile_id = None
         self.profile_id = None
         self.profile = None
@@ -830,7 +822,10 @@ class MainWindow(QMainWindow):
         return jobs, coin
 
     def _profile_status(self, profile_id, active_keys, pending_keys):
-        if profile_id == self.run_profile_id:
+        run_state = self.profile_runs.get(profile_id)
+        if run_state is not None:
+            if run_state["stopping"]:
+                return "Stopping"
             if any(self.workers[key].stop_event.is_set() for key in active_keys):
                 return "Stopping"
             if active_keys:
@@ -873,18 +868,11 @@ class MainWindow(QMainWindow):
         else:
             run_text = "▶ Chạy"
             has_runnable_accounts = bool(self.core.selected_accounts(profile))
-            other_profile_running = (
-                self.run_profile_id is not None
-                and self.run_profile_id != profile_id
-            )
             run_enabled = (
                 has_runnable_accounts
-                and not other_profile_running
                 and not self._operations
             )
-            if other_profile_running:
-                run_tooltip = "Profile khác đang chạy"
-            elif not has_runnable_accounts:
+            if not has_runnable_accounts:
                 run_tooltip = "Profile không có Facebook account nào đang bật để chạy"
             else:
                 run_tooltip = ""
@@ -937,7 +925,7 @@ class MainWindow(QMainWindow):
             key[0] == profile_id
             for key in (*self.workers, *self.pending_starts)
         )
-        if has_runtime:
+        if has_runtime or profile_id in self.profile_runs:
             return self.stop_profile(profile_id)
         return self.start_profile(profile_id)
 
@@ -1322,26 +1310,47 @@ class MainWindow(QMainWindow):
         else:
             self.start_account(account_key, profile_id=self.view_profile_id)
 
-    def _ensure_profile_lease(self, profile_id):
-        if self.profile_lease is not None:
-            if self.run_profile_id != profile_id:
-                running = self.profiles_by_id.get(self.run_profile_id, {})
-                raise RuntimeError(
-                    f"Profile {running.get('name', self.run_profile_id)} đang chạy. "
-                    "Hãy dừng run-group hiện tại trước khi chạy profile khác."
-                )
-            return
+    def _ensure_profile_run(self, profile_id, config):
+        run_state = self.profile_runs.get(profile_id)
+        if run_state is not None:
+            return run_state
         lease = self.core.ProfileRunLease(profile_id)
         lease.acquire()
-        self.profile_lease = lease
-        self.run_profile_id = profile_id
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(
+            lambda current_profile_id=profile_id:
+            self._launch_next_queued(current_profile_id)
+        )
+        run_state = {
+            "lease": lease,
+            "config": dict(config),
+            "account_template": (),
+            "queue": [],
+            "cycle": 0,
+            "cycle_logged": 0,
+            "stopping": False,
+            "next_timer": timer,
+        }
+        self.profile_runs[profile_id] = run_state
         profile = self.profiles_by_id.get(profile_id, {})
         self.log(
             f"Đã giữ profile run lease cho {profile.get('name', profile_id)}.",
             profile_id=profile_id,
         )
+        return run_state
 
-    def start_account(self, account_key, profile_id=None, queued_start=False):
+    def _active_profile_for_facebook(self, account_key, exclude_profile_id=None):
+        for runtime_profile_id, runtime_account_key in self.workers:
+            if runtime_account_key != account_key:
+                continue
+            if exclude_profile_id is not None and runtime_profile_id == exclude_profile_id:
+                continue
+            return runtime_profile_id
+        return None
+
+    def start_account(self, account_key, profile_id=None, queued_start=False,
+                      config_override=None):
         profile_id = str(profile_id or self.view_profile_id or "")
         runtime_key = self._runtime_key(profile_id, account_key)
         if runtime_key in self.workers:
@@ -1362,15 +1371,27 @@ class MainWindow(QMainWindow):
                 "Hãy dừng/chờ account hiện tại trước.",
             )
             return False
+        active_profile_id = self._active_profile_for_facebook(
+            account_key, exclude_profile_id=profile_id
+        )
+        if active_profile_id is not None:
+            active_profile = self.profiles_by_id.get(active_profile_id, {})
+            QMessageBox.warning(
+                self,
+                "Facebook account đang chạy",
+                "Facebook account này đang chạy ở profile "
+                f"{active_profile.get('name', active_profile_id)}.\n"
+                "Không thể chạy đồng thời cùng một Facebook identity ở hai profile.",
+            )
+            return False
         try:
-            if self.run_profile_id is not None and self.run_profile_id != profile_id:
-                running = self.profiles_by_id.get(self.run_profile_id, {})
-                raise RuntimeError(
-                    f"Profile {running.get('name', self.run_profile_id)} đang chạy. "
-                    "Hãy dừng run-group hiện tại trước khi chạy profile khác."
-                )
             profile = self.core.get_profile_snapshot(profile_id)
-            config = self.core.normalize_run_config(profile.get("run_config"))
+            config_source = (
+                config_override
+                if config_override is not None
+                else profile.get("run_config")
+            )
+            config = self.core.normalize_run_config(config_source)
             account = next(
                 (item for item in profile.get("fb_accounts", [])
                  if self.core.facebook_account_key(item) == account_key),
@@ -1380,10 +1401,10 @@ class MainWindow(QMainWindow):
                 raise ValueError("Facebook account/token không còn hợp lệ.")
             if not str(profile.get("auth_token", "")).strip():
                 raise ValueError("TTC profile chưa có token.")
-            self._ensure_profile_lease(profile_id)
+            self._ensure_profile_run(profile_id, config)
         except Exception as exc:
             QMessageBox.critical(self, "Không thể chạy account", str(exc))
-            self._release_group_if_idle()
+            self._release_profile_if_idle(profile_id)
             return False
 
         self.pending_starts.discard(runtime_key)
@@ -1421,11 +1442,14 @@ class MainWindow(QMainWindow):
         runtime_key = self._runtime_key(profile_id, account_key)
         if runtime_key in self.pending_starts:
             self.pending_starts.discard(runtime_key)
-            self.run_queue = [key for key in self.run_queue if key != runtime_key]
-            if not self.run_queue and self._next_account_profile_id == profile_id:
-                self._next_account_timer.stop()
-                self._next_account_profile_id = None
-            self._release_group_if_idle()
+            run_state = self.profile_runs.get(profile_id)
+            if run_state is not None:
+                run_state["queue"] = [
+                    key for key in run_state["queue"] if key != runtime_key
+                ]
+                if not run_state["queue"]:
+                    run_state["next_timer"].stop()
+            self._release_profile_if_idle(profile_id)
             self._update_controls()
             return
         worker = self.workers.get(runtime_key)
@@ -1447,14 +1471,6 @@ class MainWindow(QMainWindow):
         profile_id = str(profile_id or "").strip()
         if not profile_id or profile_id not in self.profiles_by_id:
             return False
-        if self.run_profile_id is not None and self.run_profile_id != profile_id:
-            running = self.profiles_by_id.get(self.run_profile_id, {})
-            QMessageBox.warning(
-                self, "Profile khác đang chạy",
-                f"Profile {running.get('name', self.run_profile_id)} đang chạy. "
-                "Hãy dừng run-group hiện tại trước khi chạy profile khác.",
-            )
-            return False
         try:
             profile = self.core.get_profile_snapshot(profile_id)
             config = self.core.normalize_run_config(profile.get("run_config"))
@@ -1469,7 +1485,10 @@ class MainWindow(QMainWindow):
                 "Profile không có Facebook account nào đang bật để chạy.",
             )
             return False
-        if any(key[0] == profile_id for key in (*self.workers, *self.pending_starts)):
+        if (
+            profile_id in self.profile_runs
+            or any(key[0] == profile_id for key in (*self.workers, *self.pending_starts))
+        ):
             return False
         candidates = [
             item for item in accounts
@@ -1485,77 +1504,110 @@ class MainWindow(QMainWindow):
             profile_id=profile_id,
         )
         try:
-            self._ensure_profile_lease(profile_id)
+            run_state = self._ensure_profile_run(profile_id, config)
         except Exception as exc:
             QMessageBox.critical(self, "Không thể Start All", str(exc))
             return False
-        self._run_config = dict(config)
-        self._stopping_profiles.discard(profile_id)
-        self.run_queue = [
+        run_state["account_template"] = tuple(
             self._runtime_key(profile_id, self.core.facebook_account_key(account))
             for account in candidates
-        ]
-        self.pending_starts.update(self.run_queue)
-        self._launch_next_queued()
+        )
+        run_state["cycle"] = 1
+        run_state["stopping"] = False
+        run_state["queue"] = list(run_state["account_template"])
+        self.pending_starts.update(run_state["queue"])
+        started = self._launch_next_queued(profile_id)
         self._update_controls()
-        return True
+        return started
 
     def start_all(self):
         return self.start_profile(self.view_profile_id)
 
-    def _launch_next_queued(self):
-        profile_id = self._next_account_profile_id or self.run_profile_id
-        self._next_account_profile_id = None
-        if not profile_id or profile_id in self._stopping_profiles:
-            return
+    def _launch_next_queued(self, profile_id):
+        run_state = self.profile_runs.get(profile_id)
+        if run_state is None or run_state["stopping"]:
+            return False
         if any(key[0] == profile_id for key in self.workers):
-            return
-        runtime_key = next(
-            (key for key in self.run_queue if key[0] == profile_id),
-            None,
-        )
+            return False
+        runtime_key = None
+        while run_state["queue"]:
+            candidate = run_state["queue"].pop(0)
+            if candidate not in self.pending_starts:
+                continue
+            active_profile_id = self._active_profile_for_facebook(
+                candidate[1], exclude_profile_id=profile_id
+            )
+            if active_profile_id is None:
+                runtime_key = candidate
+                break
+            self.pending_starts.discard(candidate)
+            active_profile = self.profiles_by_id.get(active_profile_id, {})
+            self.log(
+                "Bỏ qua Facebook account đang active ở profile "
+                f"{active_profile.get('name', active_profile_id)}; "
+                "không chạy trùng identity giữa hai profile.",
+                candidate[1],
+                profile_id=profile_id,
+            )
         if runtime_key is None:
-            self._release_group_if_idle()
-            return
-        self.run_queue.remove(runtime_key)
+            self._release_profile_if_idle(profile_id)
+            return False
+        if run_state["cycle_logged"] != run_state["cycle"]:
+            self.log(
+                f"Chu kỳ profile {run_state['cycle']}",
+                profile_id=profile_id,
+            )
+            run_state["cycle_logged"] = run_state["cycle"]
+        worker_config = dict(run_state["config"])
+        worker_config["continuous"] = False
         started = self.start_account(
-            runtime_key[1], profile_id=profile_id, queued_start=True
+            runtime_key[1], profile_id=profile_id, queued_start=True,
+            config_override=worker_config,
         )
         if not started:
             self.pending_starts.discard(runtime_key)
-            self.run_queue = [key for key in self.run_queue if key[0] != profile_id]
+            run_state["queue"].clear()
             self.pending_starts = {
                 key for key in self.pending_starts if key[0] != profile_id
             }
-            self._run_config = None
-            self._release_group_if_idle()
+            self._release_profile_if_idle(profile_id)
+            return False
+        return True
 
     def _schedule_next_queued(self, profile_id):
-        if profile_id in self._stopping_profiles:
+        run_state = self.profile_runs.get(profile_id)
+        if run_state is None or run_state["stopping"]:
             return False
-        if not any(key[0] == profile_id for key in self.run_queue):
-            return False
-        config = self._run_config or self.core.normalize_run_config()
+        if not run_state["queue"]:
+            if (
+                not run_state["account_template"]
+                or not run_state["config"].get("continuous", False)
+            ):
+                return False
+            run_state["cycle"] += 1
+            run_state["queue"] = list(run_state["account_template"])
+            self.pending_starts.update(run_state["queue"])
+            run_state["next_timer"].start(0)
+            return True
+        config = run_state["config"]
         delay = random.randint(
             config["account_delay_min"], config["account_delay_max"]
         )
-        self._next_account_profile_id = profile_id
         self.log(
             f"Chờ {delay}s trước Facebook account tiếp theo.",
             profile_id=profile_id,
         )
-        self._next_account_timer.start(delay * 1000)
+        run_state["next_timer"].start(delay * 1000)
         return True
 
     def stop_profile(self, profile_id):
         profile_id = str(profile_id or "").strip()
-        if not profile_id or self.run_profile_id != profile_id:
+        run_state = self.profile_runs.get(profile_id)
+        if not profile_id or run_state is None:
             return False
-        self._stopping_profiles.add(profile_id)
-        if self._next_account_profile_id == profile_id:
-            self._next_account_timer.stop()
-            self._next_account_profile_id = None
-        self.run_queue = [key for key in self.run_queue if key[0] != profile_id]
+        run_state["stopping"] = True
+        run_state["next_timer"].stop()
+        run_state["queue"].clear()
         pending_keys = [
             key for key in self.pending_starts if key[0] == profile_id
         ]
@@ -1564,29 +1616,25 @@ class MainWindow(QMainWindow):
         active_keys = [key for key in self.workers if key[0] == profile_id]
         for _runtime_profile_id, account_key in active_keys:
             self.stop_account(account_key, profile_id=profile_id)
-        if not active_keys:
-            self._stopping_profiles.discard(profile_id)
-            self._run_config = None
         self.log(
             "Đã yêu cầu dừng run-group profile.",
             profile_id=profile_id,
         )
-        self._release_group_if_idle()
+        self._release_profile_if_idle(profile_id)
         self._update_controls()
         return True
 
     def stop_all(self):
-        if self.run_profile_id is not None:
-            return self.stop_profile(self.run_profile_id)
-        self._next_account_timer.stop()
-        self._next_account_profile_id = None
-        self.run_queue.clear()
-        self.pending_starts.clear()
-        for profile_id, account_key in list(self.workers):
-            self.stop_account(account_key, profile_id=profile_id)
-        self._release_group_if_idle()
-        self._update_controls()
-        return True
+        return self.stop_profile(self.view_profile_id)
+
+    def stop_all_profiles(self):
+        profile_ids = set(self.profile_runs)
+        profile_ids.update(key[0] for key in self.workers)
+        profile_ids.update(key[0] for key in self.pending_starts)
+        stopped = False
+        for profile_id in list(profile_ids):
+            stopped = self.stop_profile(profile_id) or stopped
+        return stopped
 
     def _on_worker_event(self, profile_id, account_key, event):
         runtime_key = self._runtime_key(profile_id, account_key)
@@ -1685,21 +1733,26 @@ class MainWindow(QMainWindow):
             self._update_controls()
             self._update_profile_card(profile_id)
             return
-        self._stopping_profiles.discard(profile_id)
-        self._run_config = None
-        self._release_group_if_idle()
+        self._release_profile_if_idle(profile_id)
         self._update_controls()
         self._update_profile_card(profile_id)
         if self._closing and not self.workers and not self.pending_starts:
             QTimer.singleShot(0, self.close)
 
-    def _release_group_if_idle(self):
-        if self.workers or self.pending_starts or self.profile_lease is None:
+    def _release_profile_if_idle(self, profile_id):
+        run_state = self.profile_runs.get(profile_id)
+        if run_state is None:
             return
-        profile_id = self.run_profile_id
-        self.profile_lease.release()
-        self.profile_lease = None
-        self.run_profile_id = None
+        if any(key[0] == profile_id for key in self.workers):
+            return
+        if any(key[0] == profile_id for key in self.pending_starts):
+            return
+        if run_state["queue"] or run_state["next_timer"].isActive():
+            return
+        run_state["lease"].release()
+        run_state["next_timer"].stop()
+        run_state["next_timer"].deleteLater()
+        self.profile_runs.pop(profile_id, None)
         self.log("Đã release profile run lease sau worker cuối.", profile_id=profile_id)
 
     def _update_aggregate(self):
@@ -1713,14 +1766,21 @@ class MainWindow(QMainWindow):
         )
 
     def _update_controls(self):
-        active = bool(self.workers or self.pending_starts)
+        active = bool(self.profile_runs or self.workers or self.pending_starts)
         busy = active or bool(self._operations)
         has_profile = self.view_profile_id is not None
+        view_active = (
+            self.view_profile_id in self.profile_runs
+            or any(
+                key[0] == self.view_profile_id
+                for key in (*self.workers, *self.pending_starts)
+            )
+        )
         can_start_view = (
             has_profile and not self._operations
-            and (self.run_profile_id is None or self.run_profile_id == self.view_profile_id)
+            and not view_active
         )
-        self.stop_all_button.setEnabled(active)
+        self.stop_all_button.setEnabled(view_active)
         self.start_all_button.setEnabled(can_start_view)
         self.profile_combo.setEnabled(has_profile and not self._operations)
         self.refresh_button.setEnabled(not self._operations)
@@ -1749,7 +1809,7 @@ class MainWindow(QMainWindow):
         self._update_dashboard()
 
     def _mutation_allowed(self, require_profile=False):
-        if self.workers or self.pending_starts or self.profile_lease is not None:
+        if self.workers or self.pending_starts or self.profile_runs:
             QMessageBox.warning(
                 self, "Profile đang chạy",
                 "Hãy dừng toàn bộ worker trước khi thay đổi profile/account/config.",
@@ -1773,7 +1833,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         if not self.workers and not self.pending_starts and not self._operations:
-            self._release_group_if_idle()
+            for profile_id in list(self.profile_runs):
+                self._release_profile_if_idle(profile_id)
             event.accept()
             return
         if not self._closing:
@@ -1787,7 +1848,7 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
             self._closing = True
-            self.stop_all()
+            self.stop_all_profiles()
         event.ignore()
 
 

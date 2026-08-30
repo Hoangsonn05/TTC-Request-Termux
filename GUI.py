@@ -469,7 +469,13 @@ class MainWindow(QMainWindow):
         self.runtime_factory = runtime_factory
         self.workers = {}
         self.pending_starts = set()
-        self._start_generation = 0
+        self.run_queue = []
+        self._run_config = None
+        self._stopping_profiles = set()
+        self._next_account_profile_id = None
+        self._next_account_timer = QTimer(self)
+        self._next_account_timer.setSingleShot(True)
+        self._next_account_timer.timeout.connect(self._launch_next_queued)
         self.profile_lease = None
         self.run_profile_id = None
         self.view_profile_id = None
@@ -1335,12 +1341,26 @@ class MainWindow(QMainWindow):
             profile_id=profile_id,
         )
 
-    def start_account(self, account_key, profile_id=None):
+    def start_account(self, account_key, profile_id=None, queued_start=False):
         profile_id = str(profile_id or self.view_profile_id or "")
         runtime_key = self._runtime_key(profile_id, account_key)
         if runtime_key in self.workers:
             return False
         if not profile_id:
+            return False
+        same_profile_active = any(
+            key[0] == profile_id for key in self.workers
+        )
+        same_profile_pending = any(
+            key[0] == profile_id for key in self.pending_starts
+        )
+        if same_profile_active or (same_profile_pending and not queued_start):
+            QMessageBox.warning(
+                self,
+                "Profile đang chạy",
+                "Một Facebook account khác của profile này đang chạy.\n"
+                "Hãy dừng/chờ account hiện tại trước.",
+            )
             return False
         try:
             if self.run_profile_id is not None and self.run_profile_id != profile_id:
@@ -1401,6 +1421,10 @@ class MainWindow(QMainWindow):
         runtime_key = self._runtime_key(profile_id, account_key)
         if runtime_key in self.pending_starts:
             self.pending_starts.discard(runtime_key)
+            self.run_queue = [key for key in self.run_queue if key != runtime_key]
+            if not self.run_queue and self._next_account_profile_id == profile_id:
+                self._next_account_timer.stop()
+                self._next_account_profile_id = None
             self._release_group_if_idle()
             self._update_controls()
             return
@@ -1445,6 +1469,8 @@ class MainWindow(QMainWindow):
                 "Profile không có Facebook account nào đang bật để chạy.",
             )
             return False
+        if any(key[0] == profile_id for key in (*self.workers, *self.pending_starts)):
+            return False
         candidates = [
             item for item in accounts
             if self._runtime_key(profile_id, self.core.facebook_account_key(item))
@@ -1458,44 +1484,78 @@ class MainWindow(QMainWindow):
             "Đã yêu cầu chạy tất cả account đang bật.",
             profile_id=profile_id,
         )
-        self._start_generation += 1
-        generation = self._start_generation
-        cumulative_delay = 0
-        for index, account in enumerate(candidates):
-            key = self.core.facebook_account_key(account)
-            if index > 0:
-                cumulative_delay += random.randint(
-                    config["account_delay_min"], config["account_delay_max"]
-                )
-            if cumulative_delay <= 0:
-                self.start_account(key, profile_id=profile_id)
-                continue
-            runtime_key = self._runtime_key(profile_id, key)
-            self.pending_starts.add(runtime_key)
-            QTimer.singleShot(
-                cumulative_delay * 1000,
-                lambda current_key=runtime_key, token=generation: self._launch_pending(
-                    current_key, token
-                ),
-            )
+        try:
+            self._ensure_profile_lease(profile_id)
+        except Exception as exc:
+            QMessageBox.critical(self, "Không thể Start All", str(exc))
+            return False
+        self._run_config = dict(config)
+        self._stopping_profiles.discard(profile_id)
+        self.run_queue = [
+            self._runtime_key(profile_id, self.core.facebook_account_key(account))
+            for account in candidates
+        ]
+        self.pending_starts.update(self.run_queue)
+        self._launch_next_queued()
         self._update_controls()
         return True
 
     def start_all(self):
         return self.start_profile(self.view_profile_id)
 
-    def _launch_pending(self, runtime_key, generation):
-        if generation != self._start_generation or runtime_key not in self.pending_starts:
+    def _launch_next_queued(self):
+        profile_id = self._next_account_profile_id or self.run_profile_id
+        self._next_account_profile_id = None
+        if not profile_id or profile_id in self._stopping_profiles:
             return
-        self.pending_starts.discard(runtime_key)
-        self.start_account(runtime_key[1], profile_id=runtime_key[0])
-        self._release_group_if_idle()
+        if any(key[0] == profile_id for key in self.workers):
+            return
+        runtime_key = next(
+            (key for key in self.run_queue if key[0] == profile_id),
+            None,
+        )
+        if runtime_key is None:
+            self._release_group_if_idle()
+            return
+        self.run_queue.remove(runtime_key)
+        started = self.start_account(
+            runtime_key[1], profile_id=profile_id, queued_start=True
+        )
+        if not started:
+            self.pending_starts.discard(runtime_key)
+            self.run_queue = [key for key in self.run_queue if key[0] != profile_id]
+            self.pending_starts = {
+                key for key in self.pending_starts if key[0] != profile_id
+            }
+            self._run_config = None
+            self._release_group_if_idle()
+
+    def _schedule_next_queued(self, profile_id):
+        if profile_id in self._stopping_profiles:
+            return False
+        if not any(key[0] == profile_id for key in self.run_queue):
+            return False
+        config = self._run_config or self.core.normalize_run_config()
+        delay = random.randint(
+            config["account_delay_min"], config["account_delay_max"]
+        )
+        self._next_account_profile_id = profile_id
+        self.log(
+            f"Chờ {delay}s trước Facebook account tiếp theo.",
+            profile_id=profile_id,
+        )
+        self._next_account_timer.start(delay * 1000)
+        return True
 
     def stop_profile(self, profile_id):
         profile_id = str(profile_id or "").strip()
         if not profile_id or self.run_profile_id != profile_id:
             return False
-        self._start_generation += 1
+        self._stopping_profiles.add(profile_id)
+        if self._next_account_profile_id == profile_id:
+            self._next_account_timer.stop()
+            self._next_account_profile_id = None
+        self.run_queue = [key for key in self.run_queue if key[0] != profile_id]
         pending_keys = [
             key for key in self.pending_starts if key[0] == profile_id
         ]
@@ -1504,6 +1564,9 @@ class MainWindow(QMainWindow):
         active_keys = [key for key in self.workers if key[0] == profile_id]
         for _runtime_profile_id, account_key in active_keys:
             self.stop_account(account_key, profile_id=profile_id)
+        if not active_keys:
+            self._stopping_profiles.discard(profile_id)
+            self._run_config = None
         self.log(
             "Đã yêu cầu dừng run-group profile.",
             profile_id=profile_id,
@@ -1515,7 +1578,9 @@ class MainWindow(QMainWindow):
     def stop_all(self):
         if self.run_profile_id is not None:
             return self.stop_profile(self.run_profile_id)
-        self._start_generation += 1
+        self._next_account_timer.stop()
+        self._next_account_profile_id = None
+        self.run_queue.clear()
         self.pending_starts.clear()
         for profile_id, account_key in list(self.workers):
             self.stop_account(account_key, profile_id=profile_id)
@@ -1616,6 +1681,12 @@ class MainWindow(QMainWindow):
             )
         worker.deleteLater()
         self.log("Worker đã finished và cleanup.", account_key, profile_id)
+        if self._schedule_next_queued(profile_id):
+            self._update_controls()
+            self._update_profile_card(profile_id)
+            return
+        self._stopping_profiles.discard(profile_id)
+        self._run_config = None
         self._release_group_if_idle()
         self._update_controls()
         self._update_profile_card(profile_id)

@@ -5583,7 +5583,6 @@ class TTCAccountRuntime:
                     metrics=self.metrics,
                     action=self.facebook_action,
                     transaction_sleep_fn=self.transaction_sleep_fn,
-                    configure_remote_uid=False,
                 )
                 if not self.config["continuous"]:
                     break

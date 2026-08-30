@@ -589,6 +589,10 @@ _SENSITIVE_FIELD_RE = re.compile(
     r"(?i)\b(access_token|authorization|cookie|session|token|password|pass|auth)\b\s*[:=]\s*"
     r"(\"[^\"]*\"|'[^']*'|[^\s,;&<>]+)"
 )
+_SENSITIVE_JSON_FIELD_RE = re.compile(
+    r"(?i)([\"'](?:access_token|authorization|cookie|session|token|password|pass|auth)[\"']"
+    r"\s*:\s*)(\"[^\"]*\"|'[^']*'|[^\s,;&<>}]+)"
+)
 _MOJIBAKE_MARKERS = (
     "Ãƒ", "Ã‚", "Ã„", "Ã¡Âº", "Ã¡Â»", "chÃƒ", "Ã„â€˜", "Ã†", "Ã",
     "Â", "â€", "â€™", "â€œ", "â€�", "ðŸ", "ï¿½",
@@ -597,8 +601,14 @@ _MOJIBAKE_MARKERS = (
 
 def _mask_sensitive_text(value: str) -> str:
     text = str(value or "")
+    text = _SENSITIVE_JSON_FIELD_RE.sub(lambda m: f'{m.group(1)}"***"', text)
     text = _SENSITIVE_FIELD_RE.sub(lambda m: f"{m.group(1)}=***", text)
     text = re.sub(r"(?i)(access_token|cookie|session|token)=\S+", r"\1=***", text)
+    text = re.sub(
+        r"(?i)\b(Bearer|OAuth)\s+[A-Za-z0-9._~+/=-]+",
+        r"\1 ***",
+        text,
+    )
     return text
 
 
@@ -2149,9 +2159,9 @@ def print_facebook_job_link(job_link):
 
 
 def print_ttc_server_response(job_type, server_raw_text):
-    """Print TTC evidence without changing its response body."""
+    """Print TTC evidence while masking credential-shaped fields."""
     print_warning(f"[TTC][{job_type}]")
-    print(server_raw_text)
+    print(_mask_sensitive_text(server_raw_text))
 
 
 def print_ttc_exception(context, exc):
@@ -3523,9 +3533,10 @@ def _is_comment_pending_approval(evidence):
 
 
 class AUTO_Action:
-    def __init__(self):
+    def __init__(self, log_fn=None):
         self.url = 'https://b-graph.facebook.com/graphql'
         self._requests = requests.Session()
+        self._log_fn = log_fn
         self.last_comment_evidence = _facebook_comment_response_evidence(None)
         self.id_reaction = {
             'LIKE': 1635855486666999,
@@ -3562,6 +3573,22 @@ class AUTO_Action:
             "X-ZERO-F-DEVICE-ID": '77a256c1-5911-48a4-bafd-fa4316c9f941'
         })
 
+    def set_log_fn(self, log_fn):
+        self._log_fn = log_fn
+
+    def _log(self, message, level="info"):
+        message = _mask_sensitive_text(message)
+        if self._log_fn is not None:
+            self._log_fn(message, level)
+            return
+        printers = {
+            "success": print_success,
+            "warning": print_warning,
+            "error": print_error,
+            "raw": print,
+        }
+        printers.get(level, print_info)(message)
+
     def get_info(self, token):
         client_trace_id = str(uuid.uuid4())
         payload = {
@@ -3587,8 +3614,9 @@ class AUTO_Action:
                 break
             except requests.RequestException as exc:
                 if attempt == 0:
-                    print_warning(
-                        f"Facebook get_info timeout/lỗi mạng: {exc}; thử lại lần cuối..."
+                    self._log(
+                        f"Facebook get_info timeout/lỗi mạng: {exc}; thử lại lần cuối...",
+                        "warning",
                     )
                     time.sleep(NETWORK_RETRY_DELAY)
                     continue
@@ -3663,24 +3691,24 @@ class AUTO_Action:
                 "X-FB-Friendly-Name": "ViewerReactionsMutation",
             }, data=payload, timeout=FB_ACTION_TIMEOUT)
         except requests.RequestException as exc:
-            print_error(f"Facebook reaction timeout/lỗi mạng: {exc}; outcome unknown")
+            self._log(f"Facebook reaction timeout/lỗi mạng: {exc}; outcome unknown", "error")
             return False
         try:
             result = res.json()
         except:
-            print("❌ Lỗi parse JSON")
-            print(res.text[:500])
+            self._log("Lỗi parse JSON phản hồi Facebook reaction.", "error")
+            self._log(res.text[:500], "raw")
             return False
         if "errors" in result:
             for err in result["errors"]:
-                print(f"❌ {err.get('summary')}: {err.get('description')}")
+                self._log(f"{err.get('summary')}: {err.get('description')}", "error")
             return False
         feedback = result.get("data", {}).get("feedback_react", {}).get("feedback", {})
         if feedback.get("viewer_feedback_reaction_key") is not None:
-            print("✅ Reaction thành công!")
+            self._log("Reaction thành công!", "success")
             return True
         else:
-            print("⚠️ Reaction không thành công hoặc phản hồi thiếu dữ liệu.")
+            self._log("Reaction không thành công hoặc phản hồi thiếu dữ liệu.", "warning")
             return False
 
     def auto_cmt(self, post_id, text, token, actor_id):
@@ -3791,17 +3819,17 @@ class AUTO_Action:
                 "X-FB-Friendly-Name": "CommentCreateMutation",
             }, data=payload, timeout=FB_ACTION_TIMEOUT)
         except requests.RequestException as exc:
-            print_error(f"Facebook comment timeout/lỗi mạng: {exc}; outcome unknown")
+            self._log(f"Facebook comment timeout/lỗi mạng: {exc}; outcome unknown", "error")
             return False
         try:
             result = res.json()
         except:
-            print("❌ Lỗi parse JSON")
-            print(res.text[:500])
+            self._log("Lỗi parse JSON phản hồi Facebook comment.", "error")
+            self._log(res.text[:500], "raw")
             return False
         if "errors" in result:
             for err in result["errors"]:
-                print(f"❌ {err.get('summary')}: {err.get('description')}")
+                self._log(f"{err.get('summary')}: {err.get('description')}", "error")
             return False
         else:
             comment_data = result.get("data", {}).get("comment_create", {}).get("comment")
@@ -3821,14 +3849,14 @@ class AUTO_Action:
             )
             parent_matches = parent_post_id is None or parent_post_id == str(post_id)
             if comment_id and parent_matches and returned_text_matches and returned_actor_matches:
-                print("✅ Comment thành công! ID:", comment_data["id"])
+                self._log(f"Comment thành công! ID: {comment_data['id']}", "success")
                 return True
             else:
-                print("⚠️ Phản hồi thành công nhưng thiếu dữ liệu comment.")
+                self._log("Phản hồi thành công nhưng thiếu dữ liệu comment.", "warning")
                 return False
 
 # ---------- Hàm lấy post ID ----------
-def get_facebook_post_id(url):
+def get_facebook_post_id(url, log_fn=None):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -3854,31 +3882,50 @@ def get_facebook_post_id(url):
                 try:
                     uid = html.split('"post_id":"')[1].split('",')[0]
                 except (AttributeError, IndexError):
-                    print("Không tìm thấy Post ID trong phản hồi Facebook.")
+                    if log_fn is None:
+                        print("Không tìm thấy Post ID trong phản hồi Facebook.")
+                    else:
+                        log_fn("Không tìm thấy Post ID trong phản hồi Facebook.", "warning")
                     return None
-                print(f"{Fore.GREEN}{Style.BRIGHT}✅ Post ID: {uid}{Style.RESET_ALL}")
+                if log_fn is None:
+                    print(f"{Fore.GREEN}{Style.BRIGHT}✅ Post ID: {uid}{Style.RESET_ALL}")
+                else:
+                    log_fn(f"Post ID: {uid}", "success")
                 return uid
         except requests.RequestException as exc:
             failure = f"Lấy Post ID timeout/lỗi mạng: {exc}"
 
         if attempt < max_attempts:
-            print(f"{failure}, thử lại {attempt + 1}/{max_attempts}...")
+            message = f"{failure}, thử lại {attempt + 1}/{max_attempts}..."
+            if log_fn is None:
+                print(message)
+            else:
+                log_fn(message, "warning")
             time.sleep(NETWORK_RETRY_DELAY)
         else:
-            print(f"{failure}; đã hết {max_attempts} lần thử.")
+            message = f"{failure}; đã hết {max_attempts} lần thử."
+            if log_fn is None:
+                print(message)
+            else:
+                log_fn(message, "error")
     return None
 
 
-def _resolve_ttc_facebook_post_id(job):
+def _resolve_ttc_facebook_post_id(job, log_fn=None):
     """Use a valid direct ID first, otherwise resolve the normalized object."""
     if job.get("ttc_source") in TTC_DIRECT_POST_ID_JOB_TYPES:
         post_id = job.get("post_id")
         if isinstance(post_id, str) and re.fullmatch(r"[0-9]+", post_id) is not None:
-            print(f"{Fore.GREEN}{Style.BRIGHT}✅ Post ID: {post_id}{Style.RESET_ALL}")
+            if log_fn is None:
+                print(f"{Fore.GREEN}{Style.BRIGHT}✅ Post ID: {post_id}{Style.RESET_ALL}")
+            else:
+                log_fn(f"Post ID: {post_id}", "success")
             return post_id
 
     object_id = job.get("object_id")
-    return get_facebook_post_id(f"https://www.facebook.com/{object_id}")
+    return get_facebook_post_id(
+        f"https://www.facebook.com/{object_id}", log_fn=log_fn
+    )
 
 # ---------- Hàm đếm delay ----------
 def countdown(seconds, message="Chờ"):
@@ -5088,9 +5135,44 @@ def _runtime_stop_requested(stop_event):
 def _emit_runtime_event(event_callback, event_type, message="", **payload):
     if event_callback is None:
         return
-    event = {"type": str(event_type), "message": str(message)}
-    event.update(payload)
+    event = {
+        "type": str(event_type),
+        "message": _mask_sensitive_text(message),
+    }
+    event.update({
+        key: _mask_sensitive_text(value) if isinstance(value, str) else value
+        for key, value in payload.items()
+    })
     event_callback(event)
+
+
+def _runtime_log(event_callback, level, message, terminal_printer=print_info,
+                 **payload):
+    """Keep CLI output while publishing the same worker-local diagnostic."""
+    terminal_printer(message)
+    _emit_runtime_event(
+        event_callback,
+        "runtime_log",
+        message,
+        level=str(level),
+        **payload,
+    )
+
+
+def _runtime_server_response(event_callback, job_type, server_raw_text,
+                             **payload):
+    """Publish masked TTC evidence without changing the CLI evidence path."""
+    print_ttc_server_response(job_type, server_raw_text)
+    safe_raw_text = _mask_sensitive_text(server_raw_text)
+    _emit_runtime_event(
+        event_callback,
+        "runtime_log",
+        f"[TTC][{job_type}]\n{safe_raw_text}",
+        level="raw",
+        job_type=str(job_type),
+        server_raw_text=safe_raw_text,
+        **payload,
+    )
 
 
 def _cooperative_countdown(seconds, message, stop_event=None,
@@ -5157,6 +5239,25 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
         _emit_runtime_event(event_callback, "stopped", "Đã dừng trước khi bắt đầu job.")
         return 0
     do_job = action if action is not None else AUTO_Action()
+
+    def action_log(message, level="info"):
+        printers = {
+            "success": print_success,
+            "warning": print_warning,
+            "error": print_error,
+            "raw": print,
+        }
+        _runtime_log(
+            event_callback,
+            level,
+            message,
+            terminal_printer=printers.get(level, print_info),
+            stage="facebook_action",
+        )
+
+    set_action_log = getattr(do_job, "set_log_fn", None)
+    if event_callback is not None and callable(set_action_log):
+        set_action_log(action_log)
     uid, msg = do_job.get_info(fb_token)
     if not isinstance(uid, str) or not uid.strip():
         print("ERROR:" + msg)
@@ -5186,7 +5287,13 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
         _emit_runtime_event(event_callback, "log", "Không có job TTC phù hợp được chọn.")
         return 0
 
-    print_info(f"Đã lên kế hoạch {len(type_slots)} job, tối đa {max_jobs}.")
+    _runtime_log(
+        event_callback,
+        "info",
+        f"Đã lên kế hoạch {len(type_slots)} job, tối đa {max_jobs}.",
+        jobs_planned=len(type_slots),
+        max_jobs=max_jobs,
+    )
     total_jobs = len(type_slots)
     total_done = 0
     comment_disabled_for_this_turn = False
@@ -5220,21 +5327,48 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                 if not isinstance(item, dict):
                     raise ValueError("TTC adapter returned invalid cooldown metadata")
                 if item.get("source") == "server":
-                    print_ttc_server_response(
-                        item.get("job_type", ""), item.get("server_raw_text", "")
+                    _runtime_server_response(
+                        event_callback,
+                        item.get("job_type", ""),
+                        item.get("server_raw_text", ""),
+                        stage="fetch_cooldown",
                     )
-                    print_info(
-                        f"Tạm chờ job này {item.get('retry_after', 0)} giây."
+                    _runtime_log(
+                        event_callback,
+                        "info",
+                        f"Tạm chờ job này {item.get('retry_after', 0)} giây.",
+                        job_type=item.get("job_type", ""),
+                        retry_after=item.get("retry_after", 0),
                     )
+                _emit_runtime_event(
+                    event_callback,
+                    "endpoint_cooldown",
+                    "TTC endpoint cooldown",
+                    level="warning",
+                    job_type=item.get("job_type", ""),
+                    remaining=item.get("remaining", 0),
+                    retry_at=item.get("retry_at"),
+                    source=item.get("source", ""),
+                )
 
             for item in permanent_skips:
                 if not isinstance(item, dict):
                     raise ValueError("TTC adapter returned invalid permanent-skip metadata")
                 if item.get("source") == "server":
-                    print_ttc_server_response(
-                        item.get("job_type", ""), item.get("server_raw_text", "")
+                    _runtime_server_response(
+                        event_callback,
+                        item.get("job_type", ""),
+                        item.get("server_raw_text", ""),
+                        stage="vip_ineligible",
                     )
-                    print_info("Bỏ qua loại job này trong lượt áp dụng hiện tại.")
+                    _runtime_log(
+                        event_callback,
+                        "warning",
+                        "Bỏ qua loại job này trong lượt áp dụng hiện tại.",
+                        terminal_printer=print_info,
+                        job_type=item.get("job_type", ""),
+                        reason="vip_ineligible",
+                    )
 
             cached_jobs.extend(result["jobs"])
             if cached_jobs:
@@ -5249,10 +5383,9 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                     ]
                 )
                 fetch_retry_at[type_] = time.monotonic() + wait_seconds
-                print_info("Hiện chưa có job TTC phù hợp.")
-                _emit_runtime_event(
-                    event_callback, "log", "Hiện chưa có job TTC phù hợp.",
-                    level="info", job_type=type_,
+                _runtime_log(
+                    event_callback, "info", "Hiện chưa có job TTC phù hợp.",
+                    job_type=type_,
                 )
                 continue
 
@@ -5270,7 +5403,12 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
         else:
             object_id = original_job.get("object_id")
             if not object_id:
-                print_warning("Job TTC thiếu object_id; bỏ qua.")
+                _runtime_log(
+                    event_callback, "warning",
+                    "Job TTC thiếu object_id; bỏ qua.",
+                    terminal_printer=print_warning,
+                    job_id=original_job.get("job_id", ""),
+                )
             else:
                 job_type_display = "LIKE" if type_ == "like_facebook" else "CMT"
                 if type_ == "like_facebook":
@@ -5288,39 +5426,96 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                 _emit_runtime_event(
                     event_callback,
                     "job_started",
-                    f"[{idx}/{total_jobs}] Đang xử lý {job_type_display}",
+                    f"[{idx}/{total_jobs}] Đang xử lý {job_type_display} "
+                    f"(job_id: {original_job.get('job_id', '')}) | "
+                    f"object: {object_id}",
                     index=idx,
                     total=total_jobs,
                     job_type=type_,
                     uid=uid,
                     job_id=original_job.get("job_id", ""),
+                    object_id=object_id,
                 )
                 action_succeeded = False
                 try:
-                    post_id = _resolve_ttc_facebook_post_id(original_job)
+                    post_id = _resolve_ttc_facebook_post_id(
+                        original_job,
+                        log_fn=action_log if event_callback is not None else None,
+                    )
                     if post_id is not None and int(post_id) > 0:
                         if type_ == "like_facebook":
-                            print_info(f"Đang thực hiện {reaction} trên Facebook object {object_id}")
+                            _runtime_log(
+                                event_callback, "info",
+                                f"Đang thực hiện {reaction} trên Facebook object {object_id}",
+                                reaction_type=reaction,
+                                object_id=object_id,
+                                post_id=str(post_id),
+                            )
                             action_succeeded = do_job.auto_reaction(
                                 post_id, reaction, fb_token, uid
                             )
+                            _emit_runtime_event(
+                                event_callback,
+                                "facebook_action_result",
+                                (
+                                    f"Facebook {reaction} thành công."
+                                    if action_succeeded
+                                    else f"Facebook {reaction} thất bại."
+                                ),
+                                level="success" if action_succeeded else "warning",
+                                action="reaction",
+                                reaction_type=reaction,
+                                object_id=object_id,
+                                post_id=str(post_id),
+                                success=bool(action_succeeded),
+                            )
                         else:
-                            print_info(f"Đang thực hiện Comment trên Facebook object {object_id}")
+                            _runtime_log(
+                                event_callback, "info",
+                                f"Đang thực hiện Comment trên Facebook object {object_id}",
+                                object_id=object_id,
+                                post_id=str(post_id),
+                            )
                             action_succeeded = do_job.auto_cmt(
                                 post_id, comment_text, fb_token, uid
+                            )
+                            _emit_runtime_event(
+                                event_callback,
+                                "facebook_action_result",
+                                (
+                                    "Facebook Comment thành công."
+                                    if action_succeeded
+                                    else "Facebook Comment thất bại."
+                                ),
+                                level="success" if action_succeeded else "warning",
+                                action="comment",
+                                object_id=object_id,
+                                post_id=str(post_id),
+                                success=bool(action_succeeded),
                             )
                             comment_evidence = getattr(do_job, "last_comment_evidence", None)
                             if not isinstance(comment_evidence, dict):
                                 comment_evidence = {}
                             if action_succeeded:
                                 if _is_comment_pending_approval(comment_evidence):
-                                    print_warning("Acc yếu bị Facebook ẩn comment.")
+                                    _runtime_log(
+                                        event_callback, "warning",
+                                        "Acc yếu bị Facebook ẩn comment.",
+                                        terminal_printer=print_warning,
+                                        comment_state="pending_approval",
+                                    )
                                     if skip_hidden_comments:
                                         comment_disabled_for_this_turn = True
-                                        print_info("Bỏ qua TTC claim cho Comment này.")
-                                        print_info(
+                                        _runtime_log(
+                                            event_callback, "info",
+                                            "Bỏ qua TTC claim cho Comment này.",
+                                            reason="pending_approval",
+                                        )
+                                        _runtime_log(
+                                            event_callback, "info",
                                             "Bỏ Comment trong lượt hiện tại, "
-                                            "chuyển sang Like tiếp tục làm."
+                                            "chuyển sang Like tiếp tục làm.",
+                                            reason="pending_approval",
                                         )
                         if not comment_disabled_for_this_turn:
                             settle_seconds = (
@@ -5328,12 +5523,20 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                             )
                             transaction_sleep_fn(settle_seconds)
                     else:
-                        print_warning(
+                        _runtime_log(
+                            event_callback, "warning",
                             f"[{idx}/{total_jobs}] {job_type_display} | Không lấy được "
-                            f"Facebook ID cho {original_job.get('job_id', '')}"
+                            f"Facebook ID cho {original_job.get('job_id', '')}",
+                            terminal_printer=print_warning,
+                            job_id=original_job.get("job_id", ""),
                         )
                 except Exception as exc:
-                    print_error(f"[{idx}/{total_jobs}] Lỗi Facebook {type_}: {exc}")
+                    _runtime_log(
+                        event_callback, "error",
+                        f"[{idx}/{total_jobs}] Lỗi Facebook {type_}: {exc}",
+                        terminal_printer=print_error,
+                        stage="facebook_action",
+                    )
                     _emit_runtime_event(
                         event_callback, "error", f"Lỗi Facebook {type_}: {exc}",
                         stage="facebook_action", uid=uid,
@@ -5342,7 +5545,10 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                 if comment_disabled_for_this_turn:
                     remaining_jobs = max_jobs - total_done
                     if remaining_jobs > 0 and not _runtime_stop_requested(stop_event):
-                        print_info("Đang lấy job Like...")
+                        _runtime_log(
+                            event_callback, "info", "Đang lấy job Like...",
+                            reason="comment_pending_fallback",
+                        )
                         fallback_done = run_ttc_jobs(
                             api,
                             fb_token,
@@ -5383,10 +5589,17 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                     ):
                         server_raw_text = result.get("server_raw_text", "")
                         if isinstance(server_raw_text, str) and server_raw_text:
-                            print_ttc_server_response("CLAIM", server_raw_text)
-                        print_warning(
+                            _runtime_server_response(
+                                event_callback, "CLAIM", server_raw_text,
+                                stage="claim_retry",
+                            )
+                        _runtime_log(
+                            event_callback, "warning",
                             "TTC chưa ghi nhận reaction, thử gửi lại kết quả "
-                            f"sau {TTC_CLAIM_RETRY_DELAY} giây..."
+                            f"sau {TTC_CLAIM_RETRY_DELAY} giây...",
+                            terminal_printer=print_warning,
+                            retry_attempt=1,
+                            retry_after=TTC_CLAIM_RETRY_DELAY,
                         )
                         transaction_sleep_fn(TTC_CLAIM_RETRY_DELAY)
                         result = api.submit_job(original_job)
@@ -5416,7 +5629,9 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                         _emit_runtime_event(
                             event_callback,
                             "job_succeeded",
-                            f"{job_type_display} +{format_coin(earned)}",
+                            f"[{idx}/{total_jobs}] {job_type_display} | "
+                            f"+{format_coin(earned)} | "
+                            f"Total: {format_coin(displayed_total)}{balance_text}",
                             uid=uid,
                             jobs_succeeded=(
                                 total_done if metrics is None
@@ -5430,17 +5645,34 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                     else:
                         server_raw_text = result.get("server_raw_text", "")
                         if isinstance(server_raw_text, str) and server_raw_text:
-                            print_ttc_server_response("CLAIM", server_raw_text)
+                            _runtime_server_response(
+                                event_callback, "CLAIM", server_raw_text,
+                                stage="claim_rejected",
+                            )
+                        rejection = result.get("message") or result.get("reason") or "unknown"
                         if claim_retried:
-                            print_warning(
-                                "TTC vẫn không xác nhận job sau 1 lần thử lại."
+                            _runtime_log(
+                                event_callback, "warning",
+                                "TTC vẫn không xác nhận job sau 1 lần thử lại. "
+                                f"Lý do: {rejection}",
+                                terminal_printer=print_warning,
+                                claim_reason=result.get("reason", ""),
+                                retry_attempt=1,
                             )
                         else:
-                            print_warning("TTC không xác nhận job.")
+                            _runtime_log(
+                                event_callback, "warning",
+                                f"TTC không xác nhận job. Lý do: {rejection}",
+                                terminal_printer=print_warning,
+                                claim_reason=result.get("reason", ""),
+                            )
                 else:
-                    print_warning(
+                    _runtime_log(
+                        event_callback, "warning",
                         f"[{idx}/{total_jobs}] {job_type_display} | Thao tác Facebook thất bại; "
-                        "bỏ qua gửi kết quả TTC."
+                        "bỏ qua gửi kết quả TTC.",
+                        terminal_printer=print_warning,
+                        job_id=original_job.get("job_id", ""),
                     )
 
         if idx < total_jobs:

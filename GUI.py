@@ -51,6 +51,20 @@ LOG_LEVEL_COLORS = {
     "api": "#79c0ff",
 }
 
+PROFILE_LOG_DEFAULT = "DEFAULT"
+PROFILE_LOG_SUCCESS = "SUCCESS"
+PROFILE_LOG_DELAY = "DELAY"
+PROFILE_LOG_FAILURE = "FAILURE"
+PROFILE_LOG_INTERACTION_BLOCKED = "INTERACTION_BLOCKED"
+
+PROFILE_LOG_SEMANTIC_COLORS = {
+    PROFILE_LOG_DEFAULT: LOG_LEVEL_COLORS["info"],
+    PROFILE_LOG_SUCCESS: LOG_LEVEL_COLORS["success"],
+    PROFILE_LOG_DELAY: LOG_LEVEL_COLORS["api"],
+    PROFILE_LOG_FAILURE: LOG_LEVEL_COLORS["error"],
+    PROFILE_LOG_INTERACTION_BLOCKED: LOG_LEVEL_COLORS["warning"],
+}
+
 VISIBLE_RUNTIME_STATUSES = {
     "Running": "Đang chạy",
     "Pending": "Đang chờ",
@@ -92,6 +106,36 @@ def _event_log_level(event_type, event):
     if explicit is not None:
         return _normalize_log_level(explicit)
     return EVENT_LOG_LEVELS.get(str(event_type), "info")
+
+
+def _normalize_profile_log_semantic(semantic):
+    semantic = str(semantic or PROFILE_LOG_DEFAULT).strip().upper()
+    if semantic not in PROFILE_LOG_SEMANTIC_COLORS:
+        return PROFILE_LOG_DEFAULT
+    return semantic
+
+
+def _event_profile_log_semantic(event_type, event):
+    event_type = str(event_type)
+    if event_type == core.INTERACTION_BLOCKED_EVENT:
+        return PROFILE_LOG_INTERACTION_BLOCKED
+    if event_type == "delay":
+        return PROFILE_LOG_DELAY
+    if event_type == "job_succeeded":
+        return PROFILE_LOG_SUCCESS
+    if event_type == "completion":
+        jobs_succeeded = event.get("jobs_succeeded")
+        if (
+            isinstance(jobs_succeeded, int)
+            and not isinstance(jobs_succeeded, bool)
+            and jobs_succeeded > 0
+        ):
+            return PROFILE_LOG_SUCCESS
+    if event_type == "facebook_action_result" and event.get("success") is False:
+        return PROFILE_LOG_FAILURE
+    if event_type == "error" and event.get("stage") == "facebook_action":
+        return PROFILE_LOG_FAILURE
+    return PROFILE_LOG_DEFAULT
 
 
 def _scale_application_font(app, factor=APPLICATION_FONT_SCALE):
@@ -363,7 +407,8 @@ class ProfileSummaryCard(QGroupBox):
 
     def update_summary(self, *, name, status, account_count, active_count,
                        pending_count, jobs, coin_text, balance_text, identities,
-                       latest_log, live_status, selected, run_text, run_enabled,
+                       latest_log, latest_log_semantic, live_status, selected,
+                       run_text, run_enabled,
                        token_live_count=0, token_die_count=0,
                        token_error_count=0, token_unknown_count=0,
                        run_tooltip=""):
@@ -402,6 +447,10 @@ class ProfileSummaryCard(QGroupBox):
         )
         self.log_label.setText(
             f"Log : {latest_log or 'Chưa có log trong phiên này'}"
+        )
+        log_semantic = _normalize_profile_log_semantic(latest_log_semantic)
+        self.log_label.setStyleSheet(
+            f"color: {PROFILE_LOG_SEMANTIC_COLORS[log_semantic]};"
         )
         self.live_status_label.setText(
             f"Đang chờ: {live_status}" if live_status else "Đang chờ: —"
@@ -670,6 +719,7 @@ class MainWindow(QMainWindow):
         self.endpoint_cooldowns = {}
         self.profile_account_delays = {}
         self.latest_profile_log = {}
+        self.latest_profile_log_semantics = {}
         self.profile_balances = {}
         self.profile_errors = set()
         self._operations = set()
@@ -914,7 +964,8 @@ class MainWindow(QMainWindow):
             {},
         )
 
-    def log(self, message, account_key=None, profile_id=None, level=None):
+    def log(self, message, account_key=None, profile_id=None, level=None,
+            semantic=None):
         timestamp = datetime.now().strftime("%H:%M:%S")
         masker = getattr(self.core, "_mask_sensitive_text", None)
         if callable(masker):
@@ -944,6 +995,9 @@ class MainWindow(QMainWindow):
         self.log_text.ensureCursorVisible()
         if profile_id:
             self.latest_profile_log[profile_id] = formatted
+            self.latest_profile_log_semantics[profile_id] = (
+                _normalize_profile_log_semantic(semantic)
+            )
             self._update_profile_card(profile_id)
 
     def _render_active_delays(self):
@@ -1062,6 +1116,16 @@ class MainWindow(QMainWindow):
                 str(item["profile_id"]): item for item in profiles
             }
             valid_ids = set(self.profiles_by_id)
+            self.latest_profile_log = {
+                profile_id: latest_log
+                for profile_id, latest_log in self.latest_profile_log.items()
+                if profile_id in valid_ids
+            }
+            self.latest_profile_log_semantics = {
+                profile_id: semantic
+                for profile_id, semantic in self.latest_profile_log_semantics.items()
+                if profile_id in valid_ids
+            }
             active_id = data.get("active_profile_id")
             active_id = str(active_id) if active_id is not None else None
             selected_id = previous_id if previous_id in valid_ids else active_id
@@ -1212,6 +1276,7 @@ class MainWindow(QMainWindow):
             balance_text=balance_text,
             identities=", ".join(identities),
             latest_log=self.latest_profile_log.get(profile_id),
+            latest_log_semantic=self.latest_profile_log_semantics.get(profile_id),
             live_status=self._profile_live_status(profile_id),
             token_live_count=token_counts[TOKEN_LIVE],
             token_die_count=token_counts[TOKEN_DIE],
@@ -2043,6 +2108,7 @@ class MainWindow(QMainWindow):
         self.log(
             f"Chờ {delay}s trước Facebook account tiếp theo.",
             profile_id=profile_id,
+            semantic=PROFILE_LOG_DELAY if delay > 0 else PROFILE_LOG_DEFAULT,
         )
         if delay > 0:
             self.profile_account_delays[profile_id] = {
@@ -2119,6 +2185,7 @@ class MainWindow(QMainWindow):
                 self.log(
                     message, account_key, profile_id,
                     level=_event_log_level(event_type, event),
+                    semantic=_event_profile_log_semantic(event_type, event),
                 )
             self._update_aggregate()
             self._update_profile_card(profile_id)
@@ -2159,6 +2226,7 @@ class MainWindow(QMainWindow):
                 self.log(
                     f"{message}: {remaining}s", account_key, profile_id,
                     level="warning",
+                    semantic=_event_profile_log_semantic(event_type, event),
                 )
             self._update_aggregate()
             self._update_profile_card(profile_id)
@@ -2222,6 +2290,7 @@ class MainWindow(QMainWindow):
                 account_key,
                 profile_id,
                 level=_event_log_level(event_type, event),
+                semantic=_event_profile_log_semantic(event_type, event),
             )
         self._update_aggregate()
         self._update_profile_card(profile_id)

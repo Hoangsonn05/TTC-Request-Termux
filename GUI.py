@@ -74,6 +74,7 @@ EVENT_LOG_LEVELS = {
     "cycle": "info",
     "job_started": "info",
     "account_live": "info",
+    core.INTERACTION_BLOCKED_EVENT: "warning",
 }
 
 
@@ -165,6 +166,7 @@ class JobWorker(QThread):
         self.result = None
         self.error = None
         self._error_event_forwarded = False
+        self.interaction_blocked_event = None
 
     def request_stop(self):
         self.stop_event.set()
@@ -177,6 +179,8 @@ class JobWorker(QThread):
         payload = dict(event)
         if payload.get("type") == "error":
             self._error_event_forwarded = True
+        if payload.get("type") == core.INTERACTION_BLOCKED_EVENT:
+            self.interaction_blocked_event = dict(payload)
         self.event_signal.emit(self.profile_id, self.account_key, payload)
 
     def run(self):
@@ -1750,6 +1754,7 @@ class MainWindow(QMainWindow):
             "cycle_logged": 0,
             "stopping": False,
             "next_timer": timer,
+            "blocked_accounts": set(),
         }
         self.profile_runs[profile_id] = run_state
         profile = self.profiles_by_id.get(profile_id, {})
@@ -1968,6 +1973,9 @@ class MainWindow(QMainWindow):
             candidate = run_state["queue"].pop(0)
             if candidate not in self.pending_starts:
                 continue
+            if candidate[1] in run_state["blocked_accounts"]:
+                self.pending_starts.discard(candidate)
+                continue
             active_profile_id = self._active_profile_for_facebook(
                 candidate[1], exclude_profile_id=profile_id
             )
@@ -2019,7 +2027,12 @@ class MainWindow(QMainWindow):
             ):
                 return False
             run_state["cycle"] += 1
-            run_state["queue"] = list(run_state["account_template"])
+            run_state["queue"] = [
+                runtime_key for runtime_key in run_state["account_template"]
+                if runtime_key[1] not in run_state["blocked_accounts"]
+            ]
+            if not run_state["queue"]:
+                return False
             self.pending_starts.update(run_state["queue"])
             run_state["next_timer"].start(0)
             return True
@@ -2088,6 +2101,28 @@ class MainWindow(QMainWindow):
         event_type = event.get("type")
         message = event.get("message", "")
         card = self.account_widgets.get(account_key) if profile_id == self.view_profile_id else None
+        if event_type == core.INTERACTION_BLOCKED_EVENT:
+            status = str(event.get("status") or message).strip()
+            run_state = self.profile_runs.get(profile_id)
+            if run_state is not None:
+                run_state["blocked_accounts"].add(account_key)
+                run_state["queue"] = [
+                    key for key in run_state["queue"] if key != runtime_key
+                ]
+                self.pending_starts.discard(runtime_key)
+            self._clear_runtime_waits(runtime_key)
+            self._ensure_live_wait_timer()
+            self.account_statuses[runtime_key] = status
+            if card is not None:
+                card.set_runtime(status=status)
+            if message:
+                self.log(
+                    message, account_key, profile_id,
+                    level=_event_log_level(event_type, event),
+                )
+            self._update_aggregate()
+            self._update_profile_card(profile_id)
+            return
         if event_type == "account_live":
             data = _normalize_live_result(event)
             self.account_live_states[runtime_key] = {
@@ -2210,7 +2245,17 @@ class MainWindow(QMainWindow):
         balance = metrics.get("balance")
         if isinstance(balance, int) and not isinstance(balance, bool):
             self.profile_balances[profile_id] = balance
-        if worker.error is not None:
+        blocked_event = getattr(worker, "interaction_blocked_event", None)
+        if isinstance(blocked_event, dict):
+            status = str(
+                blocked_event.get("status")
+                or blocked_event.get("message")
+                or self.account_statuses.get(runtime_key, "")
+            ).strip()
+            run_state = self.profile_runs.get(profile_id)
+            if run_state is not None:
+                run_state["blocked_accounts"].add(account_key)
+        elif worker.error is not None:
             status = "Error"
         elif worker.stop_event.is_set():
             status = "Stopped"

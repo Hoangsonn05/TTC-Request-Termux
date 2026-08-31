@@ -18,6 +18,7 @@ import html
 import logging
 import threading
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from urllib.parse import unquote
 
@@ -54,6 +55,65 @@ FACEBOOK_REACTION_TRANSIENT_SUMMARY = "something went wrong"
 FACEBOOK_REACTION_TRANSIENT_DESCRIPTION = (
     "we're having trouble completing your request. please try again."
 )
+INTERACTION_BLOCKED = "INTERACTION_BLOCKED"
+INTERACTION_BLOCKED_EVENT = "interaction_blocked"
+_INTERACTION_BLOCKED_FEATURE_TEXT = (
+    "sorry, this feature isn't available right now"
+)
+_INTERACTION_BLOCKED_SECURITY_TEXT = (
+    "a security check is required to proceed"
+)
+
+
+def _normalize_facebook_interaction_error_text(value):
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    text = text.translate(str.maketrans({
+        "’": "'", "‘": "'", "`": "'", "´": "'",
+        "‐": " ", "‑": " ", "‒": " ", "–": " ", "—": " ", "―": " ",
+    }))
+    return " ".join(text.casefold().split())
+
+
+def _facebook_interaction_block_message(errors):
+    """Return the precise Facebook security-check error, otherwise None."""
+    if not isinstance(errors, list):
+        return None
+    for error in errors:
+        if not isinstance(error, dict):
+            continue
+        parts = [
+            str(error.get(field) or "").strip()
+            for field in ("message", "summary", "description")
+        ]
+        parts = [part for part in parts if part]
+        combined = " ".join(parts)
+        normalized = _normalize_facebook_interaction_error_text(combined)
+        if (
+            _INTERACTION_BLOCKED_FEATURE_TEXT in normalized
+            and _INTERACTION_BLOCKED_SECURITY_TEXT in normalized
+        ):
+            return combined
+    return None
+
+
+def _interaction_blocked_status(blocked_at):
+    return (
+        "Tài khoản bị block tương tác lúc "
+        f"{blocked_at.strftime('%d/%m/%Y %H:%M:%S')}"
+    )
+
+
+class FacebookInteractionBlocked(RuntimeError):
+    """Account-fatal Facebook auto-action security check for this run only."""
+
+    classification = INTERACTION_BLOCKED
+
+    def __init__(self, response_message, blocked_at=None):
+        self.response_message = str(response_message or "").strip()
+        self.blocked_at = blocked_at or datetime.now().astimezone()
+        if not isinstance(self.blocked_at, datetime):
+            raise TypeError("blocked_at must be a datetime")
+        super().__init__(_interaction_blocked_status(self.blocked_at))
 
 # =====================================================================
 # TTC API implementation
@@ -3835,6 +3895,9 @@ class AUTO_Action:
         if errors is not None:
             if not isinstance(errors, list):
                 errors = []
+            blocked_message = _facebook_interaction_block_message(errors)
+            if blocked_message is not None:
+                raise FacebookInteractionBlocked(blocked_message)
             error_texts = [
                 self._reaction_error_text(item)
                 for item in errors
@@ -4092,6 +4155,9 @@ class AUTO_Action:
             self._log(res.text[:500], "raw")
             return False
         if "errors" in result:
+            blocked_message = _facebook_interaction_block_message(result.get("errors"))
+            if blocked_message is not None:
+                raise FacebookInteractionBlocked(blocked_message)
             for err in result["errors"]:
                 summary, description = self._reaction_error_text(err)
                 raw_text = " — ".join(
@@ -5877,6 +5943,8 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                             terminal_printer=print_warning,
                             job_id=original_job.get("job_id", ""),
                         )
+                except FacebookInteractionBlocked:
+                    raise
                 except Exception as exc:
                     _runtime_log(
                         event_callback, "error",
@@ -6176,6 +6244,20 @@ class TTCAccountRuntime:
                 **self.metrics,
             })
             return dict(self.metrics)
+        except FacebookInteractionBlocked as exc:
+            blocked_at = exc.blocked_at.isoformat()
+            status = _interaction_blocked_status(exc.blocked_at)
+            self.metrics["interaction_blocked_at"] = blocked_at
+            self._handle_event({
+                "type": INTERACTION_BLOCKED_EVENT,
+                "message": status,
+                "status": status,
+                "classification": exc.classification,
+                "blocked_at": blocked_at,
+                "facebook_message": exc.response_message,
+                **self.metrics,
+            })
+            return dict(self.metrics)
         except Exception as exc:
             self._handle_event({
                 "type": "error",
@@ -6305,6 +6387,7 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
     )
     cycle = 1
     ttc_fetch_state = TTCFetchState()
+    blocked_accounts_this_session = set()
     while True:
         print_info(f"=== CHU KỲ {cycle} ===")
         total_all = 0
@@ -6312,6 +6395,9 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
             fb_token = str(acc.get('token') or '').strip()
             if not fb_token:
                 print_warning(f"Tài khoản {idx+1} chưa có token, bỏ qua.")
+                continue
+            account_key = facebook_account_key(acc)
+            if account_key in blocked_accounts_this_session:
                 continue
             identity = str(acc.get('email') or '').strip() or f"Account {idx+1}"
             api = None
@@ -6335,6 +6421,9 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
                     skip_hidden_comments=skip_hidden_comments,
                 )
                 total_all += done
+            except FacebookInteractionBlocked as exc:
+                blocked_accounts_this_session.add(account_key)
+                print_warning(str(exc))
             except Exception as exc:
                 if not print_ttc_exception(f"Lỗi TTC với {identity}.", exc):
                     print_error(f"Lỗi với {identity}: {exc}")
@@ -6346,6 +6435,12 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
                 countdown(account_delay, "Chờ trước Facebook account tiếp theo")
 
         print_info(f"Hoàn thành chu kỳ {cycle}, tổng job: {total_all}")
+        if blocked_accounts_this_session and not any(
+            str(acc.get('token') or '').strip()
+            and facebook_account_key(acc) not in blocked_accounts_this_session
+            for acc in fb_accounts
+        ):
+            break
         if not continuous:
             break
         cycle += 1

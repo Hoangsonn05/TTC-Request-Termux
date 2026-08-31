@@ -131,8 +131,11 @@ def _event_profile_log_semantic(event_type, event):
             and jobs_succeeded > 0
         ):
             return PROFILE_LOG_SUCCESS
-    if event_type == "facebook_action_result" and event.get("success") is False:
-        return PROFILE_LOG_FAILURE
+    if event_type == "facebook_action_result":
+        if event.get("success") is True:
+            return PROFILE_LOG_SUCCESS
+        if event.get("success") is False:
+            return PROFILE_LOG_FAILURE
     if event_type == "error" and event.get("stage") == "facebook_action":
         return PROFILE_LOG_FAILURE
     return PROFILE_LOG_DEFAULT
@@ -458,7 +461,7 @@ class ProfileSummaryCard(QGroupBox):
             f"Đang chờ: {live_status}" if live_status else "Đang chờ: —"
         )
         self.live_status_label.setStyleSheet(
-            "color: #f2cc60;" if live_status else "color: #9aa4b2;"
+            "color: #79c0ff;" if live_status else "color: #9aa4b2;"
         )
         border = "#58a6ff" if selected else "#44505f"
         self.setStyleSheet(
@@ -1217,11 +1220,11 @@ class MainWindow(QMainWindow):
             if run_state["stopping"]:
                 return "Stopping"
             if any(self.workers[key].stop_event.is_set() for key in active_keys):
-                return "Đang Dừng"
+                return "Stopping"
             if active_keys:
-                return "Đang Chạy"
+                return "Running"
             if pending_keys:
-                return "Đang chờ chuyển Tk"
+                return "Pending"
         if profile_id in self.profile_errors:
             return "Error"
         return "Idle"

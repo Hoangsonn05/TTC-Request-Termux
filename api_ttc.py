@@ -6025,7 +6025,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                             metrics=metrics,
                             action=do_job,
                             transaction_sleep_fn=transaction_sleep_fn,
-                            configure_remote_uid=configure_remote_uid,
+                            configure_remote_uid=False,
                             facebook_live_result=live_result,
                         )
                         total_done += fallback_done

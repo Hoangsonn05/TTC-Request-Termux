@@ -1838,7 +1838,11 @@ TTCClient.submit_job = _submit_job_alias
 # =====================================================================
 
 class TTCFetchState:
-    """Non-persistent endpoint state shared only by one automatic run."""
+    """Non-persistent endpoint state shared only by one profile run.
+
+    Temporary TTC endpoint cooldowns belong to the profile run, while VIP
+    eligibility and endpoint rotation remain scoped to each Facebook UID.
+    """
 
     def __init__(self):
         self.permanent_skip = set()
@@ -1898,15 +1902,15 @@ class API_TTC:
         eligible = {}
         for index, job_type in enumerate(job_types):
             endpoint_key = job_type.value
-            state_key = (self._facebook_uid, endpoint_key)
-            if state_key in self._fetch_state.permanent_skip:
+            uid_endpoint_key = (self._facebook_uid, endpoint_key)
+            if uid_endpoint_key in self._fetch_state.permanent_skip:
                 permanent_skips.append({
                     "job_type": endpoint_key,
                     "source": "local",
                 })
                 continue
 
-            retry_at = self._fetch_state.temporary_retry_at.get(state_key)
+            retry_at = self._fetch_state.temporary_retry_at.get(endpoint_key)
             if retry_at is not None:
                 if now < retry_at:
                     cooldowns.append({
@@ -1916,9 +1920,9 @@ class API_TTC:
                         "source": "local",
                     })
                     continue
-                del self._fetch_state.temporary_retry_at[state_key]
+                del self._fetch_state.temporary_retry_at[endpoint_key]
 
-            eligible[index] = (job_type, state_key)
+            eligible[index] = (job_type, uid_endpoint_key)
 
         if not eligible:
             return {
@@ -1938,7 +1942,7 @@ class API_TTC:
             )
             if index in eligible
         )
-        job_type, state_key = eligible[selected_index]
+        job_type, uid_endpoint_key = eligible[selected_index]
         endpoint_key = job_type.value
         self._fetch_state.endpoint_cursor[cursor_key] = (selected_index + 1) % len(job_types)
 
@@ -1947,7 +1951,7 @@ class API_TTC:
             ttc_jobs = self._client.get_jobs(job_type)
         except TTCJobCooldown as exc:
             retry_at = now + exc.retry_after
-            self._fetch_state.temporary_retry_at[state_key] = retry_at
+            self._fetch_state.temporary_retry_at[endpoint_key] = retry_at
             cooldowns.append({
                 "job_type": endpoint_key,
                 "retry_after": exc.retry_after,
@@ -1959,7 +1963,7 @@ class API_TTC:
                 "source": "server",
             })
         except TTCVipIneligibleError as exc:
-            self._fetch_state.permanent_skip.add(state_key)
+            self._fetch_state.permanent_skip.add(uid_endpoint_key)
             permanent_skips.append({
                 "job_type": endpoint_key,
                 "server_raw_text": exc.server_raw_text,
@@ -5724,7 +5728,8 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                     _runtime_log(
                         event_callback,
                         "info",
-                        f"Tạm chờ job này {item.get('retry_after', 0)} giây.",
+                        f"Tạm bỏ qua endpoint này trong "
+                        f"{item.get('retry_after', 0)} giây chờ TTC.",
                         job_type=item.get("job_type", ""),
                         retry_after=item.get("retry_after", 0),
                     )
@@ -5762,6 +5767,19 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
             if cached_jobs:
                 fetch_retry_at.pop(type_, None)
             else:
+                if not result["no_job"] and (cooldowns or permanent_skips):
+                    if cooldowns and not any(
+                            item.get("source") == "server" for item in cooldowns):
+                        wait_seconds = min(
+                            _ttc_no_job_wait_seconds([{
+                                "countdown": item.get("remaining", 0),
+                            }])
+                            for item in cooldowns
+                        )
+                        fetch_retry_at[type_] = time.monotonic() + wait_seconds
+                    else:
+                        fetch_retry_at.pop(type_, None)
+                    continue
                 wait_seconds = _ttc_no_job_wait_seconds(
                     result["no_job"]
                     + [
@@ -6151,7 +6169,8 @@ class TTCAccountRuntime:
 
     def __init__(self, profile_id, auth_token, account, config, worker_id=None,
                  stop_event=None, event_callback=None, api_factory=None,
-                 action_factory=None, transaction_sleep_fn=None):
+                 action_factory=None, transaction_sleep_fn=None,
+                 fetch_state=None):
         self.profile_id = str(profile_id or "").strip()
         self.auth_token = str(auth_token or "").strip()
         self.account = _normalize_account(dict(account or {}))
@@ -6163,7 +6182,9 @@ class TTCAccountRuntime:
         self.api_factory = api_factory or API_TTC
         self.action_factory = action_factory or AUTO_Action
         self.transaction_sleep_fn = transaction_sleep_fn
-        self.fetch_state = TTCFetchState()
+        if fetch_state is not None and not isinstance(fetch_state, TTCFetchState):
+            raise TypeError("fetch_state must be TTCFetchState")
+        self.fetch_state = fetch_state if fetch_state is not None else TTCFetchState()
         self.metrics = {
             "jobs_succeeded": 0,
             "session_coin": 0,

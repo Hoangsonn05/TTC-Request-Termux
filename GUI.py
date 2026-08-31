@@ -197,7 +197,7 @@ class JobWorker(QThread):
     event_signal = pyqtSignal(str, str, object)
 
     def __init__(self, profile_id, auth_token, account, config,
-                 runtime_factory=None, parent=None):
+                 runtime_factory=None, parent=None, fetch_state=None):
         super().__init__(parent)
         self.profile_id = str(profile_id)
         self.account = dict(account)
@@ -205,6 +205,7 @@ class JobWorker(QThread):
         self.auth_token = str(auth_token)
         self.config = dict(config)
         self.runtime_factory = runtime_factory or core.TTCAccountRuntime
+        self.fetch_state = fetch_state
         self.stop_event = threading.Event()
         self.runtime = None
         self.result = None
@@ -237,6 +238,7 @@ class JobWorker(QThread):
                 worker_id=f"{self.profile_id}:{self.account_key[-12:]}",
                 stop_event=self.stop_event,
                 event_callback=self._forward_event,
+                fetch_state=self.fetch_state,
             )
             self.result = self.runtime.run()
         except Exception as exc:
@@ -1820,6 +1822,7 @@ class MainWindow(QMainWindow):
             "stopping": False,
             "next_timer": timer,
             "blocked_accounts": set(),
+            "fetch_state": core.TTCFetchState(),
         }
         self.profile_runs[profile_id] = run_state
         profile = self.profiles_by_id.get(profile_id, {})
@@ -1906,6 +1909,7 @@ class MainWindow(QMainWindow):
             account,
             config,
             runtime_factory=self.runtime_factory,
+            fetch_state=self.profile_runs[profile_id]["fetch_state"],
             parent=self,
         )
         worker.event_signal.connect(self._on_worker_event)

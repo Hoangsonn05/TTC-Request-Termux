@@ -50,7 +50,7 @@ class SinglePhysicalJobFetchTests(unittest.TestCase):
         self.assertEqual([], first_result["jobs"])
         self.assertEqual(first_type.value, first_result["cooldowns"][0]["job_type"])
         self.assertIn(
-            ("facebook-uid", first_type.value),
+            first_type.value,
             adapter._fetch_state.temporary_retry_at,
         )
 

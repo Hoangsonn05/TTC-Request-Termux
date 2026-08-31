@@ -1843,6 +1843,7 @@ class TTCFetchState:
     def __init__(self):
         self.permanent_skip = set()
         self.temporary_retry_at = {}
+        self.endpoint_cursor = {}
 
 
 class API_TTC:
@@ -1890,12 +1891,12 @@ class API_TTC:
         except KeyError as exc:
             raise ValueError(f"Unsupported legacy job type: {legacy_type!r}") from exc
 
-        jobs = []
         no_job = []
         cooldowns = []
         permanent_skips = []
         now = time.monotonic()
-        for job_type in job_types:
+        eligible = {}
+        for index, job_type in enumerate(job_types):
             endpoint_key = job_type.value
             state_key = (self._facebook_uid, endpoint_key)
             if state_key in self._fetch_state.permanent_skip:
@@ -1917,39 +1918,61 @@ class API_TTC:
                     continue
                 del self._fetch_state.temporary_retry_at[state_key]
 
-            try:
-                ttc_jobs = self._client.get_jobs(job_type)
-            except TTCJobCooldown as exc:
-                retry_at = now + exc.retry_after
-                self._fetch_state.temporary_retry_at[state_key] = retry_at
-                cooldowns.append({
-                    "job_type": endpoint_key,
-                    "retry_after": exc.retry_after,
-                    "remaining": exc.retry_after,
-                    "retry_at": retry_at,
-                    "server_raw_text": exc.server_raw_text,
-                    "http_status": exc.http_status,
-                    "content_type": exc.content_type,
-                    "source": "server",
-                })
-                continue
-            except TTCVipIneligibleError as exc:
-                self._fetch_state.permanent_skip.add(state_key)
-                permanent_skips.append({
-                    "job_type": endpoint_key,
-                    "server_raw_text": exc.server_raw_text,
-                    "http_status": exc.http_status,
-                    "content_type": exc.content_type,
-                    "source": "server",
-                })
-                continue
-            except TTCNoJobAvailable as exc:
-                no_job.append({
-                    "job_type": job_type.value,
-                    "countdown": exc.countdown,
-                })
-                continue
+            eligible[index] = (job_type, state_key)
 
+        if not eligible:
+            return {
+                "jobs": [],
+                "no_job": no_job,
+                "cooldowns": cooldowns,
+                "permanent_skips": permanent_skips,
+            }
+
+        cursor_key = (self._facebook_uid, legacy_type)
+        start_index = self._fetch_state.endpoint_cursor.get(cursor_key, 0) % len(job_types)
+        selected_index = next(
+            index
+            for index in (
+                (start_index + offset) % len(job_types)
+                for offset in range(len(job_types))
+            )
+            if index in eligible
+        )
+        job_type, state_key = eligible[selected_index]
+        endpoint_key = job_type.value
+        self._fetch_state.endpoint_cursor[cursor_key] = (selected_index + 1) % len(job_types)
+
+        jobs = []
+        try:
+            ttc_jobs = self._client.get_jobs(job_type)
+        except TTCJobCooldown as exc:
+            retry_at = now + exc.retry_after
+            self._fetch_state.temporary_retry_at[state_key] = retry_at
+            cooldowns.append({
+                "job_type": endpoint_key,
+                "retry_after": exc.retry_after,
+                "remaining": exc.retry_after,
+                "retry_at": retry_at,
+                "server_raw_text": exc.server_raw_text,
+                "http_status": exc.http_status,
+                "content_type": exc.content_type,
+                "source": "server",
+            })
+        except TTCVipIneligibleError as exc:
+            self._fetch_state.permanent_skip.add(state_key)
+            permanent_skips.append({
+                "job_type": endpoint_key,
+                "server_raw_text": exc.server_raw_text,
+                "http_status": exc.http_status,
+                "content_type": exc.content_type,
+                "source": "server",
+            })
+        except TTCNoJobAvailable as exc:
+            no_job.append({
+                "job_type": endpoint_key,
+                "countdown": exc.countdown,
+            })
+        else:
             for original_job in ttc_jobs:
                 scheduler_job = dict(original_job)
                 scheduler_job["type"] = legacy_type

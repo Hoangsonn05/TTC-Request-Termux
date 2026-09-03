@@ -1848,6 +1848,11 @@ class TTCFetchState:
         self.permanent_skip = set()
         self.temporary_retry_at = {}
         self.endpoint_cursor = {}
+        # Session cache: tái sử dụng cookie TTC giữa các account Facebook
+        # trong cùng một profile run, tránh POST login lặp lại.
+        self.cached_cookies = None   # dict hoặc None
+        self.cached_user = None      # str hoặc None
+        self.cached_balance = None   # int hoặc None
 
 
 class API_TTC:
@@ -1872,7 +1877,30 @@ class API_TTC:
         self._facebook_uid = None
 
     def login(self):
-        return self._client.login(self._access_token)
+        fs = self._fetch_state
+        if fs.cached_cookies is not None:
+            # Nạp lại cookie đã cache vào session mới, bỏ qua POST login
+            session_cookies = getattr(self._client._session, "cookies", None)
+            if session_cookies is not None and hasattr(session_cookies, "update"):
+                session_cookies.update(fs.cached_cookies)
+            self._client._token = self._access_token
+            self._client._user = fs.cached_user or ""
+            self._client._initial_balance = fs.cached_balance
+            self._client._authenticated = True
+            return {
+                "user": fs.cached_user,
+                "balance": fs.cached_balance,
+            }
+        # Lần đầu: thực hiện POST login thật, sau đó lưu vào cache
+        result = self._client.login(self._access_token)
+        try:
+            raw_cookies = self._client._session.cookies
+            fs.cached_cookies = dict(raw_cookies) if raw_cookies else {}
+        except Exception:
+            fs.cached_cookies = {}
+        fs.cached_user = self._client._user
+        fs.cached_balance = self._client._initial_balance
+        return result
 
     def use_fetch_state(self, fetch_state):
         if not isinstance(fetch_state, TTCFetchState):
@@ -1934,54 +1962,60 @@ class API_TTC:
 
         cursor_key = (self._facebook_uid, legacy_type)
         start_index = self._fetch_state.endpoint_cursor.get(cursor_key, 0) % len(job_types)
-        selected_index = next(
-            index
-            for index in (
-                (start_index + offset) % len(job_types)
-                for offset in range(len(job_types))
-            )
-            if index in eligible
-        )
-        job_type, uid_endpoint_key = eligible[selected_index]
-        endpoint_key = job_type.value
-        self._fetch_state.endpoint_cursor[cursor_key] = (selected_index + 1) % len(job_types)
 
+        # Thử từng eligible endpoint theo thứ tự cursor; fallback sang endpoint tiếp
+        # nếu gặp Cooldown / VipIneligible / NoJob thay vì bỏ cuộc ngay.
         jobs = []
-        try:
-            ttc_jobs = self._client.get_jobs(job_type)
-        except TTCJobCooldown as exc:
-            retry_at = now + exc.retry_after
-            self._fetch_state.temporary_retry_at[endpoint_key] = retry_at
-            cooldowns.append({
-                "job_type": endpoint_key,
-                "retry_after": exc.retry_after,
-                "remaining": exc.retry_after,
-                "retry_at": retry_at,
-                "server_raw_text": exc.server_raw_text,
-                "http_status": exc.http_status,
-                "content_type": exc.content_type,
-                "source": "server",
-            })
-        except TTCVipIneligibleError as exc:
-            self._fetch_state.permanent_skip.add(uid_endpoint_key)
-            permanent_skips.append({
-                "job_type": endpoint_key,
-                "server_raw_text": exc.server_raw_text,
-                "http_status": exc.http_status,
-                "content_type": exc.content_type,
-                "source": "server",
-            })
-        except TTCNoJobAvailable as exc:
-            no_job.append({
-                "job_type": endpoint_key,
-                "countdown": exc.countdown,
-            })
-        else:
+        tried_any = False
+        for offset in range(len(job_types)):
+            candidate_index = (start_index + offset) % len(job_types)
+            if candidate_index not in eligible:
+                continue
+            job_type, uid_endpoint_key = eligible[candidate_index]
+            endpoint_key = job_type.value
+            tried_any = True
+
+            try:
+                ttc_jobs = self._client.get_jobs(job_type)
+            except TTCJobCooldown as exc:
+                retry_at = now + exc.retry_after
+                self._fetch_state.temporary_retry_at[endpoint_key] = retry_at
+                cooldowns.append({
+                    "job_type": endpoint_key,
+                    "retry_after": exc.retry_after,
+                    "remaining": exc.retry_after,
+                    "retry_at": retry_at,
+                    "server_raw_text": exc.server_raw_text,
+                    "http_status": exc.http_status,
+                    "content_type": exc.content_type,
+                    "source": "server",
+                })
+                continue  # thử endpoint tiếp theo
+            except TTCVipIneligibleError as exc:
+                self._fetch_state.permanent_skip.add(uid_endpoint_key)
+                permanent_skips.append({
+                    "job_type": endpoint_key,
+                    "server_raw_text": exc.server_raw_text,
+                    "http_status": exc.http_status,
+                    "content_type": exc.content_type,
+                    "source": "server",
+                })
+                continue  # thử endpoint tiếp theo
+            except TTCNoJobAvailable as exc:
+                no_job.append({
+                    "job_type": endpoint_key,
+                    "countdown": exc.countdown,
+                })
+                continue  # thử endpoint tiếp theo
+
+            # Endpoint này thành công — cập nhật cursor rồi gom job
+            self._fetch_state.endpoint_cursor[cursor_key] = (candidate_index + 1) % len(job_types)
             for original_job in ttc_jobs:
                 scheduler_job = dict(original_job)
                 scheduler_job["type"] = legacy_type
                 scheduler_job["_ttc_job"] = original_job
                 jobs.append(scheduler_job)
+            break  # có job rồi, không cần thử tiếp
 
         return {
             "jobs": jobs,
@@ -6123,6 +6157,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                                 terminal_printer=print_warning,
                                 claim_reason=result.get("reason", ""),
                             )
+                        break  # Dừng lượt account ngay khi claim bị từ chối
                 elif not action_failure_decision_logged:
                     _runtime_log(
                         event_callback, "error",
@@ -6131,6 +6166,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                         terminal_printer=print_error,
                         job_id=original_job.get("job_id", ""),
                     )
+                    break  # Dừng lượt account ngay khi Facebook action thất bại
 
         if idx < total_jobs:
             if _runtime_stop_requested(stop_event):

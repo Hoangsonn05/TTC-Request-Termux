@@ -1992,7 +1992,11 @@ class API_TTC:
                 })
                 continue  # thử endpoint tiếp theo
             except TTCVipIneligibleError as exc:
-                self._fetch_state.permanent_skip.add(uid_endpoint_key)
+                # Khoá toàn bộ endpoint VIP cho UID này trong phiên chạy
+                for _vip_ep in _VIP_JOB_TYPES:
+                    self._fetch_state.permanent_skip.add(
+                        (self._facebook_uid, _vip_ep)
+                    )
                 permanent_skips.append({
                     "job_type": endpoint_key,
                     "server_raw_text": exc.server_raw_text,
@@ -2542,6 +2546,120 @@ def normalize_run_config(data=None):
             raise ValueError("selected_fb_account_keys không hợp lệ")
         config["selected_fb_account_keys"] = list(dict.fromkeys(selected))
     return config
+
+
+_RUN_CONFIG_FACADE_JOB_TYPES = {
+    "like": ("like_facebook",),
+    "comment": ("like_poster",),
+    "both": ("like_facebook", "like_poster"),
+}
+_RUN_CONFIG_FACADE_FIELDS = frozenset({
+    "job_type",
+    "max_jobs_per_acc",
+    "job_delay_min",
+    "job_delay_max",
+    "account_delay_min",
+    "account_delay_max",
+    "continuous",
+})
+
+
+def get_run_config_facade(run_config=None):
+    """Return the user-facing view; ``None`` delays mean existing mixed ranges."""
+    config = normalize_run_config(run_config)
+    enabled_types = frozenset(config["job_types"])
+    job_type = next(
+        (
+            name for name, mapped_types in _RUN_CONFIG_FACADE_JOB_TYPES.items()
+            if enabled_types == frozenset(mapped_types)
+        ),
+        None,
+    )
+    if job_type is None:
+        raise ValueError("run config has no supported user-facing job type")
+
+    like_delay = (config["like_delay_min"], config["like_delay_max"])
+    comment_delay = (config["comment_delay_min"], config["comment_delay_max"])
+    shared_delay = like_delay if like_delay == comment_delay else (None, None)
+
+    return {
+        "job_type": job_type,
+        "max_jobs_per_acc": config["max_jobs_per_acc"],
+        "job_delay_min": shared_delay[0],
+        "job_delay_max": shared_delay[1],
+        "account_delay_min": config["account_delay_min"],
+        "account_delay_max": config["account_delay_max"],
+        "continuous": config["continuous"],
+    }
+
+
+def apply_run_config_facade(run_config, facade_values):
+    """Apply user-facing values while preserving all other run-config fields."""
+    if not isinstance(facade_values, dict):
+        raise ValueError("simplified run config must be an object")
+    unknown_fields = set(facade_values) - _RUN_CONFIG_FACADE_FIELDS
+    if unknown_fields:
+        raise ValueError(
+            f"Unsupported simplified run-config fields: {sorted(unknown_fields)}"
+        )
+
+    config = normalize_run_config(run_config)
+    if "job_type" in facade_values:
+        job_type = facade_values["job_type"]
+        try:
+            config["job_types"] = list(_RUN_CONFIG_FACADE_JOB_TYPES[job_type])
+        except (KeyError, TypeError) as exc:
+            raise ValueError(
+                "job_type must be one of: like, comment, both"
+            ) from exc
+
+    direct_fields = (
+        "max_jobs_per_acc",
+        "account_delay_min",
+        "account_delay_max",
+        "continuous",
+    )
+    for field in direct_fields:
+        if field in facade_values:
+            config[field] = facade_values[field]
+
+    job_delay_fields = ("job_delay_min", "job_delay_max")
+    job_delay_is_mixed = (
+        all(field in facade_values for field in job_delay_fields)
+        and all(facade_values[field] is None for field in job_delay_fields)
+    )
+    if not job_delay_is_mixed:
+        if "job_delay_min" in facade_values:
+            config["like_delay_min"] = facade_values["job_delay_min"]
+            config["comment_delay_min"] = facade_values["job_delay_min"]
+        if "job_delay_max" in facade_values:
+            config["like_delay_max"] = facade_values["job_delay_max"]
+            config["comment_delay_max"] = facade_values["job_delay_max"]
+
+    return normalize_run_config(config)
+
+
+def run_config_facade_summary(run_config):
+    """Format only values exposed by the simplified run-config facade."""
+    facade = get_run_config_facade(run_config)
+    job_labels = {
+        "like": "Like",
+        "comment": "Comment",
+        "both": "Like+Comment",
+    }
+    if facade["job_delay_min"] is None:
+        delay_summary = "mixed"
+    else:
+        delay_summary = (
+            f"{facade['job_delay_min']}-{facade['job_delay_max']}s"
+        )
+    return (
+        f"Job={job_labels[facade['job_type']]} | "
+        f"max={facade['max_jobs_per_acc']} | "
+        f"delay={delay_summary} | "
+        f"acc={facade['account_delay_min']}-{facade['account_delay_max']}s | "
+        f"continuous={'ON' if facade['continuous'] else 'OFF'}"
+    )
 
 
 def _new_profile(name, auth_token="", fb_accounts=None):
@@ -5698,6 +5816,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
     print(f"{Fore.CYAN}{Style.BRIGHT}📱 Facebook: {uid}{Style.RESET_ALL}")
     _emit_runtime_event(event_callback, "identity", f"Facebook UID: {uid}", uid=uid)
 
+    # Nạp type_slots ban đầu để kiểm tra có job hợp lệ không
     type_slots = schedule_job_types_by_burst(
         enabled_types,
         max_jobs,
@@ -5716,17 +5835,34 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
     _runtime_log(
         event_callback,
         "info",
-        f"Đã lên kế hoạch {len(type_slots)} job, tối đa {max_jobs}.",
-        jobs_planned=len(type_slots),
+        f"Đã lên kế hoạch tối đa {max_jobs} job thành công.",
+        jobs_planned=max_jobs,
         max_jobs=max_jobs,
     )
-    total_jobs = len(type_slots)
+    total_jobs = max_jobs
     total_done = 0
     comment_disabled_for_this_turn = False
     job_cache = {legacy_type: [] for legacy_type in enabled_types}
     fetch_retry_at = {}
+    consecutive_empty = 0
+    _n_enabled_types = max(len(enabled_types), 1)
 
-    for idx, type_ in enumerate(type_slots, start=1):
+    while total_done < max_jobs:
+        if not type_slots:
+            type_slots = schedule_job_types_by_burst(
+                enabled_types,
+                max_jobs,
+                like_batch_limit=like_batch_limit,
+                comment_batch_limit=comment_batch_limit,
+                like_batch_min=like_batch_min,
+                like_batch_max=like_batch_max,
+                comment_batch_min=comment_batch_min,
+                comment_batch_max=comment_batch_max,
+            )
+            if not type_slots:
+                break
+        type_ = type_slots.pop(0)
+        idx = total_done + 1
         if _runtime_stop_requested(stop_event):
             _emit_runtime_event(
                 event_callback, "stopped", "Đã dừng trước job tiếp theo.",
@@ -5737,6 +5873,14 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
         if not cached_jobs:
             retry_at = fetch_retry_at.get(type_)
             if retry_at is not None and time.monotonic() < retry_at:
+                consecutive_empty += 1
+                if consecutive_empty >= _n_enabled_types * 2:
+                    _runtime_log(
+                        event_callback, "info",
+                        "Tất cả job đều đang chờ cooldown, kết thúc lượt tài khoản này.",
+                        terminal_printer=print_info,
+                    )
+                    break
                 continue
 
             result = api.fetch_jobs_for_legacy_type(type_)
@@ -5800,6 +5944,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
             cached_jobs.extend(result["jobs"])
             if cached_jobs:
                 fetch_retry_at.pop(type_, None)
+                consecutive_empty = 0
             else:
                 if not result["no_job"] and (cooldowns or permanent_skips):
                     if cooldowns and not any(
@@ -5813,6 +5958,15 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                         fetch_retry_at[type_] = time.monotonic() + wait_seconds
                     else:
                         fetch_retry_at.pop(type_, None)
+                    consecutive_empty += 1
+                    if consecutive_empty >= _n_enabled_types:
+                        _runtime_log(
+                            event_callback, "info",
+                            "Tất cả loại job đều bị bỏ qua (VIP không đủ điều kiện hoặc cooldown), "
+                            "kết thúc lượt tài khoản này.",
+                            terminal_printer=print_info,
+                        )
+                        break
                     continue
                 wait_seconds = _ttc_no_job_wait_seconds(
                     result["no_job"]
@@ -5827,6 +5981,14 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                     event_callback, "info", "Hiện chưa có job TTC phù hợp.",
                     job_type=type_,
                 )
+                consecutive_empty += 1
+                if consecutive_empty >= _n_enabled_types:
+                    _runtime_log(
+                        event_callback, "info",
+                        "Tất cả loại job đều chưa có tác vụ phù hợp, kết thúc lượt tài khoản này.",
+                        terminal_printer=print_info,
+                    )
+                    break
                 continue
 
         if _runtime_stop_requested(stop_event):
@@ -6099,6 +6261,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                         earned = _normalize_ttc_earned_coin(result.get("earned_coin"))
                         job_succeeded = True
                         total_done += 1
+                        consecutive_empty = 0
                         if metrics is None:
                             total_coin += earned
                             displayed_total = total_coin
@@ -6168,7 +6331,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                     )
                     break  # Dừng lượt account ngay khi Facebook action thất bại
 
-        if idx < total_jobs:
+        if total_done < max_jobs:
             if _runtime_stop_requested(stop_event):
                 _emit_runtime_event(
                     event_callback, "stopped", "Đã dừng sau job hiện tại.",
@@ -6181,7 +6344,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                 delay_range = failed_delay_range
             delay = random.randint(*delay_range)
             if not _cooperative_countdown(
-                    delay, f"Chờ job {idx+1}", stop_event, event_callback):
+                    delay, f"Chờ job {total_done + 1}", stop_event, event_callback):
                 _emit_runtime_event(
                     event_callback, "stopped", "Đã ngắt thời gian chờ để dừng.",
                     jobs_succeeded=total_done,

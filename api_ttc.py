@@ -5154,114 +5154,208 @@ def run_config_summary(config):
     )
 
 
-def configure_run(profile):
-    config = normalize_run_config(profile.get('run_config'))
+_RUN_WIZARD_CANCEL = object()
+
+
+def _is_run_wizard_cancel(raw):
+    return str(raw or "").strip().lower() in {"cancel", "q", "quit"}
+
+
+def _choose_run_job_type():
+    print(f"\n{Fore.YELLOW}=== CHỌN LOẠI JOB ==={Style.RESET_ALL}")
+    print("1. Like")
+    print("2. Comment")
+    print("3. Like + Comment")
+    print("0. Quay lại")
+    choices = {"1": "like", "2": "comment", "3": "both"}
     while True:
-        print(f"\n{Fore.YELLOW}=== CẤU HÌNH CHẠY — {profile['name']} ==={Style.RESET_ALL}")
-        print(run_config_summary(config))
-        print("1. Loại job")
-        print("2. Chạy liên tục")
-        print("3. Max job / Facebook account")
-        print("4. Burst Like min-max")
-        print("5. Burst Comment min-max")
-        print("6. Delay Like min-max")
-        print("7. Delay Comment min-max")
-        print("8. Delay khi job lỗi min-max")
-        print("9. Delay chuyển Facebook account min-max")
-        print(
-            "10. Bỏ Comment khi Facebook ẩn: "
-            f"{'ON' if config['skip_hidden_comments'] else 'OFF'}"
-        )
-        print("11. Reset mặc định")
-        print("12. Quay lại")
-        choice = input("Chọn (1-12): ").strip()
-        candidate = dict(config)
-        changed_fields = ()
-        if choice == '1':
-            print("1. Like | 2. Comment | 3. Cả hai")
-            job_choice = input("Chọn: ").strip()
-            if job_choice == '1':
-                candidate['job_types'] = ['like_facebook']
-            elif job_choice == '2':
-                candidate['job_types'] = ['like_poster']
-            elif job_choice == '3':
-                candidate['job_types'] = ['like_facebook', 'like_poster']
-            else:
-                print_error("Lựa chọn không hợp lệ.")
-                continue
-            changed_fields = ('job_types',)
-        elif choice == '2':
-            candidate['continuous'] = not config['continuous']
-            changed_fields = ('continuous',)
-        elif choice == '3':
-            candidate['max_jobs_per_acc'] = prompt_int(
-                f"Max jobs [{config['max_jobs_per_acc']}]: ", config['max_jobs_per_acc'], 1
-            )
-            changed_fields = ('max_jobs_per_acc',)
-        elif choice == '4':
-            candidate['like_batch_min'], candidate['like_batch_max'] = prompt_range(
-                "Like burst", config['like_batch_min'], config['like_batch_max'], 1
-            )
-            changed_fields = ('like_batch_min', 'like_batch_max')
-        elif choice == '5':
-            candidate['comment_batch_min'], candidate['comment_batch_max'] = prompt_range(
-                "Comment burst", config['comment_batch_min'], config['comment_batch_max'], 1
-            )
-            changed_fields = ('comment_batch_min', 'comment_batch_max')
-        elif choice == '6':
-            candidate['like_delay_min'], candidate['like_delay_max'] = prompt_range(
-                "Like delay", config['like_delay_min'], config['like_delay_max'], 0
-            )
-            changed_fields = ('like_delay_min', 'like_delay_max')
-        elif choice == '7':
-            candidate['comment_delay_min'], candidate['comment_delay_max'] = prompt_range(
-                "Comment delay", config['comment_delay_min'], config['comment_delay_max'], 0
-            )
-            changed_fields = ('comment_delay_min', 'comment_delay_max')
-        elif choice == '8':
-            candidate['failed_delay_min'], candidate['failed_delay_max'] = prompt_range(
-                "Failed delay", config['failed_delay_min'], config['failed_delay_max'], 0
-            )
-            changed_fields = ('failed_delay_min', 'failed_delay_max')
-        elif choice == '9':
-            candidate['account_delay_min'], candidate['account_delay_max'] = prompt_range(
-                "Account delay", config['account_delay_min'], config['account_delay_max'], 0
-            )
-            changed_fields = ('account_delay_min', 'account_delay_max')
-        elif choice == '10':
-            candidate['skip_hidden_comments'] = not config['skip_hidden_comments']
-            changed_fields = ('skip_hidden_comments',)
-        elif choice == '11':
-            candidate = normalize_run_config()
-            changed_fields = tuple(
-                field for field in DEFAULT_RUN_CONFIG if field != 'selected_fb_account_keys'
-            )
-        elif choice == '12':
-            return
-        else:
-            print_error("Lựa chọn không hợp lệ.")
-            continue
-        candidate = normalize_run_config(candidate)
+        choice = input("Chọn (0-3): ").strip()
+        if choice == "0" or _is_run_wizard_cancel(choice):
+            return None
+        if choice in choices:
+            return choices[choice]
+        print_error("Lựa chọn không hợp lệ. Vui lòng chọn 0, 1, 2 hoặc 3.")
 
-        profile_id = profile.get("profile_id")
-        def _mutator(data):
-            prof = get_profile(data, profile_id)
-            if not prof:
-                raise ValueError("Không tìm thấy profile")
-            latest_config = normalize_run_config(prof.get('run_config'))
-            for field in changed_fields:
-                latest_config[field] = candidate[field]
-            prof['run_config'] = latest_config
-            return dict(latest_config)
 
+def _prompt_run_wizard_int(label, current, minimum):
+    while True:
+        raw = input(f"{label} [{current}]: ").strip()
+        if _is_run_wizard_cancel(raw):
+            return _RUN_WIZARD_CANCEL
+        if not raw:
+            return current, False
         try:
-            with profile_run_lock(profile_id):
-                config = mutate_database(_mutator)
-                print_success("Đã lưu cấu hình chạy.")
-        except RuntimeError as e:
-            print_error(str(e))
-        except ValueError as e:
-            print_error(str(e))
+            value = int(raw)
+            if value < minimum:
+                raise ValueError
+            return value, value != current
+        except ValueError:
+            print_error(f"{label} phải là số nguyên >= {minimum}.")
+
+
+def _prompt_run_wizard_range(label, current_min, current_max, minimum):
+    mixed = current_min is None and current_max is None
+    while True:
+        default_min = "riêng theo loại job" if mixed else current_min
+        default_max = "riêng theo loại job" if mixed else current_max
+        raw_min = input(f"{label} min [{default_min}]: ").strip()
+        if _is_run_wizard_cancel(raw_min):
+            return _RUN_WIZARD_CANCEL
+        raw_max = input(f"{label} max [{default_max}]: ").strip()
+        if _is_run_wizard_cancel(raw_max):
+            return _RUN_WIZARD_CANCEL
+
+        if not raw_min and not raw_max:
+            return (current_min, current_max), False
+        if mixed and (not raw_min or not raw_max):
+            print_error(
+                f"{label} đang dùng riêng theo loại job; hãy nhập cả min và max "
+                "hoặc Enter cả hai để giữ nguyên."
+            )
+            continue
+        try:
+            minimum_value = current_min if not raw_min else int(raw_min)
+            maximum_value = current_max if not raw_max else int(raw_max)
+            validated = validate_integer_range(
+                minimum_value, maximum_value, label, minimum
+            )
+            return validated, validated != (current_min, current_max)
+        except (TypeError, ValueError) as exc:
+            print_error(str(exc) or f"{label} không hợp lệ.")
+
+
+def _prompt_run_wizard_bool(label, current):
+    default = "Y/n" if current else "y/N"
+    while True:
+        raw = input(f"{label} [{default}]: ").strip().lower()
+        if _is_run_wizard_cancel(raw):
+            return _RUN_WIZARD_CANCEL
+        if not raw:
+            return current, False
+        if raw in {"y", "yes", "c", "co", "có"}:
+            return True, current is not True
+        if raw in {"n", "no", "k", "khong", "không"}:
+            return False, current is not False
+        print_error("Vui lòng nhập y hoặc n; Enter để giữ nguyên.")
+
+
+def run_wizard_summary(config):
+    facade = get_run_config_facade(config)
+    job_labels = {
+        "like": "Like",
+        "comment": "Comment",
+        "both": "Like + Comment",
+    }
+    if facade["job_delay_min"] is None:
+        job_delay = "riêng theo từng loại job"
+    else:
+        job_delay = f"{facade['job_delay_min']}-{facade['job_delay_max']}s"
+    return (
+        f"Job       : {job_labels[facade['job_type']]}\n"
+        f"Max/acc   : {facade['max_jobs_per_acc']}\n"
+        f"Job delay : {job_delay}\n"
+        f"Acc delay : {facade['account_delay_min']}-{facade['account_delay_max']}s\n"
+        f"Continuous: {'ON' if facade['continuous'] else 'OFF'}"
+    )
+
+
+def _collect_run_wizard_config(run_config):
+    config = normalize_run_config(run_config)
+    facade = get_run_config_facade(config)
+    job_type = _choose_run_job_type()
+    if job_type is None:
+        return None
+
+    print(f"\n{Fore.YELLOW}=== CẤU HÌNH PHIÊN CHẠY ==={Style.RESET_ALL}")
+    print("Enter để giữ giá trị hiện tại; nhập 'cancel' để quay lại.")
+    updates = {"job_type": job_type}
+
+    max_jobs = _prompt_run_wizard_int(
+        "Số job / account", facade["max_jobs_per_acc"], 1
+    )
+    if max_jobs is _RUN_WIZARD_CANCEL:
+        return None
+    if max_jobs[1]:
+        updates["max_jobs_per_acc"] = max_jobs[0]
+
+    if facade["job_delay_min"] is None:
+        print_info("Delay job hiện tại: đang dùng riêng theo từng loại job.")
+    job_delay = _prompt_run_wizard_range(
+        "Delay job", facade["job_delay_min"], facade["job_delay_max"], 0
+    )
+    if job_delay is _RUN_WIZARD_CANCEL:
+        return None
+    if job_delay[1]:
+        updates["job_delay_min"], updates["job_delay_max"] = job_delay[0]
+
+    account_delay = _prompt_run_wizard_range(
+        "Delay chuyển account",
+        facade["account_delay_min"],
+        facade["account_delay_max"],
+        0,
+    )
+    if account_delay is _RUN_WIZARD_CANCEL:
+        return None
+    if account_delay[1]:
+        updates["account_delay_min"], updates["account_delay_max"] = account_delay[0]
+
+    continuous = _prompt_run_wizard_bool("Chạy liên tục", facade["continuous"])
+    if continuous is _RUN_WIZARD_CANCEL:
+        return None
+    if continuous[1]:
+        updates["continuous"] = continuous[0]
+
+    try:
+        candidate = apply_run_config_facade(config, updates)
+    except ValueError as exc:
+        print_error(str(exc))
+        return None
+
+    print(f"\n{Fore.YELLOW}=== XÁC NHẬN PHIÊN CHẠY ==={Style.RESET_ALL}")
+    print(run_wizard_summary(candidate))
+    while True:
+        confirmation = input("Chạy với cấu hình này? (y/n, 0 để quay lại): ").strip().lower()
+        if confirmation in {"y", "yes", "c", "co", "có"}:
+            return candidate, updates
+        if confirmation in {"", "0", "n", "no", "k", "khong", "không"} or _is_run_wizard_cancel(confirmation):
+            return None
+        print_error("Vui lòng nhập y để chạy hoặc n/0 để quay lại.")
+
+
+def configure_run(profile):
+    result = _collect_run_wizard_config(profile.get("run_config"))
+    if result is None:
+        print_info("Đã hủy phiên chạy.")
+        return None
+
+    candidate, facade_updates = result
+    persisted_updates = {"job_types": candidate["job_types"]}
+    direct_fields = (
+        "max_jobs_per_acc",
+        "account_delay_min",
+        "account_delay_max",
+        "continuous",
+    )
+    for field in direct_fields:
+        if field in facade_updates:
+            persisted_updates[field] = candidate[field]
+    if "job_delay_min" in facade_updates:
+        persisted_updates.update({
+            "like_delay_min": candidate["like_delay_min"],
+            "like_delay_max": candidate["like_delay_max"],
+            "comment_delay_min": candidate["comment_delay_min"],
+            "comment_delay_max": candidate["comment_delay_max"],
+        })
+
+    try:
+        config = update_profile_run_config(
+            profile.get("profile_id"), persisted_updates
+        )
+        print_success("Đã lưu cấu hình phiên chạy.")
+        return config
+    except (KeyError, RuntimeError, ValueError) as exc:
+        print_error(str(exc))
+        return None
 
 
 def list_profiles(data):
@@ -6817,31 +6911,51 @@ def show_jobs_for_profile(profile):
 
 def print_menu(profile):
     print("\n" + "=" * 42)
-    print(f"{Fore.MAGENTA}TTC AUTO TOOL{Style.RESET_ALL}")
+    print(f"{Fore.MAGENTA}             TTC AUTO TOOL{Style.RESET_ALL}")
     print("=" * 42)
     print()
     if profile:
-        print("Profile của tab này:")
-        print(f"▶️ {profile['name']}\n")
-
         accounts = profile.get('fb_accounts', [])
         selected = selected_account_keys(profile)
         enabled_count = sum(1 for acc in accounts if facebook_account_key(acc) in selected and str(acc.get("token", "")).strip())
-        print("Facebook đang bật:")
-        print(f"{enabled_count}/{len(accounts)}\n")
+        print(f"Profile   : {profile['name']}")
+        print(f"Facebook  : {enabled_count}/{len(accounts)}\n")
     else:
-        print("Profile của tab này:")
-        print("▶️ CHƯA CHỌN\n")
-        print("Facebook đang bật:")
-        print("0/0\n")
+        print("Profile   : CHƯA CHỌN")
+        print("Facebook  : 0/0\n")
 
-    print("1. Chạy tự động")
-    print("2. Kiểm tra số dư")
-    print("3. Xem jobs")
-    print("4. Quản lý Facebook")
-    print("5. Cấu hình delay / burst")
-    print("6. Quản lý TTC profile")
-    print("7. Thoát")
+    print("1. Chạy job")
+    print("2. Quản lý Facebook")
+    print("3. Quản lý TTC")
+    print("0. Thoát")
+
+
+def ttc_manager():
+    while True:
+        data = load_database()
+        profile = get_profile(data)
+        print(f"\n{Fore.YELLOW}=== QUẢN LÝ TTC ==={Style.RESET_ALL}")
+        print("1. Kiểm tra số dư")
+        print("2. Xem jobs")
+        print("3. Quản lý TTC profile")
+        print("0. Quay lại")
+        choice = input("Chọn (0-3): ").strip()
+        if choice == '1':
+            if profile:
+                check_balance(profile)
+            else:
+                print_error("Chưa có TTC profile.")
+        elif choice == '2':
+            if profile:
+                show_jobs_for_profile(profile)
+            else:
+                print_error("Chưa có TTC profile.")
+        elif choice == '3':
+            profile_manager(data)
+        elif choice == '0':
+            return
+        else:
+            print_error("Lựa chọn không hợp lệ.")
 
 
 def main():
@@ -6865,35 +6979,24 @@ def main():
         data = load_database()
         profile = get_profile(data)
         print_menu(profile)
-        choice = input("Chọn chức năng (1-7): ").strip()
+        choice = input("Chọn chức năng (0-3): ").strip()
         if choice == '1':
             if profile:
-                run_active_profile(profile)
+                config = configure_run(profile)
+                if config is not None:
+                    run_profile = dict(profile)
+                    run_profile['run_config'] = config
+                    run_active_profile(run_profile)
             else:
                 print_error("Chưa có TTC profile.")
         elif choice == '2':
             if profile:
-                check_balance(profile)
-            else:
-                print_error("Chưa có TTC profile.")
-        elif choice == '3':
-            if profile:
-                show_jobs_for_profile(profile)
-            else:
-                print_error("Chưa có TTC profile.")
-        elif choice == '4':
-            if profile:
                 account_manager(profile['profile_id'])
             else:
                 print_error("Chưa có TTC profile.")
-        elif choice == '5':
-            if profile:
-                configure_run(profile)
-            else:
-                print_error("Chưa có TTC profile.")
-        elif choice == '6':
-            profile_manager(data)
-        elif choice == '7':
+        elif choice == '3':
+            ttc_manager()
+        elif choice == '0':
             print_success("Thoát chương trình.")
             break
         else:

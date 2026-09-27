@@ -192,7 +192,7 @@ class MainMenuTests(unittest.TestCase):
 
     def test_ttc_submenu_keeps_balance_jobs_and_profile_management_reachable(self):
         output = io.StringIO()
-        with patch("builtins.input", side_effect=["1", "2", "3", "0"]), patch.object(
+        with patch("builtins.input", side_effect=["4", "5", "6", "0"]), patch.object(
             api_ttc, "load_database", return_value=self.data
         ), patch.object(api_ttc, "get_profile", return_value=self.profile), patch.object(
             api_ttc, "check_balance"

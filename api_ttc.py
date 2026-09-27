@@ -1,3 +1,12 @@
+from __future__ import annotations
+
+import sys
+
+MINIMUM_PYTHON = (3, 9)
+
+if sys.version_info < MINIMUM_PYTHON:
+    raise SystemExit("api_ttc.py requires Python 3.9 or newer.")
+
 import requests
 import time
 import hashlib
@@ -57,9 +66,17 @@ FACEBOOK_REACTION_TRANSIENT_DESCRIPTION = (
 )
 INTERACTION_BLOCKED = "INTERACTION_BLOCKED"
 INTERACTION_BLOCKED_EVENT = "interaction_blocked"
+RUNTIME_DEBUG_ENV = "TTC_DEBUG"
 _INTERACTION_BLOCKED_FEATURE_TEXT = (
     "sorry, this feature isn't available right now"
 )
+
+
+def _runtime_debug_enabled():
+    """Enable runtime diagnostics without adding debug to the normal wizard."""
+    return str(os.environ.get(RUNTIME_DEBUG_ENV, "")).strip().casefold() in {
+        "1", "true", "yes", "on",
+    }
 _INTERACTION_BLOCKED_SECURITY_TEXT = (
     "a security check is required to proceed"
 )
@@ -1992,11 +2009,7 @@ class API_TTC:
                 })
                 continue  # thử endpoint tiếp theo
             except TTCVipIneligibleError as exc:
-                # Khoá toàn bộ endpoint VIP cho UID này trong phiên chạy
-                for _vip_ep in _VIP_JOB_TYPES:
-                    self._fetch_state.permanent_skip.add(
-                        (self._facebook_uid, _vip_ep)
-                    )
+                self._fetch_state.permanent_skip.add(uid_endpoint_key)
                 permanent_skips.append({
                     "job_type": endpoint_key,
                     "server_raw_text": exc.server_raw_text,
@@ -2313,8 +2326,13 @@ def print_ttc_exception(context, exc):
     server_raw_text = getattr(exc, "server_raw_text", "")
     if not isinstance(server_raw_text, str) or not server_raw_text:
         return False
-    print_error(context)
-    print_ttc_server_response(getattr(exc, "job_type", "") or "UNKNOWN", server_raw_text)
+    detail = str(exc).split("[TTC SERVER]", 1)[0].strip()
+    detail = _mask_sensitive_text(detail)
+    print_error(f"{context} {detail}".strip())
+    if _runtime_debug_enabled():
+        print_ttc_server_response(
+            getattr(exc, "job_type", "") or "UNKNOWN", server_raw_text
+        )
     return True
 
 
@@ -4716,9 +4734,7 @@ def view_accounts(profile):
         key = facebook_account_key(account)
         run_mark = "✅" if key in selected else "❌"
         identity = str(account.get('email', '')).strip() or "Manual token"
-        token_view = preview_token(account.get('token', ''))
-        has_2fa = "Có" if str(account.get('secret', '')).strip() else "Không"
-        print(f" {index:>2}. {run_mark} {identity} | token {token_view} | 2FA: {has_2fa}")
+        print(f"[{index}] {run_mark} {identity}")
 
 
 def show_facebook_account_details(profile):
@@ -5077,36 +5093,30 @@ def toggle_account_selection(profile):
         view_accounts(latest_profile)
 
 
-def account_manager(profile_id):
+def account_list_menu(profile):
+    view_accounts(profile)
+    if not profile.get('fb_accounts'):
+        return
     while True:
-        try:
-            profile = get_profile(load_database(), profile_id)
-        except Exception as exc:
-            print_error(f"Không thể đọc dữ liệu mới nhất. {exc}")
-            return
-        if profile is None:
-            print_error("TTC profile không còn tồn tại trong dữ liệu mới nhất.")
-            return
-        print(f"\n{Fore.YELLOW}=== FACEBOOK — {profile['name']} ==={Style.RESET_ALL}")
-        print("1. Xem danh sách")
-        print("2. Xem chi tiết account")
-        print("3. Thêm token thủ công")
-        print("4. Login Facebook hàng loạt & thêm")
-        print("5. Sửa account")
-        print("6. Login lại & cập nhật token")
-        print("7. Xóa account")
-        print("8. Chọn Facebook account được chạy")
-        print("9. Quay lại")
-        choice = input("Chọn (1-9): ").strip()
+        print("\n1. Xem chi tiết tài khoản")
+        print("0. Quay lại")
+        choice = input("Chọn (0-1): ").strip()
         if choice == '1':
-            view_accounts(profile)
-        elif choice == '2':
             show_facebook_account_details(profile)
-        elif choice == '3':
-            token = input("Facebook token: ")
-            if add_manual_account(profile_id, token):
-                print_success("Đã thêm token.")
-        elif choice == '4':
+        elif choice == '0':
+            return
+        else:
+            print_error("Lựa chọn không hợp lệ.")
+
+
+def add_account_menu(profile_id):
+    while True:
+        print(f"\n{Fore.YELLOW}=== THÊM TÀI KHOẢN FACEBOOK ==={Style.RESET_ALL}")
+        print("1. Login UID|PASSWORD|2FA")
+        print("2. Thêm token thủ công")
+        print("0. Quay lại")
+        choice = input("Chọn (0-2): ").strip()
+        if choice == '1':
             print("\nĐịnh dạng:")
             print("UID|PASSWORD|2FA")
             print("\nNhiều account:")
@@ -5121,15 +5131,51 @@ def account_manager(profile_id):
                 batch_login_accounts(profile_id, raw_credentials)
             except ValueError as exc:
                 print_error(str(exc))
+        elif choice == '2':
+            token = input("Facebook token: ")
+            if add_manual_account(profile_id, token):
+                print_success("Đã thêm token.")
+        elif choice == '0':
+            return
+        else:
+            print_error("Lựa chọn không hợp lệ.")
+
+
+def account_manager(profile_id):
+    while True:
+        try:
+            profile = get_profile(load_database(), profile_id)
+        except Exception as exc:
+            print_error(f"Không thể đọc dữ liệu mới nhất. {exc}")
+            return
+        if profile is None:
+            print_error("TTC profile không còn tồn tại trong dữ liệu mới nhất.")
+            return
+        accounts = profile.get('fb_accounts', [])
+        enabled_count = len(selected_accounts(profile))
+        print(f"\n{Fore.YELLOW}======== QUẢN LÝ FACEBOOK ========{Style.RESET_ALL}\n")
+        print(f"Facebook: {enabled_count} bật / {len(accounts)} tổng\n")
+        print("1. Xem danh sách tài khoản")
+        print("2. Thêm tài khoản")
+        print("3. Bật / tắt tài khoản")
+        print("4. Login lại tài khoản")
+        print("5. Sửa tài khoản")
+        print("6. Xóa tài khoản")
+        print("0. Quay lại")
+        choice = input("Chọn (0-6): ").strip()
+        if choice == '1':
+            account_list_menu(profile)
+        elif choice == '2':
+            add_account_menu(profile_id)
+        elif choice == '3':
+            toggle_account_selection(profile)
+        elif choice == '4':
+            relogin_account(profile)
         elif choice == '5':
             edit_account(profile)
         elif choice == '6':
-            relogin_account(profile)
-        elif choice == '7':
             delete_account(profile)
-        elif choice == '8':
-            toggle_account_selection(profile)
-        elif choice == '9':
+        elif choice == '0':
             return
         else:
             print_error("Lựa chọn không hợp lệ.")
@@ -5591,8 +5637,75 @@ def copy_facebook_accounts_from_profile(destination_profile_id):
         return
 
 
-def profile_manager(data):
+def select_profile_menu(data):
     global SESSION_PROFILE_ID
+    print(f"\n{Fore.YELLOW}=== CHỌN PROFILE ĐỂ CHẠY ==={Style.RESET_ALL}")
+    index = _profile_index(data)
+    if index is None:
+        return
+    selected_id = data['profiles'][index]['profile_id']
+    selected_name = data['profiles'][index]['name']
+    try:
+        select_profile_as_default(selected_id)
+        SESSION_PROFILE_ID = selected_id
+        print_success(f"Đã chọn profile để chạy: {selected_name}")
+    except Exception as exc:
+        print_error(f"Không thể lưu thay đổi. Dữ liệu cũ vẫn được giữ nguyên. {exc}")
+
+
+def rename_profile_menu(data):
+    print(f"\n{Fore.YELLOW}=== ĐỔI TÊN PROFILE ==={Style.RESET_ALL}")
+    index = _profile_index(data, "Chọn profile muốn đổi tên: ")
+    if index is None:
+        return
+    profile_id = data['profiles'][index]['profile_id']
+    old_name = data['profiles'][index]['name']
+    name = input("Tên mới: ").strip()
+    if not name:
+        return
+    try:
+        rename_profile(profile_id, name)
+        print_success("Đã đổi tên.")
+    except ProfileInUseError:
+        print_error(
+            f'Không thể đổi tên. Profile "{old_name}" '
+            'đang được sử dụng ở phiên khác.'
+        )
+    except Exception as exc:
+        print_error(f"Không thể lưu thay đổi. Dữ liệu cũ vẫn được giữ nguyên. {exc}")
+
+
+def delete_profile_menu(data):
+    global SESSION_PROFILE_ID
+    print(f"\n{Fore.YELLOW}=== XÓA PROFILE ==={Style.RESET_ALL}")
+    index = _profile_index(data, "Chọn profile muốn xóa: ")
+    if index is None:
+        return
+    profile = data['profiles'][index]
+    fb_count = len(profile.get('fb_accounts', []))
+    print("\n=== XÁC NHẬN XÓA PROFILE ===")
+    print(f"Profile:\n{profile['name']}")
+    print(f"\nFacebook:\n{fb_count} account")
+    print(f"\nTTC token:\n{preview_token(profile.get('auth_token'))}")
+    if input("\nXóa profile này? (y/n): ").strip().lower() not in ['y', 'yes']:
+        return
+    deleted_id = profile['profile_id']
+    deleted_name = profile['name']
+    try:
+        _, new_active_id = delete_profile(deleted_id)
+        if SESSION_PROFILE_ID == deleted_id:
+            SESSION_PROFILE_ID = new_active_id
+        print_success("Đã xóa TTC profile.")
+    except ProfileInUseError:
+        print_error(
+            f'Không thể xóa. Profile "{deleted_name}" '
+            'đang được sử dụng ở phiên khác.'
+        )
+    except Exception as exc:
+        print_error(f"Không thể lưu thay đổi. Dữ liệu cũ vẫn được giữ nguyên. {exc}")
+
+
+def profile_manager(data):
     while True:
         try:
             latest = load_database()
@@ -5610,76 +5723,18 @@ def profile_manager(data):
                 break
         print("Profile của tab này:")
         print(f"▶️ {active_name}\n")
-        print("1. Chọn profile để chạy")
-        print("2. Tạo profile mới")
-        print("3. Đổi tên profile")
-        print("4. Xem / cập nhật TTC token")
-        print("5. Sao chép Facebook từ profile khác")
-        print("6. Xóa profile")
-        print("7. Quay lại")
-        choice = input("Chọn (1-7): ").strip()
+        print("1. Đổi tên profile")
+        print("2. Sao chép Facebook từ profile khác")
+        print("3. Xóa profile")
+        print("0. Quay lại")
+        choice = input("Chọn (0-3): ").strip()
         if choice == '1':
-            print(f"\n{Fore.YELLOW}=== CHỌN PROFILE ĐỂ CHẠY ==={Style.RESET_ALL}")
-            index = _profile_index(data)
-            if index is not None:
-                selected_id = data['profiles'][index]['profile_id']
-                selected_name = data['profiles'][index]['name']
-                try:
-                    select_profile_as_default(selected_id)
-                    SESSION_PROFILE_ID = selected_id
-                    print_success(f"Đã chọn profile để chạy: {selected_name}")
-                except Exception as exc:
-                    print_error(f"Không thể lưu thay đổi. Dữ liệu cũ vẫn được giữ nguyên. {exc}")
+            rename_profile_menu(data)
         elif choice == '2':
-            create_profile(data)
-        elif choice == '3':
-            print(f"\n{Fore.YELLOW}=== ĐỔI TÊN PROFILE ==={Style.RESET_ALL}")
-            index = _profile_index(data, "Chọn profile muốn đổi tên: ")
-            if index is not None:
-                profile_id = data['profiles'][index]['profile_id']
-                old_name = data['profiles'][index]['name']
-                name = input("Tên mới: ").strip()
-                if name:
-                    try:
-                        rename_profile(profile_id, name)
-                        print_success("Đã đổi tên.")
-                    except ProfileInUseError:
-                        print_error(
-                            f'Không thể đổi tên. Profile "{old_name}" '
-                            'đang được sử dụng ở phiên khác.'
-                        )
-                    except Exception as exc:
-                        print_error(f"Không thể lưu thay đổi. Dữ liệu cũ vẫn được giữ nguyên. {exc}")
-        elif choice == '4':
-            view_ttc_token(data)
-        elif choice == '5':
             copy_facebook_accounts_from_profile(SESSION_PROFILE_ID)
-        elif choice == '6':
-            print(f"\n{Fore.YELLOW}=== XÓA PROFILE ==={Style.RESET_ALL}")
-            index = _profile_index(data, "Chọn profile muốn xóa: ")
-            if index is not None:
-                profile = data['profiles'][index]
-                fb_count = len(profile.get('fb_accounts', []))
-                print(f"\n=== XÁC NHẬN XÓA PROFILE ===")
-                print(f"Profile:\n{profile['name']}")
-                print(f"\nFacebook:\n{fb_count} account")
-                print(f"\nTTC token:\n{preview_token(profile.get('auth_token'))}")
-                if input(f"\nXóa profile này? (y/n): ").strip().lower() in ['y', 'yes']:
-                    deleted_id = profile['profile_id']
-                    deleted_name = profile['name']
-                    try:
-                        _, new_active_id = delete_profile(deleted_id)
-                        if SESSION_PROFILE_ID == deleted_id:
-                            SESSION_PROFILE_ID = new_active_id
-                        print_success("Đã xóa TTC profile.")
-                    except ProfileInUseError:
-                        print_error(
-                            f'Không thể xóa. Profile "{deleted_name}" '
-                            'đang được sử dụng ở phiên khác.'
-                        )
-                    except Exception as exc:
-                        print_error(f"Không thể lưu thay đổi. Dữ liệu cũ vẫn được giữ nguyên. {exc}")
-        elif choice == '7':
+        elif choice == '3':
+            delete_profile_menu(data)
+        elif choice == '0':
             return
         else:
             print_error("Lựa chọn không hợp lệ.")
@@ -5755,21 +5810,30 @@ def _emit_runtime_event(event_callback, event_type, message="", **payload):
 
 
 def _runtime_log(event_callback, level, message, terminal_printer=print_info,
-                 **payload):
-    """Keep CLI output while publishing the same worker-local diagnostic."""
-    terminal_printer(message)
+                 visibility="debug", **payload):
+    """Render USER/CRITICAL output normally and retain DEBUG diagnostics."""
+    visibility = str(visibility).strip().casefold()
+    if visibility not in {"user", "critical", "debug"}:
+        raise ValueError(f"Unsupported runtime log visibility: {visibility!r}")
+    if visibility == "debug" and not _runtime_debug_enabled():
+        return
+    safe_message = _mask_sensitive_text(message)
+    terminal_printer(safe_message)
     _emit_runtime_event(
         event_callback,
         "runtime_log",
-        message,
+        safe_message,
         level=str(level),
+        visibility=visibility,
         **payload,
     )
 
 
 def _runtime_server_response(event_callback, job_type, server_raw_text,
                              **payload):
-    """Publish masked TTC evidence without changing the CLI evidence path."""
+    """Publish masked TTC evidence only through the explicit debug boundary."""
+    if not _runtime_debug_enabled():
+        return
     print_ttc_server_response(job_type, server_raw_text)
     safe_raw_text = _mask_sensitive_text(server_raw_text)
     _emit_runtime_event(
@@ -5783,10 +5847,43 @@ def _runtime_server_response(event_callback, job_type, server_raw_text,
     )
 
 
+def _runtime_job_result(event_callback, index, total, job_type, state,
+                        earned_coin=None, **payload):
+    """Render one user-facing line from an already-decided runtime state."""
+    labels = {
+        "success": ("Thành công", print_success, "job_succeeded", "success"),
+        "failed": ("Thất bại", print_error, "job_failed", "error"),
+        "skipped": ("Bỏ qua", print_warning, "job_skipped", "warning"),
+    }
+    if state not in labels:
+        raise ValueError(f"Unsupported job result state: {state!r}")
+    label, printer, event_type, level = labels[state]
+    line = f"[{index}/{total}] {str(job_type).upper():<7} | {label}"
+    if state == "success" and earned_coin is not None:
+        line += f" | +{format_coin(earned_coin)} xu"
+    printer(line)
+    _emit_runtime_event(
+        event_callback,
+        event_type,
+        line,
+        level=level,
+        index=index,
+        total=total,
+        job_type=str(job_type),
+        result_state=state,
+        earned_coin=earned_coin,
+        **payload,
+    )
+
+
 def _cooperative_countdown(seconds, message, stop_event=None,
                            event_callback=None):
     if stop_event is None:
-        countdown(seconds, message)
+        seconds = max(0, int(seconds))
+        if seconds:
+            print_info(f"{message}: {seconds}s...")
+        for _remaining in range(seconds, 0, -1):
+            time.sleep(1)
         return True
     seconds = max(0, int(seconds))
     wait = getattr(stop_event, "wait", None)
@@ -5864,7 +5961,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
         )
 
     set_action_log = getattr(do_job, "set_log_fn", None)
-    if event_callback is not None and callable(set_action_log):
+    if callable(set_action_log):
         set_action_log(action_log)
     preflight_performed = facebook_live_result is None
     if not preflight_performed:
@@ -5884,16 +5981,22 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                 "reason": "Facebook token LIVE" if isinstance(uid, str) and uid.strip()
                 else message,
             })
+        account_live_message = (
+            f"Facebook token/account không dùng được: {live_result.reason}"
+            if live_result.status == FACEBOOK_DIE_TOKEN
+            else f"Không thể kiểm tra Facebook account: {live_result.reason}"
+            if live_result.status != FACEBOOK_LIVE
+            else "Facebook token LIVE"
+            if _runtime_debug_enabled()
+            else ""
+        )
+        account_live_message = _mask_sensitive_text(account_live_message)
+        if live_result.status != FACEBOOK_LIVE:
+            print_error(account_live_message)
         _emit_runtime_event(
             event_callback,
             "account_live",
-            (
-                f"Facebook token LIVE | UID: {live_result.uid}"
-                if live_result.status == FACEBOOK_LIVE
-                else "Facebook token DIE; bỏ qua account này."
-                if live_result.status == FACEBOOK_DIE_TOKEN
-                else f"Check Facebook token lỗi: {live_result.reason}; bỏ qua lượt account này."
-            ),
+            account_live_message,
             status=live_result.status,
             uid=live_result.uid,
             reason=live_result.reason,
@@ -5907,10 +6010,15 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
         api.set_facebook_uid(uid)
     else:
         api.bind_facebook_uid(uid)
-    print(f"{Fore.CYAN}{Style.BRIGHT}📱 Facebook: {uid}{Style.RESET_ALL}")
-    _emit_runtime_event(event_callback, "identity", f"Facebook UID: {uid}", uid=uid)
+    if _runtime_debug_enabled():
+        print(f"{Fore.CYAN}{Style.BRIGHT}📱 Facebook: {uid}{Style.RESET_ALL}")
+    _emit_runtime_event(
+        event_callback,
+        "identity",
+        f"Facebook UID: {uid}" if _runtime_debug_enabled() else "",
+        uid=uid,
+    )
 
-    # Nạp type_slots ban đầu để kiểm tra có job hợp lệ không
     type_slots = schedule_job_types_by_burst(
         enabled_types,
         max_jobs,
@@ -5929,34 +6037,18 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
     _runtime_log(
         event_callback,
         "info",
-        f"Đã lên kế hoạch tối đa {max_jobs} job thành công.",
-        jobs_planned=max_jobs,
+        f"Đã lên kế hoạch {len(type_slots)} job, tối đa {max_jobs}.",
+        jobs_planned=len(type_slots),
         max_jobs=max_jobs,
     )
-    total_jobs = max_jobs
+    total_jobs = len(type_slots)
     total_done = 0
     comment_disabled_for_this_turn = False
     job_cache = {legacy_type: [] for legacy_type in enabled_types}
     fetch_retry_at = {}
-    consecutive_empty = 0
-    _n_enabled_types = max(len(enabled_types), 1)
+    no_job_reported = False
 
-    while total_done < max_jobs:
-        if not type_slots:
-            type_slots = schedule_job_types_by_burst(
-                enabled_types,
-                max_jobs,
-                like_batch_limit=like_batch_limit,
-                comment_batch_limit=comment_batch_limit,
-                like_batch_min=like_batch_min,
-                like_batch_max=like_batch_max,
-                comment_batch_min=comment_batch_min,
-                comment_batch_max=comment_batch_max,
-            )
-            if not type_slots:
-                break
-        type_ = type_slots.pop(0)
-        idx = total_done + 1
+    for idx, type_ in enumerate(type_slots, start=1):
         if _runtime_stop_requested(stop_event):
             _emit_runtime_event(
                 event_callback, "stopped", "Đã dừng trước job tiếp theo.",
@@ -5967,14 +6059,6 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
         if not cached_jobs:
             retry_at = fetch_retry_at.get(type_)
             if retry_at is not None and time.monotonic() < retry_at:
-                consecutive_empty += 1
-                if consecutive_empty >= _n_enabled_types * 2:
-                    _runtime_log(
-                        event_callback, "info",
-                        "Tất cả job đều đang chờ cooldown, kết thúc lượt tài khoản này.",
-                        terminal_printer=print_info,
-                    )
-                    break
                 continue
 
             result = api.fetch_jobs_for_legacy_type(type_)
@@ -6038,7 +6122,6 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
             cached_jobs.extend(result["jobs"])
             if cached_jobs:
                 fetch_retry_at.pop(type_, None)
-                consecutive_empty = 0
             else:
                 if not result["no_job"] and (cooldowns or permanent_skips):
                     if cooldowns and not any(
@@ -6052,15 +6135,6 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                         fetch_retry_at[type_] = time.monotonic() + wait_seconds
                     else:
                         fetch_retry_at.pop(type_, None)
-                    consecutive_empty += 1
-                    if consecutive_empty >= _n_enabled_types:
-                        _runtime_log(
-                            event_callback, "info",
-                            "Tất cả loại job đều bị bỏ qua (VIP không đủ điều kiện hoặc cooldown), "
-                            "kết thúc lượt tài khoản này.",
-                            terminal_printer=print_info,
-                        )
-                        break
                     continue
                 wait_seconds = _ttc_no_job_wait_seconds(
                     result["no_job"]
@@ -6075,14 +6149,14 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                     event_callback, "info", "Hiện chưa có job TTC phù hợp.",
                     job_type=type_,
                 )
-                consecutive_empty += 1
-                if consecutive_empty >= _n_enabled_types:
+                if not no_job_reported:
                     _runtime_log(
                         event_callback, "info",
-                        "Tất cả loại job đều chưa có tác vụ phù hợp, kết thúc lượt tài khoản này.",
+                        "Không có job phù hợp.",
                         terminal_printer=print_info,
+                        visibility="user",
                     )
-                    break
+                    no_job_reported = True
                 continue
 
         if _runtime_stop_requested(stop_event):
@@ -6099,6 +6173,12 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
         else:
             object_id = original_job.get("object_id")
             if not object_id:
+                _runtime_job_result(
+                    event_callback, idx, total_jobs,
+                    "LIKE" if type_ == "like_facebook" else "COMMENT",
+                    "skipped",
+                    job_id=original_job.get("job_id", ""),
+                )
                 _runtime_log(
                     event_callback, "warning",
                     "Job TTC thiếu object_id; bỏ qua.",
@@ -6106,7 +6186,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                     job_id=original_job.get("job_id", ""),
                 )
             else:
-                job_type_display = "LIKE" if type_ == "like_facebook" else "CMT"
+                job_type_display = "LIKE" if type_ == "like_facebook" else "COMMENT"
                 if type_ == "like_facebook":
                     reaction = original_job.get("reaction_type")
                     if not reaction:
@@ -6115,16 +6195,22 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                     comment_text = original_job.get("comment_text")
                     if not isinstance(comment_text, str) or not comment_text:
                         raise ValueError("TTC comment job is missing comment_text")
-                print_info(
+                _runtime_log(
+                    event_callback,
+                    "info",
                     f"[{idx}/{total_jobs}] Đang xử lý {job_type_display} "
-                    f"(job_id: {original_job.get('job_id', '')})..."
+                    f"(job_id: {original_job.get('job_id', '')})...",
+                    job_id=original_job.get("job_id", ""),
                 )
                 _emit_runtime_event(
                     event_callback,
                     "job_started",
-                    f"[{idx}/{total_jobs}] Đang xử lý {job_type_display} "
-                    f"(job_id: {original_job.get('job_id', '')}) | "
-                    f"object: {object_id}",
+                    (
+                        f"[{idx}/{total_jobs}] Đang xử lý {job_type_display} "
+                        f"(job_id: {original_job.get('job_id', '')}) | "
+                        f"object: {object_id}"
+                        if _runtime_debug_enabled() else ""
+                    ),
                     index=idx,
                     total=total_jobs,
                     job_type=type_,
@@ -6137,7 +6223,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                 try:
                     post_id = _resolve_ttc_facebook_post_id(
                         original_job,
-                        log_fn=action_log if event_callback is not None else None,
+                        log_fn=action_log,
                     )
                     if post_id is not None and int(post_id) > 0:
                         if type_ == "like_facebook":
@@ -6199,7 +6285,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                             _emit_runtime_event(
                                 event_callback,
                                 "facebook_action_result",
-                                reaction_message,
+                                reaction_message if _runtime_debug_enabled() else "",
                                 level=reaction_level,
                                 action="reaction",
                                 reaction_type=reaction,
@@ -6228,7 +6314,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                                     "Comment thành công."
                                     if action_succeeded
                                     else "Comment thất bại; bỏ qua job này."
-                                ),
+                                ) if _runtime_debug_enabled() else "",
                                 level="success" if action_succeeded else "error",
                                 action="comment",
                                 object_id=object_id,
@@ -6242,6 +6328,11 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                                 comment_evidence = {}
                             if action_succeeded:
                                 if _is_comment_pending_approval(comment_evidence):
+                                    _runtime_job_result(
+                                        event_callback, idx, total_jobs,
+                                        job_type_display, "skipped",
+                                        job_id=original_job.get("job_id", ""),
+                                    )
                                     _runtime_log(
                                         event_callback, "warning",
                                         "Acc yếu bị Facebook ẩn comment.",
@@ -6269,8 +6360,8 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                     else:
                         _runtime_log(
                             event_callback, "warning",
-                            f"[{idx}/{total_jobs}] {job_type_display} | Không lấy được "
-                            f"Facebook ID cho {original_job.get('job_id', '')}",
+                            f"Không lấy được Facebook ID cho "
+                            f"{original_job.get('job_id', '')}",
                             terminal_printer=print_warning,
                             job_id=original_job.get("job_id", ""),
                         )
@@ -6284,7 +6375,9 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                         stage="facebook_action",
                     )
                     _emit_runtime_event(
-                        event_callback, "error", f"Lỗi Facebook {type_}: {exc}",
+                        event_callback, "error",
+                        f"Lỗi Facebook {type_}: {exc}"
+                        if _runtime_debug_enabled() else "",
                         stage="facebook_action", uid=uid,
                     )
 
@@ -6355,7 +6448,6 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                         earned = _normalize_ttc_earned_coin(result.get("earned_coin"))
                         job_succeeded = True
                         total_done += 1
-                        consecutive_empty = 0
                         if metrics is None:
                             total_coin += earned
                             displayed_total = total_coin
@@ -6366,27 +6458,16 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                         latest_balance = _latest_known_ttc_balance(api, result)
                         if metrics is not None:
                             metrics["balance"] = latest_balance
-                        balance_text = (
-                            f" | {format_coin(latest_balance)} xu"
-                            if latest_balance is not None else ""
-                        )
-                        print_success(
-                            f"[{idx}/{total_jobs}] {job_type_display} | +{format_coin(earned)} | "
-                            f"Total: {format_coin(displayed_total)}{balance_text}"
-                        )
-                        _emit_runtime_event(
-                            event_callback,
-                            "job_succeeded",
-                            f"[{idx}/{total_jobs}] {job_type_display} | "
-                            f"+{format_coin(earned)} | "
-                            f"Total: {format_coin(displayed_total)}{balance_text}",
+                        _runtime_job_result(
+                            event_callback, idx, total_jobs,
+                            job_type_display, "success",
+                            earned_coin=earned,
                             uid=uid,
                             jobs_succeeded=(
                                 total_done if metrics is None
                                 else metrics["jobs_succeeded"]
                             ),
                             session_coin=displayed_total,
-                            earned_coin=earned,
                             balance=latest_balance,
                             claim_id=original_job.get("idpost", ""),
                         )
@@ -6414,18 +6495,34 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                                 terminal_printer=print_warning,
                                 claim_reason=result.get("reason", ""),
                             )
+                        _runtime_job_result(
+                            event_callback, idx, total_jobs,
+                            job_type_display, "failed",
+                            job_id=original_job.get("job_id", ""),
+                            claim_reason=result.get("reason", ""),
+                        )
                         break  # Dừng lượt account ngay khi claim bị từ chối
                 elif not action_failure_decision_logged:
+                    _runtime_job_result(
+                        event_callback, idx, total_jobs,
+                        job_type_display, "failed",
+                        job_id=original_job.get("job_id", ""),
+                    )
                     _runtime_log(
                         event_callback, "error",
-                        f"[{idx}/{total_jobs}] {job_type_display} | Thao tác Facebook thất bại; "
-                        "bỏ qua job này.",
+                        f"{job_type_display} | Thao tác Facebook thất bại; bỏ qua job này.",
                         terminal_printer=print_error,
                         job_id=original_job.get("job_id", ""),
                     )
                     break  # Dừng lượt account ngay khi Facebook action thất bại
+                else:
+                    _runtime_job_result(
+                        event_callback, idx, total_jobs,
+                        job_type_display, "failed",
+                        job_id=original_job.get("job_id", ""),
+                    )
 
-        if total_done < max_jobs:
+        if idx < total_jobs:
             if _runtime_stop_requested(stop_event):
                 _emit_runtime_event(
                     event_callback, "stopped", "Đã dừng sau job hiện tại.",
@@ -6438,7 +6535,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                 delay_range = failed_delay_range
             delay = random.randint(*delay_range)
             if not _cooperative_countdown(
-                    delay, f"Chờ job {total_done + 1}", stop_event, event_callback):
+                    delay, f"Chờ job {idx + 1}", stop_event, event_callback):
                 _emit_runtime_event(
                     event_callback, "stopped", "Đã ngắt thời gian chờ để dừng.",
                     jobs_succeeded=total_done,
@@ -6497,10 +6594,13 @@ class TTCAccountRuntime:
             self.event_callback(dict(event))
 
     def _ttc_log(self, message, level="api"):
+        if not _runtime_debug_enabled():
+            return
         self._handle_event({
             "type": "log",
-            "message": str(message),
+            "message": _mask_sensitive_text(message),
             "level": str(level),
+            "visibility": "debug",
         })
 
     def run(self):
@@ -6521,7 +6621,7 @@ class TTCAccountRuntime:
         try:
             self._handle_event({
                 "type": "status",
-                "message": "Đang đăng nhập TTC",
+                "message": "Đang đăng nhập TTC" if _runtime_debug_enabled() else "",
                 "status": "Running",
             })
             account_info = self.api.login()
@@ -6538,7 +6638,7 @@ class TTCAccountRuntime:
             while not _runtime_stop_requested(self.stop_event):
                 self._handle_event({
                     "type": "cycle",
-                    "message": f"Chu kỳ {cycle}",
+                    "message": f"Chu kỳ {cycle}" if _runtime_debug_enabled() else "",
                     "cycle": cycle,
                 })
                 run_ttc_jobs(
@@ -6576,7 +6676,9 @@ class TTCAccountRuntime:
             status = "Stopped" if _runtime_stop_requested(self.stop_event) else "Completed"
             self._handle_event({
                 "type": "status",
-                "message": "Đã dừng" if status == "Stopped" else "Hoàn thành",
+                "message": (
+                    "Đã dừng" if status == "Stopped" else "Hoàn thành"
+                ) if _runtime_debug_enabled() else "",
                 "status": status,
                 **self.metrics,
             })
@@ -6726,7 +6828,7 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
     ttc_fetch_state = TTCFetchState()
     blocked_accounts_this_session = set()
     while True:
-        print_info(f"=== CHU KỲ {cycle} ===")
+        _runtime_log(None, "info", f"=== CHU KỲ {cycle} ===")
         total_all = 0
         for idx, acc in enumerate(fb_accounts):
             fb_token = str(acc.get('token') or '').strip()
@@ -6737,6 +6839,15 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
             if account_key in blocked_accounts_this_session:
                 continue
             identity = str(acc.get('email') or '').strip() or f"Account {idx+1}"
+            selected_labels = []
+            if "like_facebook" in enabled_types:
+                selected_labels.append("Like")
+            if "like_poster" in enabled_types:
+                selected_labels.append("Comment")
+            print(f"\n{'─' * 28}")
+            print(f"Facebook: {identity}")
+            print(f"Job: {' + '.join(selected_labels)}")
+            print("─" * 28)
             api = None
             try:
                 worker_id = f"{profile_id or 'profile'}:{idx+1}"
@@ -6763,13 +6874,13 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
                 print_warning(str(exc))
             except Exception as exc:
                 if not print_ttc_exception(f"Lỗi TTC với {identity}.", exc):
-                    print_error(f"Lỗi với {identity}: {exc}")
+                    print_error(_mask_sensitive_text(f"Lỗi với {identity}: {exc}"))
             finally:
                 if api:
                     api.close()
             if idx < len(fb_accounts) - 1:
                 account_delay = random.randint(*account_delay_range)
-                countdown(account_delay, "Chờ trước Facebook account tiếp theo")
+                _cooperative_countdown(account_delay, "Chuyển account")
 
         print_info(f"Hoàn thành chu kỳ {cycle}, tổng job: {total_all}")
         if blocked_accounts_this_session and not any(
@@ -6793,10 +6904,13 @@ def run_active_profile(profile):
         print_warning("Chưa có Facebook account nào được bật để chạy.")
         return
     config = normalize_run_config(profile.get('run_config'))
-    print_info(run_config_summary(config))
+    _runtime_log(None, "info", run_config_summary(config))
     try:
         with profile_run_lock(profile.get('profile_id')):
-            print_info(f"🔒 Đã khóa profile TTC {profile['name']} cho phiên chạy này.")
+            _runtime_log(
+                None, "info",
+                f"Đã khóa profile TTC {profile['name']} cho phiên chạy này.",
+            )
             run_multi_tokens(
                 auth_token,
                 accounts,
@@ -6934,23 +7048,41 @@ def ttc_manager():
     while True:
         data = load_database()
         profile = get_profile(data)
-        print(f"\n{Fore.YELLOW}=== QUẢN LÝ TTC ==={Style.RESET_ALL}")
-        print("1. Kiểm tra số dư")
-        print("2. Xem jobs")
-        print("3. Quản lý TTC profile")
+        print(f"\n{Fore.YELLOW}======== QUẢN LÝ TTC ========{Style.RESET_ALL}\n")
+        if profile:
+            accounts = profile.get('fb_accounts', [])
+            print(f"Profile   : {profile['name']}")
+            print(f"TTC token : {'Có' if str(profile.get('auth_token') or '').strip() else 'Chưa có'}")
+            print(f"Facebook  : {len(selected_accounts(profile))} bật / {len(accounts)} tổng\n")
+        else:
+            print("Profile   : CHƯA CHỌN")
+            print("TTC token : Chưa có")
+            print("Facebook  : 0 bật / 0 tổng\n")
+        print("1. Chọn profile")
+        print("2. Tạo profile")
+        print("3. Cập nhật TTC token")
+        print("4. Kiểm tra số dư")
+        print("5. Xem jobs")
+        print("6. Quản lý profile")
         print("0. Quay lại")
-        choice = input("Chọn (0-3): ").strip()
+        choice = input("Chọn (0-6): ").strip()
         if choice == '1':
+            select_profile_menu(data)
+        elif choice == '2':
+            create_profile(data)
+        elif choice == '3':
+            view_ttc_token(data)
+        elif choice == '4':
             if profile:
                 check_balance(profile)
             else:
                 print_error("Chưa có TTC profile.")
-        elif choice == '2':
+        elif choice == '5':
             if profile:
                 show_jobs_for_profile(profile)
             else:
                 print_error("Chưa có TTC profile.")
-        elif choice == '3':
+        elif choice == '6':
             profile_manager(data)
         elif choice == '0':
             return
@@ -7004,4 +7136,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        if _runtime_debug_enabled():
+            raise
+        print("\nĐã dừng.")

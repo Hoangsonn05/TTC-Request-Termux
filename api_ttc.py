@@ -60,6 +60,7 @@ FB_ACTION_TIMEOUT = (10, 45)
 FB_LOGIN_TIMEOUT = (10, 45)
 NETWORK_RETRY_DELAY = 2
 TTC_CLAIM_RETRY_DELAY = 2
+TTC_ACQUISITION_POLL_SECONDS = 10
 FACEBOOK_REACTION_TRANSIENT_SUMMARY = "something went wrong"
 FACEBOOK_REACTION_TRANSIENT_DESCRIPTION = (
     "we're having trouble completing your request. please try again."
@@ -2151,31 +2152,6 @@ def schedule_jobs_by_burst(jobs, enabled_types, max_jobs,
     return candidate_jobs[:max_jobs]
 
 
-def schedule_job_types_by_burst(enabled_types, max_jobs,
-                                like_batch_limit=None, comment_batch_limit=None, *,
-                                like_batch_min=None, like_batch_max=None,
-                                comment_batch_min=None, comment_batch_max=None):
-    like_range, comment_range = resolve_burst_ranges(
-        like_batch_limit, comment_batch_limit,
-        like_batch_min, like_batch_max,
-        comment_batch_min, comment_batch_max,
-    )
-    if max_jobs <= 0:
-        return []
-
-    ranges = {'like_facebook': like_range, 'like_poster': comment_range}
-    type_slots = []
-    for job_type in ('like_facebook', 'like_poster'):
-        if job_type not in enabled_types:
-            continue
-        target = random.randint(*ranges[job_type])
-        type_slots.extend([job_type] * target)
-
-    if len(type_slots) > 1:
-        random.shuffle(type_slots)
-    return type_slots[:max_jobs]
-
-
 def resolve_delay_ranges(normal_delay_min=10, normal_delay_max=None,
                          failed_delay_min=None, failed_delay_max=None,
                          delay_between_jobs=None):
@@ -2296,6 +2272,34 @@ def print_info(msg):
 
 def print_warning(msg):
     print(f"{Fore.YELLOW}⚠️ {msg}{Style.RESET_ALL}")
+
+
+JOB_TABLE_HEADER = (
+    f"| {'STT':<3} | {'UID-TK làm job':<17} | {'ID-post':<17} | "
+    f"{'ID job':<20} | {'xu-thêm':<7} | {'Số dư':<8} |"
+)
+JOB_TABLE_SEP = (
+    f"|{'-' * 5}|{'-' * 19}|{'-' * 19}|{'-' * 22}|{'-' * 9}|{'-' * 10}|"
+)
+
+
+def print_job_table_header():
+    print(f"\n{Fore.LIGHTWHITE_EX}{Style.BRIGHT}{JOB_TABLE_HEADER}{Style.RESET_ALL}")
+    print(f"{Fore.LIGHTWHITE_EX}{Style.BRIGHT}{JOB_TABLE_SEP}{Style.RESET_ALL}")
+
+
+def print_job_row(stt, uid, post_id, job_id, coin, balance, success):
+    uid_text = str(uid or "-")[:17]
+    post_text = str(post_id or "-")[:17]
+    job_text = str(job_id or "-")[:20]
+    coin_text = f"+{format_coin(coin)}" if success else "0"
+    balance_text = "-" if balance is None else format_coin(balance)
+    color = Fore.LIGHTGREEN_EX if success else Fore.LIGHTRED_EX
+    print(
+        f"{color}| {stt:<3} | {uid_text:<17} | {post_text:<17} | "
+        f"{job_text:<20} | {coin_text:<7} | {balance_text[:8]:<8} |"
+        f"{Style.RESET_ALL}"
+    )
 
 def _facebook_job_link_for_display(job_link):
     if not isinstance(job_link, str) or not job_link.strip():
@@ -5742,7 +5746,6 @@ def profile_manager(data):
 
 # ---------- Chạy đa Facebook account ----------
 def _ttc_no_job_wait_seconds(no_job_metadata):
-    positive_countdowns = []
     for item in no_job_metadata:
         if not isinstance(item, dict):
             raise ValueError("TTC adapter returned invalid no-job metadata")
@@ -5755,9 +5758,11 @@ def _ttc_no_job_wait_seconds(no_job_metadata):
             seconds = int(raw_countdown.strip())
         else:
             continue
-        if seconds > 0:
-            positive_countdowns.append(seconds)
-    return max(positive_countdowns) if positive_countdowns else 10
+        # Server countdowns remain endpoint metadata. The runner only uses a
+        # short cooperative tick so one endpoint cannot globally block others.
+        if seconds < 0:
+            continue
+    return TTC_ACQUISITION_POLL_SECONDS
 
 
 def _normalize_ttc_earned_coin(value):
@@ -5849,42 +5854,43 @@ def _runtime_server_response(event_callback, job_type, server_raw_text,
 
 def _runtime_job_result(event_callback, index, total, job_type, state,
                         earned_coin=None, **payload):
-    """Render one user-facing line from an already-decided runtime state."""
+    """Render one table row from an already-decided actual job state."""
     labels = {
-        "success": ("Thành công", print_success, "job_succeeded", "success"),
-        "failed": ("Thất bại", print_error, "job_failed", "error"),
-        "skipped": ("Bỏ qua", print_warning, "job_skipped", "warning"),
+        "success": ("Thành công", "job_succeeded", "success"),
+        "failed": ("Thất bại", "job_failed", "error"),
+        "skipped": ("Bỏ qua", "job_skipped", "warning"),
     }
     if state not in labels:
         raise ValueError(f"Unsupported job result state: {state!r}")
-    label, printer, event_type, level = labels[state]
-    line = f"[{index}/{total}] {str(job_type).upper():<7} | {label}"
-    if state == "success" and earned_coin is not None:
-        line += f" | +{format_coin(earned_coin)} xu"
-    printer(line)
-    _emit_runtime_event(
-        event_callback,
-        event_type,
-        line,
-        level=level,
-        index=index,
-        total=total,
-        job_type=str(job_type),
-        result_state=state,
-        earned_coin=earned_coin,
-        **payload,
+    label, event_type, level = labels[state]
+    success = state == "success"
+    print_job_row(
+        index,
+        payload.get("uid"),
+        payload.get("post_id"),
+        payload.get("job_id"),
+        earned_coin if success and earned_coin is not None else 0,
+        payload.get("balance"),
+        success,
     )
+    line = f"{str(job_type).upper()} | {label}"
+    if success and earned_coin is not None:
+        line += f" | +{format_coin(earned_coin)} xu"
+    event_payload = {
+        "level": level,
+        "index": index,
+        "job_type": str(job_type),
+        "result_state": state,
+        "earned_coin": earned_coin,
+        **payload,
+    }
+    if total is not None:
+        event_payload["total"] = total
+    _emit_runtime_event(event_callback, event_type, line, **event_payload)
 
 
 def _cooperative_countdown(seconds, message, stop_event=None,
                            event_callback=None):
-    if stop_event is None:
-        seconds = max(0, int(seconds))
-        if seconds:
-            print_info(f"{message}: {seconds}s...")
-        for _remaining in range(seconds, 0, -1):
-            time.sleep(1)
-        return True
     seconds = max(0, int(seconds))
     wait = getattr(stop_event, "wait", None)
     for remaining in range(seconds, 0, -1):
@@ -5895,33 +5901,26 @@ def _cooperative_countdown(seconds, message, stop_event=None,
             remaining=remaining,
             seconds=seconds,
         )
+        if event_callback is None:
+            print(
+                f"\r{Fore.YELLOW}⏳ {message} {remaining}s...{Style.RESET_ALL}",
+                end="",
+                flush=True,
+            )
         if callable(wait):
             if wait(1):
+                if event_callback is None:
+                    print("\r\033[2K", end="", flush=True)
                 return False
             continue
         if _runtime_stop_requested(stop_event):
+            if event_callback is None:
+                print("\r\033[2K", end="", flush=True)
             return False
         time.sleep(1)
+    if seconds and event_callback is None:
+        print("\r\033[2K", end="", flush=True)
     return not _runtime_stop_requested(stop_event)
-
-
-def _print_ttc_completion(api, done, total, metrics=None, event_callback=None):
-    latest_balance = _latest_known_ttc_balance(api)
-    coin_total = total_coin if metrics is None else metrics.get("session_coin", 0)
-    completed_count = done if metrics is None else metrics.get("jobs_succeeded", done)
-    summary = f"Hoàn thành {done}/{total} job | Total: {format_coin(coin_total)}"
-    if latest_balance is not None:
-        summary += f" | {format_coin(latest_balance)} xu"
-    print_success(summary)
-    _emit_runtime_event(
-        event_callback,
-        "completion",
-        summary,
-        jobs_succeeded=completed_count,
-        jobs_planned=total,
-        session_coin=coin_total,
-        balance=latest_balance,
-    )
 
 
 def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
@@ -6019,144 +6018,169 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
         uid=uid,
     )
 
-    type_slots = schedule_job_types_by_burst(
-        enabled_types,
-        max_jobs,
-        like_batch_limit=like_batch_limit,
-        comment_batch_limit=comment_batch_limit,
-        like_batch_min=like_batch_min,
-        like_batch_max=like_batch_max,
-        comment_batch_min=comment_batch_min,
-        comment_batch_max=comment_batch_max,
-    )
-    if not type_slots:
-        print_info("Không có job TTC phù hợp được chọn.")
-        _emit_runtime_event(event_callback, "log", "Không có job TTC phù hợp được chọn.")
-        return 0
-
-    _runtime_log(
-        event_callback,
-        "info",
-        f"Đã lên kế hoạch {len(type_slots)} job, tối đa {max_jobs}.",
-        jobs_planned=len(type_slots),
-        max_jobs=max_jobs,
-    )
-    total_jobs = len(type_slots)
     total_done = 0
+    processed_jobs = 0
     comment_disabled_for_this_turn = False
-    job_cache = {legacy_type: [] for legacy_type in enabled_types}
-    fetch_retry_at = {}
-    no_job_reported = False
+    active_types = set(enabled_types)
+    job_queue = []
+    attempted_job_keys = set()
+    latest_balance = (
+        metrics.get("balance") if metrics is not None
+        else _latest_known_ttc_balance(api)
+    )
 
-    for idx, type_ in enumerate(type_slots, start=1):
+    def wait_after_actual_job(succeeded, actual_type):
+        if total_done >= max_jobs or not active_types:
+            return True
+        if _runtime_stop_requested(stop_event):
+            return False
+        delay_range = (
+            like_delay_range if succeeded and actual_type == "like_facebook"
+            else comment_delay_range if succeeded
+            else failed_delay_range
+        )
+        delay = random.randint(*delay_range)
+        return _cooperative_countdown(
+            delay, "Chờ job tiếp theo", stop_event, event_callback
+        )
+
+    while total_done < max_jobs and active_types:
         if _runtime_stop_requested(stop_event):
             _emit_runtime_event(
                 event_callback, "stopped", "Đã dừng trước job tiếp theo.",
                 jobs_succeeded=total_done,
             )
             break
-        cached_jobs = job_cache[type_]
-        if not cached_jobs:
-            retry_at = fetch_retry_at.get(type_)
-            if retry_at is not None and time.monotonic() < retry_at:
-                continue
-
-            result = api.fetch_jobs_for_legacy_type(type_)
-            if (not isinstance(result, dict)
-                    or not isinstance(result.get("jobs"), list)
-                    or not isinstance(result.get("no_job"), list)):
-                raise ValueError("TTC adapter returned an invalid fetch result")
-            cooldowns = result.get("cooldowns", [])
-            permanent_skips = result.get("permanent_skips", [])
-            if not isinstance(cooldowns, list) or not isinstance(permanent_skips, list):
-                raise ValueError("TTC adapter returned invalid endpoint-state metadata")
-
-            for item in cooldowns:
-                if not isinstance(item, dict):
-                    raise ValueError("TTC adapter returned invalid cooldown metadata")
-                if item.get("source") == "server":
-                    _runtime_server_response(
-                        event_callback,
-                        item.get("job_type", ""),
-                        item.get("server_raw_text", ""),
-                        stage="fetch_cooldown",
-                    )
-                    _runtime_log(
-                        event_callback,
-                        "info",
-                        f"Tạm bỏ qua endpoint này trong "
-                        f"{item.get('retry_after', 0)} giây chờ TTC.",
-                        job_type=item.get("job_type", ""),
-                        retry_after=item.get("retry_after", 0),
-                    )
-                _emit_runtime_event(
-                    event_callback,
-                    "endpoint_cooldown",
-                    "TTC endpoint cooldown",
-                    level="warning",
-                    job_type=item.get("job_type", ""),
-                    remaining=item.get("remaining", 0),
-                    retry_at=item.get("retry_at"),
-                    source=item.get("source", ""),
-                )
-
-            for item in permanent_skips:
-                if not isinstance(item, dict):
-                    raise ValueError("TTC adapter returned invalid permanent-skip metadata")
-                if item.get("source") == "server":
-                    _runtime_server_response(
-                        event_callback,
-                        item.get("job_type", ""),
-                        item.get("server_raw_text", ""),
-                        stage="vip_ineligible",
-                    )
-                    _runtime_log(
-                        event_callback,
-                        "warning",
-                        "Bỏ qua loại job này trong lượt áp dụng hiện tại.",
-                        terminal_printer=print_info,
-                        job_type=item.get("job_type", ""),
-                        reason="vip_ineligible",
-                    )
-
-            cached_jobs.extend(result["jobs"])
-            if cached_jobs:
-                fetch_retry_at.pop(type_, None)
-            else:
-                if not result["no_job"] and (cooldowns or permanent_skips):
-                    if cooldowns and not any(
-                            item.get("source") == "server" for item in cooldowns):
-                        wait_seconds = min(
-                            _ttc_no_job_wait_seconds([{
-                                "countdown": item.get("remaining", 0),
-                            }])
-                            for item in cooldowns
-                        )
-                        fetch_retry_at[type_] = time.monotonic() + wait_seconds
-                    else:
-                        fetch_retry_at.pop(type_, None)
+        if not job_queue:
+            actual_jobs = []
+            no_job_metadata = []
+            for fetch_type in ("like_facebook", "like_poster"):
+                if fetch_type not in active_types:
                     continue
-                wait_seconds = _ttc_no_job_wait_seconds(
-                    result["no_job"]
-                    + [
-                        {"countdown": item.get("remaining", 0)}
-                        for item in cooldowns
-                        if isinstance(item, dict)
-                    ]
-                )
-                fetch_retry_at[type_] = time.monotonic() + wait_seconds
-                _runtime_log(
-                    event_callback, "info", "Hiện chưa có job TTC phù hợp.",
-                    job_type=type_,
-                )
-                if not no_job_reported:
-                    _runtime_log(
-                        event_callback, "info",
-                        "Không có job phù hợp.",
-                        terminal_printer=print_info,
-                        visibility="user",
+                result = api.fetch_jobs_for_legacy_type(fetch_type)
+                if (not isinstance(result, dict)
+                        or not isinstance(result.get("jobs"), list)
+                        or not isinstance(result.get("no_job"), list)):
+                    raise ValueError("TTC adapter returned an invalid fetch result")
+                cooldowns = result.get("cooldowns", [])
+                permanent_skips = result.get("permanent_skips", [])
+                if (not isinstance(cooldowns, list)
+                        or not isinstance(permanent_skips, list)):
+                    raise ValueError("TTC adapter returned invalid endpoint-state metadata")
+
+                for item in cooldowns:
+                    if not isinstance(item, dict):
+                        raise ValueError("TTC adapter returned invalid cooldown metadata")
+                    if item.get("source") == "server":
+                        _runtime_server_response(
+                            event_callback,
+                            item.get("job_type", ""),
+                            item.get("server_raw_text", ""),
+                            stage="fetch_cooldown",
+                        )
+                        _runtime_log(
+                            event_callback,
+                            "info",
+                            f"Tạm bỏ qua endpoint này trong "
+                            f"{item.get('retry_after', 0)} giây chờ TTC.",
+                            job_type=item.get("job_type", ""),
+                            retry_after=item.get("retry_after", 0),
+                        )
+                    _emit_runtime_event(
+                        event_callback,
+                        "endpoint_cooldown",
+                        "TTC endpoint cooldown",
+                        level="warning",
+                        job_type=item.get("job_type", ""),
+                        remaining=item.get("remaining", 0),
+                        retry_at=item.get("retry_at"),
+                        source=item.get("source", ""),
                     )
-                    no_job_reported = True
+                    no_job_metadata.append({
+                        "countdown": item.get("remaining", 0),
+                    })
+
+                for item in permanent_skips:
+                    if not isinstance(item, dict):
+                        raise ValueError(
+                            "TTC adapter returned invalid permanent-skip metadata"
+                        )
+                    if item.get("source") == "server":
+                        _runtime_server_response(
+                            event_callback,
+                            item.get("job_type", ""),
+                            item.get("server_raw_text", ""),
+                            stage="vip_ineligible",
+                        )
+                        _runtime_log(
+                            event_callback,
+                            "warning",
+                            "Bỏ qua endpoint VIP không đủ điều kiện.",
+                            job_type=item.get("job_type", ""),
+                            reason="vip_ineligible",
+                        )
+
+                no_job_metadata.extend(result["no_job"])
+                actual_jobs.extend(result["jobs"])
+                if (
+                    not result["jobs"]
+                    and not result["no_job"]
+                    and not cooldowns
+                    and permanent_skips
+                ):
+                    active_types.discard(fetch_type)
+
+            unique_jobs = []
+            queued_keys = set()
+            for candidate in actual_jobs:
+                original = candidate.get("_ttc_job") if isinstance(candidate, dict) else None
+                if isinstance(original, dict):
+                    job_key = str(
+                        original.get("job_id")
+                        or original.get("idpost")
+                        or original.get("object_id")
+                        or ""
+                    )
+                else:
+                    job_key = ""
+                if job_key and (job_key in attempted_job_keys or job_key in queued_keys):
+                    _runtime_log(
+                        event_callback, "info", "Bỏ qua job đã xử lý trong account run.",
+                        job_id=job_key, reason="duplicate_actual_job",
+                    )
+                    continue
+                if job_key:
+                    queued_keys.add(job_key)
+                unique_jobs.append(candidate)
+
+            job_queue.extend(schedule_jobs_by_burst(
+                unique_jobs,
+                active_types,
+                len(unique_jobs),
+                like_batch_limit=like_batch_limit,
+                comment_batch_limit=comment_batch_limit,
+                like_batch_min=like_batch_min,
+                like_batch_max=like_batch_max,
+                comment_batch_min=comment_batch_min,
+                comment_batch_max=comment_batch_max,
+            ))
+            if not job_queue:
+                if not active_types:
+                    break
+                wait_seconds = _ttc_no_job_wait_seconds(no_job_metadata)
+                _runtime_log(
+                    event_callback,
+                    "info",
+                    "Không có actual TTC job; chờ polling tick.",
+                    wait_seconds=wait_seconds,
+                )
+                if not _cooperative_countdown(
+                        wait_seconds, "Chờ lấy job", stop_event, event_callback):
+                    _emit_runtime_event(
+                        event_callback, "stopped", "Đã ngắt chờ lấy job.",
+                        jobs_succeeded=total_done,
+                    )
+                    break
                 continue
 
         if _runtime_stop_requested(stop_event):
@@ -6165,19 +6189,46 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                 jobs_succeeded=total_done,
             )
             break
-        job = cached_jobs.pop(0)
+        job = job_queue.pop(0)
+        type_ = job.get("type") if isinstance(job, dict) else ""
+        processed_jobs += 1
+        idx = processed_jobs
+        total_jobs = None
         original_job = job.get("_ttc_job")
+        if isinstance(original_job, dict):
+            attempted_key = str(
+                original_job.get("job_id")
+                or original_job.get("idpost")
+                or original_job.get("object_id")
+                or ""
+            )
+            if attempted_key:
+                attempted_job_keys.add(attempted_key)
         job_succeeded = False
         if not isinstance(original_job, dict):
-            raise ValueError("TTC scheduler wrapper is missing its original job")
+            _runtime_job_result(
+                event_callback, idx, total_jobs, type_ or "UNKNOWN", "failed",
+                uid=uid, post_id="-", job_id="-", balance=latest_balance,
+            )
+            _runtime_log(
+                event_callback, "error",
+                "TTC scheduler wrapper thiếu actual job; bỏ qua.",
+                stage="job_validation",
+            )
+            if not wait_after_actual_job(False, type_):
+                break
+            continue
         else:
             object_id = original_job.get("object_id")
             if not object_id:
                 _runtime_job_result(
                     event_callback, idx, total_jobs,
                     "LIKE" if type_ == "like_facebook" else "COMMENT",
-                    "skipped",
+                    "failed",
+                    uid=uid,
+                    post_id="-",
                     job_id=original_job.get("job_id", ""),
+                    balance=latest_balance,
                 )
                 _runtime_log(
                     event_callback, "warning",
@@ -6185,20 +6236,49 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                     terminal_printer=print_warning,
                     job_id=original_job.get("job_id", ""),
                 )
+                if not wait_after_actual_job(False, type_):
+                    break
+                continue
             else:
                 job_type_display = "LIKE" if type_ == "like_facebook" else "COMMENT"
                 if type_ == "like_facebook":
                     reaction = original_job.get("reaction_type")
                     if not reaction:
-                        raise ValueError("TTC reaction job is missing reaction_type")
+                        _runtime_job_result(
+                            event_callback, idx, total_jobs,
+                            job_type_display, "failed", uid=uid, post_id="-",
+                            job_id=original_job.get("job_id", ""),
+                            balance=latest_balance,
+                        )
+                        _runtime_log(
+                            event_callback, "error",
+                            "Job TTC thiếu reaction_type; bỏ qua.",
+                            stage="job_validation",
+                        )
+                        if not wait_after_actual_job(False, type_):
+                            break
+                        continue
                 else:
                     comment_text = original_job.get("comment_text")
                     if not isinstance(comment_text, str) or not comment_text:
-                        raise ValueError("TTC comment job is missing comment_text")
+                        _runtime_job_result(
+                            event_callback, idx, total_jobs,
+                            job_type_display, "failed", uid=uid, post_id="-",
+                            job_id=original_job.get("job_id", ""),
+                            balance=latest_balance,
+                        )
+                        _runtime_log(
+                            event_callback, "error",
+                            "Job TTC thiếu comment_text; bỏ qua.",
+                            stage="job_validation",
+                        )
+                        if not wait_after_actual_job(False, type_):
+                            break
+                        continue
                 _runtime_log(
                     event_callback,
                     "info",
-                    f"[{idx}/{total_jobs}] Đang xử lý {job_type_display} "
+                    f"[{idx}] Đang xử lý {job_type_display} "
                     f"(job_id: {original_job.get('job_id', '')})...",
                     job_id=original_job.get("job_id", ""),
                 )
@@ -6206,13 +6286,12 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                     event_callback,
                     "job_started",
                     (
-                        f"[{idx}/{total_jobs}] Đang xử lý {job_type_display} "
+                        f"[{idx}] Đang xử lý {job_type_display} "
                         f"(job_id: {original_job.get('job_id', '')}) | "
                         f"object: {object_id}"
                         if _runtime_debug_enabled() else ""
                     ),
                     index=idx,
-                    total=total_jobs,
                     job_type=type_,
                     uid=uid,
                     job_id=original_job.get("job_id", ""),
@@ -6220,6 +6299,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                 )
                 action_succeeded = False
                 action_failure_decision_logged = False
+                post_id = "-"
                 try:
                     post_id = _resolve_ttc_facebook_post_id(
                         original_job,
@@ -6328,11 +6408,6 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                                 comment_evidence = {}
                             if action_succeeded:
                                 if _is_comment_pending_approval(comment_evidence):
-                                    _runtime_job_result(
-                                        event_callback, idx, total_jobs,
-                                        job_type_display, "skipped",
-                                        job_id=original_job.get("job_id", ""),
-                                    )
                                     _runtime_log(
                                         event_callback, "warning",
                                         "Acc yếu bị Facebook ẩn comment.",
@@ -6370,7 +6445,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                 except Exception as exc:
                     _runtime_log(
                         event_callback, "error",
-                        f"[{idx}/{total_jobs}] Lỗi Facebook {type_}: {exc}",
+                        f"[{idx}] Lỗi Facebook {type_}: {exc}",
                         terminal_printer=print_error,
                         stage="facebook_action",
                     )
@@ -6382,42 +6457,14 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                     )
 
                 if comment_disabled_for_this_turn:
-                    remaining_jobs = max_jobs - total_done
-                    if remaining_jobs > 0 and not _runtime_stop_requested(stop_event):
-                        _runtime_log(
-                            event_callback, "info", "Đang lấy job Like...",
-                            reason="comment_pending_fallback",
-                        )
-                        fallback_done = run_ttc_jobs(
-                            api,
-                            fb_token,
-                            max_jobs=remaining_jobs,
-                            job_types={"like_facebook"},
-                            like_batch_limit=like_batch_limit,
-                            comment_batch_limit=comment_batch_limit,
-                            like_batch_min=like_batch_min,
-                            like_batch_max=like_batch_max,
-                            comment_batch_min=comment_batch_min,
-                            comment_batch_max=comment_batch_max,
-                            like_delay_range=like_delay_range,
-                            comment_delay_range=comment_delay_range,
-                            failed_delay_range=failed_delay_range,
-                            skip_hidden_comments=skip_hidden_comments,
-                            stop_event=stop_event,
-                            event_callback=event_callback,
-                            metrics=metrics,
-                            action=do_job,
-                            transaction_sleep_fn=transaction_sleep_fn,
-                            configure_remote_uid=False,
-                            facebook_live_result=live_result,
-                        )
-                        total_done += fallback_done
-                    _print_ttc_completion(
-                        api, total_done, max_jobs,
-                        metrics=metrics,
-                        event_callback=event_callback,
-                    )
-                    return total_done
+                    active_types.discard("like_poster")
+                    job_queue[:] = [
+                        queued_job for queued_job in job_queue
+                        if queued_job.get("type") != "like_poster"
+                    ]
+                    comment_disabled_for_this_turn = False
+                    action_succeeded = False
+                    action_failure_decision_logged = True
                 if action_succeeded:
                     result = api.submit_job(original_job)
                     claim_retried = False
@@ -6463,6 +6510,8 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                             job_type_display, "success",
                             earned_coin=earned,
                             uid=uid,
+                            post_id=str(post_id),
+                            job_id=original_job.get("job_id", ""),
                             jobs_succeeded=(
                                 total_done if metrics is None
                                 else metrics["jobs_succeeded"]
@@ -6498,15 +6547,20 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                         _runtime_job_result(
                             event_callback, idx, total_jobs,
                             job_type_display, "failed",
+                            uid=uid,
+                            post_id=str(post_id),
                             job_id=original_job.get("job_id", ""),
+                            balance=latest_balance,
                             claim_reason=result.get("reason", ""),
                         )
-                        break  # Dừng lượt account ngay khi claim bị từ chối
                 elif not action_failure_decision_logged:
                     _runtime_job_result(
                         event_callback, idx, total_jobs,
                         job_type_display, "failed",
+                        uid=uid,
+                        post_id=str(post_id),
                         job_id=original_job.get("job_id", ""),
+                        balance=latest_balance,
                     )
                     _runtime_log(
                         event_callback, "error",
@@ -6514,39 +6568,23 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                         terminal_printer=print_error,
                         job_id=original_job.get("job_id", ""),
                     )
-                    break  # Dừng lượt account ngay khi Facebook action thất bại
                 else:
                     _runtime_job_result(
                         event_callback, idx, total_jobs,
                         job_type_display, "failed",
+                        uid=uid,
+                        post_id=str(post_id),
                         job_id=original_job.get("job_id", ""),
+                        balance=latest_balance,
                     )
 
-        if idx < total_jobs:
-            if _runtime_stop_requested(stop_event):
-                _emit_runtime_event(
-                    event_callback, "stopped", "Đã dừng sau job hiện tại.",
-                    jobs_succeeded=total_done,
-                )
-                break
-            if job_succeeded:
-                delay_range = like_delay_range if type_ == "like_facebook" else comment_delay_range
-            else:
-                delay_range = failed_delay_range
-            delay = random.randint(*delay_range)
-            if not _cooperative_countdown(
-                    delay, f"Chờ job {idx + 1}", stop_event, event_callback):
-                _emit_runtime_event(
-                    event_callback, "stopped", "Đã ngắt thời gian chờ để dừng.",
-                    jobs_succeeded=total_done,
-                )
-                break
+        if not wait_after_actual_job(job_succeeded, type_):
+            _emit_runtime_event(
+                event_callback, "stopped", "Đã ngắt thời gian chờ để dừng.",
+                jobs_succeeded=total_done,
+            )
+            break
 
-    _print_ttc_completion(
-        api, total_done, total_jobs,
-        metrics=metrics,
-        event_callback=event_callback,
-    )
     return total_done
 
 
@@ -6634,13 +6672,7 @@ class TTCAccountRuntime:
                     "balance": self.metrics["balance"],
                 })
 
-            cycle = 1
             while not _runtime_stop_requested(self.stop_event):
-                self._handle_event({
-                    "type": "cycle",
-                    "message": f"Chu kỳ {cycle}" if _runtime_debug_enabled() else "",
-                    "cycle": cycle,
-                })
                 run_ttc_jobs(
                     self.api,
                     self.account["token"],
@@ -6671,7 +6703,6 @@ class TTCAccountRuntime:
                 )
                 if not self.config["continuous"]:
                     break
-                cycle += 1
 
             status = "Stopped" if _runtime_stop_requested(self.stop_event) else "Completed"
             self._handle_event({
@@ -6824,12 +6855,10 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
         comment_delay_min, comment_delay_max,
         account_delay_min, account_delay_max,
     )
-    cycle = 1
     ttc_fetch_state = TTCFetchState()
     blocked_accounts_this_session = set()
+    print_job_table_header()
     while True:
-        _runtime_log(None, "info", f"=== CHU KỲ {cycle} ===")
-        total_all = 0
         for idx, acc in enumerate(fb_accounts):
             fb_token = str(acc.get('token') or '').strip()
             if not fb_token:
@@ -6839,22 +6868,13 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
             if account_key in blocked_accounts_this_session:
                 continue
             identity = str(acc.get('email') or '').strip() or f"Account {idx+1}"
-            selected_labels = []
-            if "like_facebook" in enabled_types:
-                selected_labels.append("Like")
-            if "like_poster" in enabled_types:
-                selected_labels.append("Comment")
-            print(f"\n{'─' * 28}")
-            print(f"Facebook: {identity}")
-            print(f"Job: {' + '.join(selected_labels)}")
-            print("─" * 28)
             api = None
             try:
                 worker_id = f"{profile_id or 'profile'}:{idx+1}"
                 api = API_TTC(auth_token, worker_id=worker_id)
                 api.use_fetch_state(ttc_fetch_state)
                 api.login()
-                done = run_ttc_jobs(
+                run_ttc_jobs(
                     api,
                     fb_token,
                     max_jobs=max_jobs_per_acc,
@@ -6868,10 +6888,13 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
                     failed_delay_range=failed_delay_range,
                     skip_hidden_comments=skip_hidden_comments,
                 )
-                total_all += done
             except FacebookInteractionBlocked as exc:
                 blocked_accounts_this_session.add(account_key)
                 print_warning(str(exc))
+            except TTCAuthError as exc:
+                if not print_ttc_exception("Phiên TTC không còn hợp lệ.", exc):
+                    print_error(_mask_sensitive_text(str(exc)))
+                return
             except Exception as exc:
                 if not print_ttc_exception(f"Lỗi TTC với {identity}.", exc):
                     print_error(_mask_sensitive_text(f"Lỗi với {identity}: {exc}"))
@@ -6882,7 +6905,6 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
                 account_delay = random.randint(*account_delay_range)
                 _cooperative_countdown(account_delay, "Chuyển account")
 
-        print_info(f"Hoàn thành chu kỳ {cycle}, tổng job: {total_all}")
         if blocked_accounts_this_session and not any(
             str(acc.get('token') or '').strip()
             and facebook_account_key(acc) not in blocked_accounts_this_session
@@ -6891,7 +6913,6 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
             break
         if not continuous:
             break
-        cycle += 1
 
 
 def run_active_profile(profile):

@@ -3092,8 +3092,13 @@ def relogin_account_record(profile_id, account_key, password=None, secret=None,
     if not login_password:
         raise ValueError("Password không được để trống khi login lại.")
 
-    login_client = req_fb or Requests_facebook()
-    token = login_client.login_and_get_token(email, login_password, login_secret)
+    owns_client = req_fb is None
+    login_client = Requests_facebook() if owns_client else req_fb
+    try:
+        token = login_client.login_and_get_token(email, login_password, login_secret)
+    finally:
+        if owns_client:
+            login_client.close()
     if not token:
         raise RuntimeError("Login lại thất bại; token cũ vẫn được giữ.")
     updates = {"token": token}
@@ -3679,6 +3684,9 @@ class Requests_facebook:
         }
         print_error(f"Login Facebook thất bại: {result['message']}")
         return None
+
+    def close(self):
+        self._requests.close()
 
 # ---------- Hàm tạo session/attribution (giữ nguyên) ----------
 def generate_session_id(prefix="UFS", suffix="fg-4"):
@@ -4608,8 +4616,13 @@ def add_login_account(profile_id, email, password, secret="", req_fb=None):
         print_error("Email / UID không được để trống.")
         return False
 
-    req_fb = req_fb or Requests_facebook()
-    token = req_fb.login_and_get_token(email, password, secret)
+    owns_client = req_fb is None
+    login_client = Requests_facebook() if owns_client else req_fb
+    try:
+        token = login_client.login_and_get_token(email, password, secret)
+    finally:
+        if owns_client:
+            login_client.close()
     if not token:
         print_error(f"Đăng nhập thất bại cho {email}.")
         return False
@@ -4660,9 +4673,13 @@ def batch_login_accounts(
         print_info(f"[{index}/{total}] Đang login UID/email {email}...")
         try:
             req_fb = req_fb_factory() if req_fb_factory is not None else Requests_facebook()
-            token = req_fb.login_and_get_token(
-                email, account["password"], account["secret"]
-            )
+            try:
+                token = req_fb.login_and_get_token(
+                    email, account["password"], account["secret"]
+                )
+            finally:
+                if req_fb_factory is None:
+                    req_fb.close()
         except Exception:
             token = None
 
@@ -4897,7 +4914,11 @@ def relogin_account(profile):
     if use_saved_2fa != 'y':
         secret = secret_input("2FA secret (có thể trống): ")
         secret_changed = True
-    token = Requests_facebook().login_and_get_token(email, password, secret)
+    login_client = Requests_facebook()
+    try:
+        token = login_client.login_and_get_token(email, password, secret)
+    finally:
+        login_client.close()
     if not token:
         print_error("Login lại thất bại; token cũ vẫn được giữ.")
         return

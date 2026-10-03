@@ -2290,16 +2290,50 @@ _TTC_JOB_TYPE_LABELS = {
     "ttc_like_post_vip_cheo": "Like_Vip",
     "ttc_like_post_vip_re": "Like_thường",
     "ttc_reaction_vip_cheo": "CX_Vip",
-    "ttc_reaction_vip_re": "CX_Vip",
+    "ttc_reaction_vip_re": "CX_thường",
     "ttc_comment": "Comment",
-    "like_facebook": "Like",
-    "like_poster": "Comment",
+}
+
+_TTC_JOB_ACTION_FAMILIES = {
+    "ttc_like_post_vip_cheo": "like",
+    "ttc_like_post_vip_re": "like",
+    "ttc_reaction_vip_cheo": "reaction",
+    "ttc_reaction_vip_re": "reaction",
+    "ttc_comment": "comment",
+}
+
+_TTC_SUCCESS_REWARD_LABELS = {
+    "like": {
+        400: "Like_thường",
+        1100: "Like_Vip",
+    },
+    "reaction": {
+        400: "CX_thường",
+        1100: "CX_Vip",
+    },
 }
 
 
-def compact_ttc_job_type(source):
-    """Return a short presentation label for a canonical TTC source."""
-    return _TTC_JOB_TYPE_LABELS.get(source, "Unknown")
+def compact_ttc_job_type(source, job_id="", earned_coin=None, success=False):
+    """Return a short label from canonical identity and confirmed reward."""
+    source_key = source if isinstance(source, str) and source in TTC_ENDPOINTS else None
+    job_id_prefix = job_id.split(":", 1)[0] if isinstance(job_id, str) else ""
+    job_id_key = job_id_prefix if job_id_prefix in TTC_ENDPOINTS else None
+
+    if source_key and job_id_key and source_key != job_id_key:
+        return "Unknown"
+
+    canonical_source = source_key or job_id_key
+    if canonical_source is None:
+        return "Unknown"
+
+    action_family = _TTC_JOB_ACTION_FAMILIES[canonical_source]
+    if success and action_family in _TTC_SUCCESS_REWARD_LABELS:
+        reward_label = _TTC_SUCCESS_REWARD_LABELS[action_family].get(earned_coin)
+        if reward_label is not None:
+            return reward_label
+
+    return _TTC_JOB_TYPE_LABELS[canonical_source]
 
 
 JOB_TABLE_HEADER = (
@@ -5917,7 +5951,12 @@ def _runtime_job_result(event_callback, index, total, job_type, state,
         index,
         payload.get("uid"),
         payload.get("post_id"),
-        compact_ttc_job_type(type_job_source),
+        compact_ttc_job_type(
+            type_job_source,
+            job_id=payload.get("job_id", ""),
+            earned_coin=earned_coin,
+            success=success,
+        ),
         earned_coin if success and earned_coin is not None else 0,
         payload.get("balance"),
         success,

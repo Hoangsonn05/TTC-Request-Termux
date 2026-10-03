@@ -6019,8 +6019,16 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                  failed_delay_range=(10, 10), skip_hidden_comments=True,
                  stop_event=None, event_callback=None, metrics=None,
                  action=None, transaction_sleep_fn=None,
-                 configure_remote_uid=True, facebook_live_result=None):
+                 configure_remote_uid=True, facebook_live_result=None,
+                 row_counter=None):
     global total_coin
+    if (row_counter is not None
+            and (not isinstance(row_counter, dict)
+                 or type(row_counter.get("value")) is not int
+                 or row_counter["value"] < 0)):
+        raise ValueError(
+            "row_counter must be a dict with an integer 'value' >= 0"
+        )
     enabled_types = normalize_job_types(job_types)
     transaction_sleep_fn = transaction_sleep_fn or time.sleep
     if metrics is not None:
@@ -6280,7 +6288,11 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
         job = job_queue.pop(0)
         type_ = job.get("type") if isinstance(job, dict) else ""
         processed_jobs += 1
-        idx = processed_jobs
+        if row_counter is None:
+            idx = processed_jobs
+        else:
+            row_counter["value"] += 1
+            idx = row_counter["value"]
         total_jobs = None
         original_job = job.get("_ttc_job")
         if isinstance(original_job, dict):
@@ -6958,6 +6970,7 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
     ttc_fetch_state = TTCFetchState()
     blocked_accounts_this_session = set()
     print_job_table_header()
+    row_counter = {"value": 0}
     while True:
         for idx, acc in enumerate(fb_accounts):
             fb_token = str(acc.get('token') or '').strip()
@@ -6990,6 +7003,7 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
                     failed_delay_range=failed_delay_range,
                     skip_hidden_comments=skip_hidden_comments,
                     action=facebook_action,
+                    row_counter=row_counter,
                 )
             except FacebookInteractionBlocked as exc:
                 blocked_accounts_this_session.add(account_key)

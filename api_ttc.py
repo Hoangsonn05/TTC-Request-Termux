@@ -2274,12 +2274,28 @@ def print_warning(msg):
     print(f"{Fore.YELLOW}⚠️ {msg}{Style.RESET_ALL}")
 
 
+_TTC_JOB_TYPE_LABELS = {
+    "ttc_like_post_vip_cheo": "Like_Vip",
+    "ttc_like_post_vip_re": "Like_thường",
+    "ttc_reaction_vip_cheo": "CX_Vip",
+    "ttc_reaction_vip_re": "CX_Vip",
+    "ttc_comment": "Comment",
+    "like_facebook": "Like",
+    "like_poster": "Comment",
+}
+
+
+def compact_ttc_job_type(source):
+    """Return a short presentation label for a canonical TTC source."""
+    return _TTC_JOB_TYPE_LABELS.get(source, "Unknown")
+
+
 JOB_TABLE_HEADER = (
-    f"| {'STT':<3} | {'UID-TK làm job':<17} | {'ID-post':<17} | "
-    f"{'ID job':<20} | {'xu-thêm':<7} | {'Số dư':<8} |"
+    f"| {'STT':<3} | {'UID-TK làm job':<17} | {'ID-post':<18}|"
+    f" {'Type Job':<10}| {'xu-thêm':<7} | {'Số dư':<8} |"
 )
 JOB_TABLE_SEP = (
-    f"|{'-' * 5}|{'-' * 19}|{'-' * 19}|{'-' * 22}|{'-' * 9}|{'-' * 10}|"
+    f"|{'-' * 5}|{'-' * 19}|{'-' * 19}|{'-' * 11}|{'-' * 9}|{'-' * 10}|"
 )
 
 
@@ -2288,16 +2304,16 @@ def print_job_table_header():
     print(f"{Fore.LIGHTWHITE_EX}{Style.BRIGHT}{JOB_TABLE_SEP}{Style.RESET_ALL}")
 
 
-def print_job_row(stt, uid, post_id, job_id, coin, balance, success):
+def print_job_row(stt, uid, post_id, type_job, coin, balance, success):
     uid_text = str(uid or "-")[:17]
     post_text = str(post_id or "-")[:17]
-    job_text = str(job_id or "-")[:20]
+    type_job_text = str(type_job or "Unknown")[:11]
     coin_text = f"+{format_coin(coin)}" if success else "0"
     balance_text = "-" if balance is None else format_coin(balance)
     color = Fore.LIGHTGREEN_EX if success else Fore.LIGHTRED_EX
     print(
-        f"{color}| {stt:<3} | {uid_text:<17} | {post_text:<17} | "
-        f"{job_text:<20} | {coin_text:<7} | {balance_text[:8]:<8} |"
+        f"{color}| {stt:<3} | {uid_text:<17} | {post_text:<18}|"
+        f"{type_job_text:<11}| {coin_text:<7} | {balance_text[:8]:<8} |"
         f"{Style.RESET_ALL}"
     )
 
@@ -5853,7 +5869,7 @@ def _runtime_server_response(event_callback, job_type, server_raw_text,
 
 
 def _runtime_job_result(event_callback, index, total, job_type, state,
-                        earned_coin=None, **payload):
+                        earned_coin=None, type_job_source=None, **payload):
     """Render one table row from an already-decided actual job state."""
     labels = {
         "success": ("Thành công", "job_succeeded", "success"),
@@ -5868,7 +5884,7 @@ def _runtime_job_result(event_callback, index, total, job_type, state,
         index,
         payload.get("uid"),
         payload.get("post_id"),
-        payload.get("job_id"),
+        compact_ttc_job_type(type_job_source),
         earned_coin if success and earned_coin is not None else 0,
         payload.get("balance"),
         success,
@@ -6229,6 +6245,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                     post_id="-",
                     job_id=original_job.get("job_id", ""),
                     balance=latest_balance,
+                    type_job_source=original_job.get("ttc_source"),
                 )
                 _runtime_log(
                     event_callback, "warning",
@@ -6249,6 +6266,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                             job_type_display, "failed", uid=uid, post_id="-",
                             job_id=original_job.get("job_id", ""),
                             balance=latest_balance,
+                            type_job_source=original_job.get("ttc_source"),
                         )
                         _runtime_log(
                             event_callback, "error",
@@ -6266,6 +6284,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                             job_type_display, "failed", uid=uid, post_id="-",
                             job_id=original_job.get("job_id", ""),
                             balance=latest_balance,
+                            type_job_source=original_job.get("ttc_source"),
                         )
                         _runtime_log(
                             event_callback, "error",
@@ -6519,6 +6538,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                             session_coin=displayed_total,
                             balance=latest_balance,
                             claim_id=original_job.get("idpost", ""),
+                            type_job_source=original_job.get("ttc_source"),
                         )
                     else:
                         server_raw_text = result.get("server_raw_text", "")
@@ -6552,6 +6572,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                             job_id=original_job.get("job_id", ""),
                             balance=latest_balance,
                             claim_reason=result.get("reason", ""),
+                            type_job_source=original_job.get("ttc_source"),
                         )
                 elif not action_failure_decision_logged:
                     _runtime_job_result(
@@ -6561,6 +6582,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                         post_id=str(post_id),
                         job_id=original_job.get("job_id", ""),
                         balance=latest_balance,
+                        type_job_source=original_job.get("ttc_source"),
                     )
                     _runtime_log(
                         event_callback, "error",
@@ -6576,6 +6598,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                         post_id=str(post_id),
                         job_id=original_job.get("job_id", ""),
                         balance=latest_balance,
+                        type_job_source=original_job.get("ttc_source"),
                     )
 
         if not wait_after_actual_job(job_succeeded, type_):

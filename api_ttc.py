@@ -6897,11 +6897,13 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
                 continue
             identity = str(acc.get('email') or '').strip() or f"Account {idx+1}"
             api = None
+            facebook_action = None
             try:
                 worker_id = f"{profile_id or 'profile'}:{idx+1}"
                 api = API_TTC(auth_token, worker_id=worker_id)
                 api.use_fetch_state(ttc_fetch_state)
                 api.login()
+                facebook_action = AUTO_Action()
                 run_ttc_jobs(
                     api,
                     fb_token,
@@ -6915,6 +6917,7 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
                     comment_delay_range=comment_delay_range,
                     failed_delay_range=failed_delay_range,
                     skip_hidden_comments=skip_hidden_comments,
+                    action=facebook_action,
                 )
             except FacebookInteractionBlocked as exc:
                 blocked_accounts_this_session.add(account_key)
@@ -6927,8 +6930,14 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
                 if not print_ttc_exception(f"Lỗi TTC với {identity}.", exc):
                     print_error(_mask_sensitive_text(f"Lỗi với {identity}: {exc}"))
             finally:
-                if api:
-                    api.close()
+                try:
+                    if facebook_action is not None:
+                        close_action = getattr(facebook_action, "close", None)
+                        if callable(close_action):
+                            close_action()
+                finally:
+                    if api:
+                        api.close()
             if idx < len(fb_accounts) - 1:
                 account_delay = random.randint(*account_delay_range)
                 _cooperative_countdown(account_delay, "Chuyển account")

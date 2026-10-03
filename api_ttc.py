@@ -804,9 +804,16 @@ def _decode_response_body(response):
     }
 
 
-def _safe_json(response, label="response", allow_plain_text=False):
+def _safe_json(
+    response,
+    label="response",
+    allow_plain_text=False,
+    *,
+    decoded_text=None,
+):
     """Parse JSON from decoded body; optionally return plain text for claim diagnostics."""
-    decoded_text, _meta = _decode_response_body(response)
+    if decoded_text is None:
+        decoded_text, _meta = _decode_response_body(response)
     try:
         return json.loads(decoded_text)
     except Exception as e:
@@ -1760,7 +1767,12 @@ class TTCClient:
                 **response_metadata,
             )
 
-        data = _safe_json(resp, f"claim_reward({job_type})", allow_plain_text=True)
+        data = _safe_json(
+            resp,
+            f"claim_reward({job_type})",
+            allow_plain_text=True,
+            decoded_text=decoded_text,
+        )
         message = _extract_message(data)
         evidence = _summarize_claim_response(
             data,

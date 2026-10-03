@@ -914,11 +914,11 @@ def _is_vip_ineligible_message(message: str) -> bool:
     return "chưa đủ điều kiện làm nhiệm vụ vip" in normalized
 
 
-def _job_cooldown_seconds(message: str) -> int:
+def _job_cooldown_seconds(message: str) -> int | None:
     """Match only the observed TTC 'Lấy nhiệm vụ sau <N> giây' contract."""
     normalized = " ".join(_strip_accents(str(message or "")).casefold().split())
     match = re.search(r"\blay nhiem vu sau\s+(\d+)\s+giay\b", normalized)
-    return int(match.group(1)) if match else 0
+    return int(match.group(1)) if match else None
 
 
 def _server_evidence_message(summary, job_type, server_raw_text, classification):
@@ -1532,7 +1532,7 @@ class TTCClient:
             )
 
         retry_after = _job_cooldown_seconds(semantic_text)
-        if retry_after > 0:
+        if retry_after is not None:
             raise TTCJobCooldown(
                 _server_evidence_message(
                     f"[TTC] Endpoint cooldown while fetching {job_type}.",
@@ -2344,10 +2344,10 @@ def compact_ttc_job_type(source, job_id="", earned_coin=None, success=False):
 
 JOB_TABLE_HEADER = (
     f"| {'STT':<3} | {'UID-TK làm job':<17} | {'ID-post':<18}|"
-    f" {'Type Job':<10}| {'xu-thêm':<7} | {'Số dư':<8} |"
+    f" {'Type Job':<10}| {'xu-thêm':<7} | {'Số dư':<12} |"
 )
 JOB_TABLE_SEP = (
-    f"|{'-' * 5}|{'-' * 19}|{'-' * 19}|{'-' * 11}|{'-' * 9}|{'-' * 10}|"
+    f"|{'-' * 5}|{'-' * 19}|{'-' * 19}|{'-' * 11}|{'-' * 9}|{'-' * 14}|"
 )
 
 
@@ -2365,7 +2365,7 @@ def print_job_row(stt, uid, post_id, type_job, coin, balance, success):
     color = Fore.LIGHTGREEN_EX if success else Fore.LIGHTRED_EX
     print(
         f"{color}| {stt:<3} | {uid_text:<17} | {post_text:<18}|"
-        f"{type_job_text:<11}| {coin_text:<7} | {balance_text[:8]:<8} |"
+        f"{type_job_text:<11}| {coin_text:<7} | {balance_text:<12} |"
         f"{Style.RESET_ALL}"
     )
 
@@ -6146,6 +6146,30 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
             delay, "Chờ job tiếp theo", stop_event, event_callback
         )
 
+    def fetch_validated(fetch_type):
+        result = api.fetch_jobs_for_legacy_type(fetch_type)
+        if (not isinstance(result, dict)
+                or not isinstance(result.get("jobs"), list)
+                or not isinstance(result.get("no_job"), list)):
+            raise ValueError("TTC adapter returned an invalid fetch result")
+        cooldowns = result.get("cooldowns", [])
+        permanent_skips = result.get("permanent_skips", [])
+        if (not isinstance(cooldowns, list)
+                or not isinstance(permanent_skips, list)):
+            raise ValueError("TTC adapter returned invalid endpoint-state metadata")
+        for item in result["no_job"]:
+            if not isinstance(item, dict):
+                raise ValueError("TTC adapter returned invalid no-job metadata")
+        for item in cooldowns:
+            if not isinstance(item, dict):
+                raise ValueError("TTC adapter returned invalid cooldown metadata")
+        for item in permanent_skips:
+            if not isinstance(item, dict):
+                raise ValueError(
+                    "TTC adapter returned invalid permanent-skip metadata"
+                )
+        return result, cooldowns, permanent_skips
+
     while total_done < max_jobs and active_types:
         if _runtime_stop_requested(stop_event):
             _emit_runtime_event(
@@ -6159,20 +6183,37 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
             for fetch_type in ("like_facebook", "like_poster"):
                 if fetch_type not in active_types:
                     continue
-                result = api.fetch_jobs_for_legacy_type(fetch_type)
-                if (not isinstance(result, dict)
-                        or not isinstance(result.get("jobs"), list)
-                        or not isinstance(result.get("no_job"), list)):
-                    raise ValueError("TTC adapter returned an invalid fetch result")
-                cooldowns = result.get("cooldowns", [])
-                permanent_skips = result.get("permanent_skips", [])
-                if (not isinstance(cooldowns, list)
-                        or not isinstance(permanent_skips, list)):
-                    raise ValueError("TTC adapter returned invalid endpoint-state metadata")
+                result, cooldowns, permanent_skips = fetch_validated(fetch_type)
+
+                comment_retry_wait = None
+                if fetch_type == "like_poster" and not result["jobs"]:
+                    if result["no_job"] and not cooldowns:
+                        comment_retry_wait = _ttc_no_job_wait_seconds(
+                            result["no_job"]
+                        )
+                    elif cooldowns:
+                        remaining_values = []
+                        for item in cooldowns:
+                            remaining = _parse_strict_integer(item.get("remaining"))
+                            if remaining is None or remaining < 0:
+                                raise ValueError(
+                                    "TTC adapter returned invalid cooldown remaining"
+                                )
+                            remaining_values.append(remaining)
+                        comment_retry_wait = max(remaining_values)
+
+                if comment_retry_wait is not None:
+                    if not _cooperative_countdown(
+                            comment_retry_wait, "Chờ Comment",
+                            stop_event, event_callback):
+                        _emit_runtime_event(
+                            event_callback, "stopped",
+                            "Đã ngắt chờ Comment.", jobs_succeeded=total_done,
+                        )
+                        return total_done
+                    result, cooldowns, permanent_skips = fetch_validated(fetch_type)
 
                 for item in cooldowns:
-                    if not isinstance(item, dict):
-                        raise ValueError("TTC adapter returned invalid cooldown metadata")
                     if item.get("source") == "server":
                         _runtime_server_response(
                             event_callback,
@@ -6203,10 +6244,6 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                     })
 
                 for item in permanent_skips:
-                    if not isinstance(item, dict):
-                        raise ValueError(
-                            "TTC adapter returned invalid permanent-skip metadata"
-                        )
                     if item.get("source") == "server":
                         _runtime_server_response(
                             event_callback,

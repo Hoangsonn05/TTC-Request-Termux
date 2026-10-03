@@ -4421,46 +4421,46 @@ def get_facebook_post_id(url, log_fn=None):
         'Sec-Fetch-User': '?1',
         'Cache-Control': 'max-age=0',
     }
-    session = requests.Session()
-    session.headers.update(headers)
-    max_attempts = 3
-    for attempt in range(1, max_attempts + 1):
-        try:
-            resp = session.get(url, timeout=15, allow_redirects=True)
-            if resp.status_code != 200:
-                failure = f"Lỗi HTTP {resp.status_code} khi lấy Post ID"
-            else:
-                html = resp.text
-                try:
-                    uid = html.split('"post_id":"')[1].split('",')[0]
-                except (AttributeError, IndexError):
-                    if log_fn is None:
-                        print("Không tìm thấy Post ID trong phản hồi Facebook.")
-                    else:
-                        log_fn("Không tìm thấy Post ID trong phản hồi Facebook.", "warning")
-                    return None
-                if log_fn is None:
-                    print(f"{Fore.GREEN}{Style.BRIGHT}✅ Post ID: {uid}{Style.RESET_ALL}")
+    with requests.Session() as session:
+        session.headers.update(headers)
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = session.get(url, timeout=15, allow_redirects=True)
+                if resp.status_code != 200:
+                    failure = f"Lỗi HTTP {resp.status_code} khi lấy Post ID"
                 else:
-                    log_fn(f"Post ID: {uid}", "success")
-                return uid
-        except requests.RequestException as exc:
-            failure = f"Lấy Post ID timeout/lỗi mạng: {exc}"
+                    html = resp.text
+                    try:
+                        uid = html.split('"post_id":"')[1].split('",')[0]
+                    except (AttributeError, IndexError):
+                        if log_fn is None:
+                            print("Không tìm thấy Post ID trong phản hồi Facebook.")
+                        else:
+                            log_fn("Không tìm thấy Post ID trong phản hồi Facebook.", "warning")
+                        return None
+                    if log_fn is None:
+                        print(f"{Fore.GREEN}{Style.BRIGHT}✅ Post ID: {uid}{Style.RESET_ALL}")
+                    else:
+                        log_fn(f"Post ID: {uid}", "success")
+                    return uid
+            except requests.RequestException as exc:
+                failure = f"Lấy Post ID timeout/lỗi mạng: {exc}"
 
-        if attempt < max_attempts:
-            message = f"{failure}, thử lại {attempt + 1}/{max_attempts}..."
-            if log_fn is None:
-                print(message)
+            if attempt < max_attempts:
+                message = f"{failure}, thử lại {attempt + 1}/{max_attempts}..."
+                if log_fn is None:
+                    print(message)
+                else:
+                    log_fn(message, "warning")
+                time.sleep(NETWORK_RETRY_DELAY)
             else:
-                log_fn(message, "warning")
-            time.sleep(NETWORK_RETRY_DELAY)
-        else:
-            message = f"{failure}; đã hết {max_attempts} lần thử."
-            if log_fn is None:
-                print(message)
-            else:
-                log_fn(message, "error")
-    return None
+                message = f"{failure}; đã hết {max_attempts} lần thử."
+                if log_fn is None:
+                    print(message)
+                else:
+                    log_fn(message, "error")
+        return None
 
 
 def _resolve_ttc_facebook_post_id(job, log_fn=None):
@@ -6817,6 +6817,7 @@ def get_profile_balance(profile_id):
 def get_profile_jobs_preview(profile_id, account_key=None):
     """Fetch current normalized jobs for GUI/background callers."""
     api = None
+    action = None
     with profile_run_lock(profile_id):
         try:
             profile = get_profile_snapshot(profile_id)
@@ -6852,8 +6853,12 @@ def get_profile_jobs_preview(profile_id, account_key=None):
                 jobs.extend(result["jobs"])
             return {"uid": uid, "jobs": jobs}
         finally:
-            if api is not None:
-                api.close()
+            try:
+                if action is not None:
+                    action.close()
+            finally:
+                if api is not None:
+                    api.close()
 
 
 def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_per_acc=30,
@@ -7022,6 +7027,7 @@ def show_jobs_for_profile(profile):
         print_error("Cần TTC token và ít nhất một Facebook token.")
         return
     api = None
+    action = None
     try:
         with profile_run_lock(profile.get('profile_id')):
             worker_id = f"{profile.get('profile_id') or 'profile'}:preview"
@@ -7063,8 +7069,12 @@ def show_jobs_for_profile(profile):
         if not print_ttc_exception("Lỗi TTC khi lấy danh sách job.", exc):
             print_error(f"Lỗi: {exc}")
     finally:
-        if api:
-            api.close()
+        try:
+            if action is not None:
+                action.close()
+        finally:
+            if api:
+                api.close()
 
 
 def print_menu(profile):

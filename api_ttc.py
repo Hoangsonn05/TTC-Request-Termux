@@ -2056,7 +2056,13 @@ class API_TTC:
 
     def submit_job(self, job):
         original_job = job.get("_ttc_job", job) if isinstance(job, dict) else job
-        return self._client.submit_job(original_job)
+        result = self._client.submit_job(original_job)
+        current_balance = self._client._initial_balance
+        if (isinstance(result, dict) and result.get("success") is True
+                and isinstance(current_balance, int)
+                and not isinstance(current_balance, bool)):
+            self._fetch_state.cached_balance = current_balance
+        return result
 
     def get_account_info(self):
         return self._client.get_account_info()

@@ -67,6 +67,14 @@ FACEBOOK_REACTION_TRANSIENT_DESCRIPTION = (
 )
 INTERACTION_BLOCKED = "INTERACTION_BLOCKED"
 INTERACTION_BLOCKED_EVENT = "interaction_blocked"
+COMMENT_ONLY_BLOCK = "COMMENT_ONLY_BLOCK"
+REACTION_BLOCK = "REACTION_BLOCK"
+ACCOUNT_INTERACTION_BLOCKED = "ACCOUNT_INTERACTION_BLOCKED"
+COMMENT_HIDDEN_OR_PENDING = "COMMENT_HIDDEN_OR_PENDING"
+TRANSIENT_ERROR = "TRANSIENT_ERROR"
+ORDINARY_FAILURE = "ORDINARY_FAILURE"
+UNKNOWN_FAILURE = "UNKNOWN_FAILURE"
+PAUSED_BY_SAFETY = "PAUSED_BY_SAFETY"
 RUNTIME_DEBUG_ENV = "TTC_DEBUG"
 _INTERACTION_BLOCKED_FEATURE_TEXT = (
     "sorry, this feature isn't available right now"
@@ -84,7 +92,13 @@ _INTERACTION_BLOCKED_SECURITY_TEXT = (
 
 
 def _normalize_facebook_interaction_error_text(value):
-    text = unicodedata.normalize("NFKC", str(value or ""))
+    text = str(value or "")
+    text = re.sub(
+        r"\\u([0-9a-fA-F]{4})",
+        lambda match: chr(int(match.group(1), 16)),
+        text,
+    )
+    text = unicodedata.normalize("NFKC", text)
     text = text.translate(str.maketrans({
         "’": "'", "‘": "'", "`": "'", "´": "'",
         "‐": " ", "‑": " ", "‒": " ", "–": " ", "—": " ", "―": " ",
@@ -92,25 +106,153 @@ def _normalize_facebook_interaction_error_text(value):
     return " ".join(text.casefold().split())
 
 
-def _facebook_interaction_block_message(errors):
-    """Return the precise Facebook security-check error, otherwise None."""
-    if not isinstance(errors, list):
-        return None
-    for error in errors:
-        if not isinstance(error, dict):
-            continue
-        parts = [
-            str(error.get(field) or "").strip()
-            for field in ("message", "summary", "description")
-        ]
-        parts = [part for part in parts if part]
-        combined = " ".join(parts)
-        normalized = _normalize_facebook_interaction_error_text(combined)
-        if (
-            _INTERACTION_BLOCKED_FEATURE_TEXT in normalized
-            and _INTERACTION_BLOCKED_SECURITY_TEXT in normalized
-        ):
-            return combined
+def _facebook_error_match_text(value):
+    normalized = _normalize_facebook_interaction_error_text(value)
+    decomposed = unicodedata.normalize("NFKD", normalized)
+    without_marks = "".join(
+        char for char in decomposed if unicodedata.category(char) != "Mn"
+    )
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", without_marks).split())
+
+
+@dataclass(frozen=True)
+class FacebookFailureClassification:
+    classification: str
+    message: str = ""
+    code: int = None
+    confirmed: bool = False
+
+
+def _facebook_error_records(value):
+    records = []
+
+    def visit(item):
+        if isinstance(item, dict):
+            if any(key in item for key in (
+                    "message", "summary", "description", "code", "error_subcode")):
+                records.append(item)
+            for nested in item.values():
+                if isinstance(nested, (dict, list, tuple)):
+                    visit(nested)
+        elif isinstance(item, (list, tuple)):
+            for nested in item:
+                visit(nested)
+
+    visit(value)
+    return records
+
+
+def _facebook_failure_classification(response, action_kind=None):
+    """Classify Facebook failure evidence without promoting ambiguity to block."""
+    action_kind = str(action_kind or "").strip().casefold()
+    records = _facebook_error_records(response)
+    if not records:
+        return FacebookFailureClassification(UNKNOWN_FAILURE)
+
+    parts = []
+    codes = []
+    for record in records:
+        for field in ("message", "summary", "description"):
+            value = record.get(field)
+            if isinstance(value, str) and value.strip():
+                parts.append(value.strip())
+        for field in ("code", "error_subcode"):
+            value = record.get(field)
+            if isinstance(value, int) and not isinstance(value, bool):
+                codes.append(value)
+            elif isinstance(value, str) and value.strip().isdigit():
+                codes.append(int(value.strip()))
+
+    message = " — ".join(dict.fromkeys(parts))
+    match_text = _facebook_error_match_text(message)
+    code = codes[0] if codes else None
+
+    account_markers = (
+        "account is restricted from interacting",
+        "account has been restricted from interacting",
+        "cannot interact with posts",
+        "all interactions are restricted",
+        "tai khoan bi han che tuong tac",
+        "tai khoan cua ban bi han che tuong tac",
+        "khong the tuong tac voi bai viet",
+        "bi chan moi tuong tac",
+    )
+    comment_markers = (
+        "temporarily blocked from commenting",
+        "you can t comment right now",
+        "you cannot comment right now",
+        "comments have been restricted",
+        "hien khong the binh luan",
+        "bi chan binh luan",
+        "bi han che binh luan",
+        "khong the su dung tinh nang binh luan",
+    )
+    reaction_markers = (
+        "temporarily blocked from reacting",
+        "you can t react right now",
+        "you cannot react right now",
+        "reactions have been restricted",
+        "hien khong the bay to cam xuc",
+        "bi chan bay to cam xuc",
+        "bi han che bay to cam xuc",
+        "khong the thich bai viet",
+    )
+    feature_markers = (
+        "sorry this feature isn t available right now",
+        "sorry this feature is not available right now",
+        "tinh nang nay hien khong kha dung",
+        "ban hien khong the su dung tinh nang nay",
+    )
+    security_markers = (
+        "a security check is required to proceed",
+        "security check is required to proceed",
+        "can kiem tra bao mat de tiep tuc",
+        "yeu cau kiem tra bao mat de tiep tuc",
+    )
+    transient_markers = (
+        "something went wrong",
+        "please try again",
+        "temporarily unavailable",
+        "request timed out",
+        "rate limit",
+        "qua nhieu yeu cau",
+        "thu lai sau",
+    )
+
+    if any(marker in match_text for marker in account_markers):
+        return FacebookFailureClassification(
+            ACCOUNT_INTERACTION_BLOCKED, message, code, True
+        )
+    if any(marker in match_text for marker in comment_markers):
+        return FacebookFailureClassification(COMMENT_ONLY_BLOCK, message, code, True)
+    if any(marker in match_text for marker in reaction_markers):
+        return FacebookFailureClassification(REACTION_BLOCK, message, code, True)
+
+    feature_error = any(marker in match_text for marker in feature_markers)
+    security_error = any(marker in match_text for marker in security_markers)
+    structured_block = 368 in codes
+    if structured_block or (feature_error and security_error):
+        scoped_classification = (
+            COMMENT_ONLY_BLOCK if action_kind == "comment" else
+            REACTION_BLOCK if action_kind == "reaction" else
+            ACCOUNT_INTERACTION_BLOCKED
+        )
+        return FacebookFailureClassification(
+            scoped_classification, message, code, True
+        )
+    if any(marker in match_text for marker in transient_markers) or any(
+            item in {1, 2, 4, 17, 32, 613} for item in codes):
+        return FacebookFailureClassification(TRANSIENT_ERROR, message, code)
+    if message or codes:
+        return FacebookFailureClassification(ORDINARY_FAILURE, message, code)
+    return FacebookFailureClassification(UNKNOWN_FAILURE)
+
+
+def _facebook_interaction_block_message(errors, action_kind=None):
+    """Compatibility helper returning only confirmed interaction restrictions."""
+    classification = _facebook_failure_classification(errors, action_kind)
+    if classification.confirmed:
+        return classification.message
     return None
 
 
@@ -122,16 +264,119 @@ def _interaction_blocked_status(blocked_at):
 
 
 class FacebookInteractionBlocked(RuntimeError):
-    """Account-fatal Facebook auto-action security check for this run only."""
+    """Confirmed Facebook restriction scoped to an action or whole account."""
 
-    classification = INTERACTION_BLOCKED
-
-    def __init__(self, response_message, blocked_at=None):
+    def __init__(self, response_message, blocked_at=None,
+                 classification=ACCOUNT_INTERACTION_BLOCKED):
+        if classification not in {
+                COMMENT_ONLY_BLOCK, REACTION_BLOCK, ACCOUNT_INTERACTION_BLOCKED}:
+            raise ValueError("invalid Facebook block classification")
+        self.classification = classification
         self.response_message = str(response_message or "").strip()
         self.blocked_at = blocked_at or datetime.now().astimezone()
         if not isinstance(self.blocked_at, datetime):
             raise TypeError("blocked_at must be a datetime")
         super().__init__(_interaction_blocked_status(self.blocked_at))
+
+
+class ConsecutiveJobFailureLimitReached(RuntimeError):
+    def __init__(self, uid, count, threshold):
+        self.uid = str(uid or "-")
+        self.count = int(count)
+        self.threshold = int(threshold)
+        super().__init__(
+            f"UID {self.uid} đạt {self.count}/{self.threshold} job thất bại liên tiếp"
+        )
+
+
+class ProfileSafetyStopRequested(RuntimeError):
+    pass
+
+
+class ProfileRunSafetyCoordinator:
+    """Thread-safe, session-local block ratio and Facebook-action barrier."""
+
+    def __init__(self, account_keys):
+        self.account_keys = frozenset(
+            str(key).strip() for key in account_keys if str(key).strip()
+        )
+        self.total_accounts = len(self.account_keys)
+        self.block_threshold = (
+            math.ceil(2 * self.total_accounts / 3) if self.total_accounts else 0
+        )
+        self.blocked_accounts = set()
+        self.suspended_accounts = set()
+        self.state = "RUNNING"
+        self._condition = threading.Condition()
+        self._in_flight = set()
+        self._safety_event_emitted = False
+
+    def acquire_action_slot(self, account_key, stop_event=None):
+        account_key = str(account_key or "").strip()
+        with self._condition:
+            while self.state == PAUSED_BY_SAFETY:
+                if _runtime_stop_requested(stop_event):
+                    return False
+                self._condition.wait(0.1)
+            if self.state == "STOPPED" or _runtime_stop_requested(stop_event):
+                return False
+            if (account_key in self.blocked_accounts
+                    or account_key in self.suspended_accounts):
+                return False
+            self._in_flight.add(account_key)
+            return True
+
+    def release_action_slot(self, account_key):
+        with self._condition:
+            self._in_flight.discard(str(account_key or "").strip())
+            self._condition.notify_all()
+
+    def report_confirmed_block(self, account_key):
+        account_key = str(account_key or "").strip()
+        with self._condition:
+            newly_blocked = account_key in self.account_keys and account_key not in self.blocked_accounts
+            if newly_blocked:
+                self.blocked_accounts.add(account_key)
+            blocked_count = len(self.blocked_accounts)
+            pause_required = (
+                self.block_threshold > 0
+                and blocked_count >= self.block_threshold
+                and not self._safety_event_emitted
+                and self.state != "STOPPED"
+            )
+            if pause_required:
+                self.state = PAUSED_BY_SAFETY
+                self._safety_event_emitted = True
+            self._condition.notify_all()
+            return {
+                "newly_blocked": newly_blocked,
+                "pause_required": pause_required,
+                "blocked": blocked_count,
+                "total": self.total_accounts,
+                "threshold": self.block_threshold,
+            }
+
+    def suspend_account(self, account_key):
+        with self._condition:
+            self.suspended_accounts.add(str(account_key or "").strip())
+            self._condition.notify_all()
+
+    def resolve_pause(self, continue_running):
+        with self._condition:
+            if self.state != PAUSED_BY_SAFETY:
+                return self.state != "STOPPED"
+            self.state = "RUNNING" if continue_running else "STOPPED"
+            self._condition.notify_all()
+            return bool(continue_running)
+
+    def request_stop(self):
+        with self._condition:
+            self.state = "STOPPED"
+            self._condition.notify_all()
+
+    def notify_waiters(self):
+        with self._condition:
+            self._condition.notify_all()
 
 # =====================================================================
 # TTC API implementation
@@ -2539,6 +2784,7 @@ DEFAULT_RUN_CONFIG = {
     "job_types": ["like_facebook", "like_poster"],
     "continuous": False,
     "max_jobs_per_acc": 30,
+    "max_consecutive_failed_jobs": 5,
     "like_batch_min": 10,
     "like_batch_max": 10,
     "comment_batch_min": 5,
@@ -2614,6 +2860,9 @@ def normalize_run_config(data=None):
     config["max_jobs_per_acc"] = validate_batch_limit(
         config["max_jobs_per_acc"], "max jobs per account"
     )
+    config["max_consecutive_failed_jobs"] = validate_batch_limit(
+        config["max_consecutive_failed_jobs"], "max consecutive failed jobs"
+    )
     resolve_burst_ranges(
         like_batch_min=config["like_batch_min"],
         like_batch_max=config["like_batch_max"],
@@ -2646,6 +2895,7 @@ _RUN_CONFIG_FACADE_JOB_TYPES = {
 _RUN_CONFIG_FACADE_FIELDS = frozenset({
     "job_type",
     "max_jobs_per_acc",
+    "max_consecutive_failed_jobs",
     "job_delay_min",
     "job_delay_max",
     "account_delay_min",
@@ -2675,6 +2925,7 @@ def get_run_config_facade(run_config=None):
     return {
         "job_type": job_type,
         "max_jobs_per_acc": config["max_jobs_per_acc"],
+        "max_consecutive_failed_jobs": config["max_consecutive_failed_jobs"],
         "job_delay_min": shared_delay[0],
         "job_delay_max": shared_delay[1],
         "account_delay_min": config["account_delay_min"],
@@ -2705,6 +2956,7 @@ def apply_run_config_facade(run_config, facade_values):
 
     direct_fields = (
         "max_jobs_per_acc",
+        "max_consecutive_failed_jobs",
         "account_delay_min",
         "account_delay_max",
         "continuous",
@@ -2746,6 +2998,7 @@ def run_config_facade_summary(run_config):
     return (
         f"Job={job_labels[facade['job_type']]} | "
         f"max={facade['max_jobs_per_acc']} | "
+        f"fail-streak={facade['max_consecutive_failed_jobs']} | "
         f"delay={delay_summary} | "
         f"acc={facade['account_delay_min']}-{facade['account_delay_max']}s | "
         f"continuous={'ON' if facade['continuous'] else 'OFF'}"
@@ -3888,6 +4141,18 @@ def _is_comment_pending_approval(evidence):
     )
 
 
+def _is_comment_hidden_or_pending(evidence):
+    """Use only explicit Facebook visibility fields for non-claimable comments."""
+    if not isinstance(evidence, dict):
+        return False
+    if _is_comment_pending_approval(evidence):
+        return True
+    visibility = evidence.get("visibility_fields")
+    if not isinstance(visibility, dict):
+        return False
+    return visibility.get("is_hidden") is True or visibility.get("is_pending") is True
+
+
 FACEBOOK_LIVE = "LIVE"
 FACEBOOK_DIE_TOKEN = "DIE_TOKEN"
 FACEBOOK_CHECK_ERROR = "CHECK_ERROR"
@@ -4144,7 +4409,7 @@ class AUTO_Action:
         except requests.RequestException as exc:
             return FacebookReactionAttemptResult(
                 False,
-                "NETWORK_UNKNOWN",
+                UNKNOWN_FAILURE,
                 description=_safe_display_message(
                     _mask_sensitive_text(str(exc)), limit=500
                 ),
@@ -4156,25 +4421,29 @@ class AUTO_Action:
         except (TypeError, ValueError) as exc:
             return FacebookReactionAttemptResult(
                 False,
-                "PARSE_ERROR",
+                UNKNOWN_FAILURE,
                 description=_safe_display_message(str(exc), limit=300),
                 raw_text=response_text[:500],
             )
         if not isinstance(result, dict):
             return FacebookReactionAttemptResult(
                 False,
-                "PARSE_ERROR",
+                UNKNOWN_FAILURE,
                 description="Facebook trả về dữ liệu reaction không hợp lệ.",
                 raw_text=response_text[:500],
             )
 
-        errors = result.get("errors")
-        if errors is not None:
-            if not isinstance(errors, list):
-                errors = []
-            blocked_message = _facebook_interaction_block_message(errors)
-            if blocked_message is not None:
-                raise FacebookInteractionBlocked(blocked_message)
+        errors_payload = result.get("errors")
+        if errors_payload is None and "error" in result:
+            errors_payload = result.get("error")
+        if errors_payload is not None:
+            failure = _facebook_failure_classification(errors_payload, "reaction")
+            if failure.confirmed:
+                raise FacebookInteractionBlocked(
+                    failure.message,
+                    classification=failure.classification,
+                )
+            errors = errors_payload if isinstance(errors_payload, list) else [errors_payload]
             error_texts = [
                 self._reaction_error_text(item)
                 for item in errors
@@ -4183,12 +4452,12 @@ class AUTO_Action:
             error_texts = [pair for pair in error_texts if any(pair)]
             summary, description = error_texts[0] if error_texts else ("", "")
             classification = (
-                "TRANSIENT_RESPONSE"
+                TRANSIENT_ERROR
                 if error_texts and all(
                     self._is_transient_reaction_error(item_summary, item_description)
                     for item_summary, item_description in error_texts
                 )
-                else "NON_RETRYABLE_RESPONSE"
+                else failure.classification
             )
             raw_text = "\n".join(
                 " — ".join(part for part in pair if part)
@@ -4216,7 +4485,7 @@ class AUTO_Action:
             return FacebookReactionAttemptResult(True, "SUCCESS")
         return FacebookReactionAttemptResult(
             False,
-            "NON_RETRYABLE_RESPONSE",
+            UNKNOWN_FAILURE,
             description="Phản hồi Facebook thiếu dữ liệu xác nhận reaction.",
             raw_text=_safe_display_message(response_text, limit=500),
         )
@@ -4281,7 +4550,7 @@ class AUTO_Action:
                 break
             if not (
                 attempts == 1
-                and attempt_result.classification == "TRANSIENT_RESPONSE"
+                and attempt_result.classification == TRANSIENT_ERROR
             ):
                 break
             details = " — ".join(
@@ -4423,19 +4692,41 @@ class AUTO_Action:
                 "X-FB-Friendly-Name": "CommentCreateMutation",
             }, data=payload, timeout=FB_ACTION_TIMEOUT)
         except requests.RequestException as exc:
+            self.last_comment_evidence = {
+                "classification": TRANSIENT_ERROR,
+                "reason": _safe_display_message(
+                    _mask_sensitive_text(str(exc)), limit=500
+                ),
+            }
             self._log(f"Facebook comment timeout/lỗi mạng: {exc}; outcome unknown", "error")
             return False
         try:
             result = res.json()
-        except:
+        except (TypeError, ValueError):
+            self.last_comment_evidence = {"classification": UNKNOWN_FAILURE}
             self._log("Lỗi parse JSON phản hồi Facebook comment.", "error")
             self._log(res.text[:500], "raw")
             return False
-        if "errors" in result:
-            blocked_message = _facebook_interaction_block_message(result.get("errors"))
-            if blocked_message is not None:
-                raise FacebookInteractionBlocked(blocked_message)
-            for err in result["errors"]:
+        if not isinstance(result, dict):
+            self.last_comment_evidence = {"classification": UNKNOWN_FAILURE}
+            return False
+        if "errors" in result or "error" in result:
+            errors_payload = result.get("errors")
+            if errors_payload is None:
+                errors_payload = result.get("error")
+            failure = _facebook_failure_classification(errors_payload, "comment")
+            self.last_comment_evidence = {
+                "classification": failure.classification,
+                "facebook_message": failure.message,
+                "code": failure.code,
+            }
+            if failure.confirmed:
+                raise FacebookInteractionBlocked(
+                    failure.message,
+                    classification=failure.classification,
+                )
+            errors = errors_payload if isinstance(errors_payload, list) else [errors_payload]
+            for err in errors:
                 summary, description = self._reaction_error_text(err)
                 raw_text = " — ".join(
                     part for part in (summary, description) if part
@@ -5282,6 +5573,7 @@ def run_config_summary(config):
         jobs.append('Comment')
     return (
         f"Job={'+'.join(jobs)} | max={config['max_jobs_per_acc']} | "
+        f"fail-streak={config['max_consecutive_failed_jobs']} | "
         f"burst L {config['like_batch_min']}-{config['like_batch_max']}, "
         f"C {config['comment_batch_min']}-{config['comment_batch_max']} | "
         f"delay L {config['like_delay_min']}-{config['like_delay_max']}s, "
@@ -5392,6 +5684,7 @@ def run_wizard_summary(config):
     return (
         f"Job       : {job_labels[facade['job_type']]}\n"
         f"Max/acc   : {facade['max_jobs_per_acc']}\n"
+        f"Fail limit: {facade['max_consecutive_failed_jobs']}\n"
         f"Job delay : {job_delay}\n"
         f"Acc delay : {facade['account_delay_min']}-{facade['account_delay_max']}s\n"
         f"Continuous: {'ON' if facade['continuous'] else 'OFF'}"
@@ -5416,6 +5709,16 @@ def _collect_run_wizard_config(run_config):
         return None
     if max_jobs[1]:
         updates["max_jobs_per_acc"] = max_jobs[0]
+
+    max_failed_jobs = _prompt_run_wizard_int(
+        "Số job thất bại liên tiếp tối đa",
+        facade["max_consecutive_failed_jobs"],
+        1,
+    )
+    if max_failed_jobs is _RUN_WIZARD_CANCEL:
+        return None
+    if max_failed_jobs[1]:
+        updates["max_consecutive_failed_jobs"] = max_failed_jobs[0]
 
     if facade["job_delay_min"] is None:
         print_info("Delay job hiện tại: đang dùng riêng theo từng loại job.")
@@ -5471,6 +5774,7 @@ def configure_run(profile):
     persisted_updates = {"job_types": candidate["job_types"]}
     direct_fields = (
         "max_jobs_per_acc",
+        "max_consecutive_failed_jobs",
         "account_delay_min",
         "account_delay_max",
         "continuous",
@@ -6026,7 +6330,9 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                  stop_event=None, event_callback=None, metrics=None,
                  action=None, transaction_sleep_fn=None,
                  configure_remote_uid=True, facebook_live_result=None,
-                 row_counter=None):
+                 row_counter=None, max_consecutive_failed_jobs=5,
+                 account_guard_state=None, account_key=None,
+                 safety_coordinator=None):
     global total_coin
     if (row_counter is not None
             and (not isinstance(row_counter, dict)
@@ -6036,6 +6342,21 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
             "row_counter must be a dict with an integer 'value' >= 0"
         )
     enabled_types = normalize_job_types(job_types)
+    max_consecutive_failed_jobs = validate_batch_limit(
+        max_consecutive_failed_jobs, "max consecutive failed jobs"
+    )
+    if account_guard_state is None:
+        account_guard_state = {}
+    if not isinstance(account_guard_state, dict):
+        raise TypeError("account_guard_state must be a dict")
+    consecutive_failures = account_guard_state.setdefault("consecutive_failures", 0)
+    if (not isinstance(consecutive_failures, int)
+            or isinstance(consecutive_failures, bool)
+            or consecutive_failures < 0):
+        raise ValueError("invalid consecutive failure state")
+    logged_block_types = account_guard_state.setdefault("logged_block_types", set())
+    if not isinstance(logged_block_types, set):
+        raise ValueError("invalid block incident state")
     transaction_sleep_fn = transaction_sleep_fn or time.sleep
     if metrics is not None:
         metrics.setdefault("jobs_succeeded", 0)
@@ -6106,6 +6427,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
     if live_result.status != FACEBOOK_LIVE:
         return 0
     uid = live_result.uid
+    account_key = str(account_key or uid or "").strip()
 
     if configure_remote_uid:
         api.set_facebook_uid(uid)
@@ -6122,14 +6444,107 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
 
     total_done = 0
     processed_jobs = 0
-    comment_disabled_for_this_turn = False
+    comment_disabled_for_this_turn = bool(
+        account_guard_state.get("comment_disabled", False)
+    )
     active_types = set(enabled_types)
+    if comment_disabled_for_this_turn:
+        active_types.discard("like_poster")
     job_queue = []
     attempted_job_keys = set()
     latest_balance = (
         metrics.get("balance") if metrics is not None
         else _latest_known_ttc_balance(api)
     )
+
+    def emit_safety_pause(result, blocked_at):
+        if not result.get("pause_required"):
+            return
+        timestamp = blocked_at.strftime("%d/%m/%Y %H:%M:%S")
+        message = (
+            f"[SAFETY PAUSE] Đã có {result['blocked']}/{result['total']} "
+            f"tài khoản bị block | Thời điểm: {timestamp}"
+        )
+        _runtime_log(
+            event_callback, "warning", message,
+            terminal_printer=print_warning, visibility="critical",
+            blocked=result["blocked"], total=result["total"],
+            threshold=result["threshold"], status=PAUSED_BY_SAFETY,
+        )
+        _emit_runtime_event(
+            event_callback, "safety_pause_required", message,
+            status=PAUSED_BY_SAFETY, blocked=result["blocked"],
+            total=result["total"], threshold=result["threshold"],
+        )
+
+    def record_block_incident(exc):
+        classification = exc.classification
+        if classification not in logged_block_types:
+            logged_block_types.add(classification)
+            label = {
+                COMMENT_ONLY_BLOCK: "COMMENT",
+                REACTION_BLOCK: "REACTION",
+                ACCOUNT_INTERACTION_BLOCKED: "ACCOUNT",
+            }[classification]
+            timestamp = exc.blocked_at.strftime("%d/%m/%Y %H:%M:%S")
+            message = (
+                f"[BLOCK] UID: {uid} | Loại: {label} | Thời điểm: {timestamp}"
+            )
+            _runtime_log(
+                event_callback, "warning", message,
+                terminal_printer=print_warning, visibility="critical",
+                uid=uid, classification=classification,
+                blocked_at=exc.blocked_at.isoformat(),
+            )
+            _emit_runtime_event(
+                event_callback, INTERACTION_BLOCKED_EVENT, "",
+                uid=uid, classification=classification,
+                blocked_at=exc.blocked_at.isoformat(),
+            )
+            if exc.response_message:
+                _runtime_log(
+                    event_callback, "raw", exc.response_message,
+                    terminal_printer=print, visibility="debug",
+                    stage="facebook_block_response",
+                )
+        if (classification in {REACTION_BLOCK, ACCOUNT_INTERACTION_BLOCKED}
+                and safety_coordinator is not None):
+            result = safety_coordinator.report_confirmed_block(account_key)
+            emit_safety_pause(result, exc.blocked_at)
+
+    def finalize_job_result(*args, **kwargs):
+        state = args[4] if len(args) > 4 else kwargs.get("state")
+        _runtime_job_result(*args, **kwargs)
+        if state == "success":
+            account_guard_state["consecutive_failures"] = 0
+            return
+        if state != "failed":
+            return
+        count = account_guard_state.get("consecutive_failures", 0) + 1
+        account_guard_state["consecutive_failures"] = count
+        if count < max_consecutive_failed_jobs:
+            return
+        if not account_guard_state.get("failure_guard_logged"):
+            account_guard_state["failure_guard_logged"] = True
+            timestamp = datetime.now().astimezone().strftime("%d/%m/%Y %H:%M:%S")
+            _runtime_log(
+                event_callback, "warning",
+                f"[FAIL GUARD] UID: {uid} | Fail: {count}/{max_consecutive_failed_jobs} "
+                f"| Thời điểm: {timestamp}",
+                terminal_printer=print_warning, visibility="critical",
+                uid=uid, fail_count=count,
+                threshold=max_consecutive_failed_jobs,
+            )
+            _emit_runtime_event(
+                event_callback, "account_suspended", "",
+                uid=uid, reason="consecutive_failures",
+                fail_count=count, threshold=max_consecutive_failed_jobs,
+            )
+        if safety_coordinator is not None:
+            safety_coordinator.suspend_account(account_key)
+        raise ConsecutiveJobFailureLimitReached(
+            uid, count, max_consecutive_failed_jobs
+        )
 
     def wait_after_actual_job(succeeded, actual_type):
         if total_done >= max_jobs or not active_types:
@@ -6349,14 +6764,14 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                 attempted_job_keys.add(attempted_key)
         job_succeeded = False
         if not isinstance(original_job, dict):
-            _runtime_job_result(
+            finalize_job_result(
                 event_callback, idx, total_jobs, type_ or "UNKNOWN", "failed",
                 uid=uid, post_id="-", job_id="-", balance=latest_balance,
             )
             _runtime_log(
                 event_callback, "error",
                 "TTC scheduler wrapper thiếu actual job; bỏ qua.",
-                stage="job_validation",
+                stage="job_validation", visibility="user",
             )
             if not wait_after_actual_job(False, type_):
                 break
@@ -6364,7 +6779,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
         else:
             object_id = original_job.get("object_id")
             if not object_id:
-                _runtime_job_result(
+                finalize_job_result(
                     event_callback, idx, total_jobs,
                     "LIKE" if type_ == "like_facebook" else "COMMENT",
                     "failed",
@@ -6378,6 +6793,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                     event_callback, "warning",
                     "Job TTC thiếu object_id; bỏ qua.",
                     terminal_printer=print_warning,
+                    visibility="user",
                     job_id=original_job.get("job_id", ""),
                 )
                 if not wait_after_actual_job(False, type_):
@@ -6388,7 +6804,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                 if type_ == "like_facebook":
                     reaction = original_job.get("reaction_type")
                     if not reaction:
-                        _runtime_job_result(
+                        finalize_job_result(
                             event_callback, idx, total_jobs,
                             job_type_display, "failed", uid=uid, post_id="-",
                             job_id=original_job.get("job_id", ""),
@@ -6398,7 +6814,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                         _runtime_log(
                             event_callback, "error",
                             "Job TTC thiếu reaction_type; bỏ qua.",
-                            stage="job_validation",
+                            stage="job_validation", visibility="user",
                         )
                         if not wait_after_actual_job(False, type_):
                             break
@@ -6406,7 +6822,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                 else:
                     comment_text = original_job.get("comment_text")
                     if not isinstance(comment_text, str) or not comment_text:
-                        _runtime_job_result(
+                        finalize_job_result(
                             event_callback, idx, total_jobs,
                             job_type_display, "failed", uid=uid, post_id="-",
                             job_id=original_job.get("job_id", ""),
@@ -6416,7 +6832,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                         _runtime_log(
                             event_callback, "error",
                             "Job TTC thiếu comment_text; bỏ qua.",
-                            stage="job_validation",
+                            stage="job_validation", visibility="user",
                         )
                         if not wait_after_actual_job(False, type_):
                             break
@@ -6445,7 +6861,19 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                 )
                 action_succeeded = False
                 action_failure_decision_logged = False
+                job_result_rendered = False
                 post_id = "-"
+                action_slot_acquired = False
+                if safety_coordinator is not None:
+                    action_slot_acquired = safety_coordinator.acquire_action_slot(
+                        account_key, stop_event
+                    )
+                    if not action_slot_acquired:
+                        if safety_coordinator.state == "STOPPED":
+                            raise ProfileSafetyStopRequested(
+                                "profile run stopped by safety decision"
+                            )
+                        return total_done
                 try:
                     post_id = _resolve_ttc_facebook_post_id(
                         original_job,
@@ -6488,17 +6916,10 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                                 )
                                 reaction_level = "error"
                                 action_failure_decision_logged = True
-                            elif reaction_evidence.get("classification") == "NETWORK_UNKNOWN":
+                            elif reaction_evidence.get("classification") == UNKNOWN_FAILURE:
                                 reaction_message = (
-                                    f"{reaction} gặp lỗi mạng; kết quả phản ứng chưa xác định "
+                                    f"{reaction} có kết quả chưa xác định "
                                     "nên không thử lại; bỏ qua job này."
-                                )
-                                reaction_level = "error"
-                                action_failure_decision_logged = True
-                            elif reaction_evidence.get("classification") == "PARSE_ERROR":
-                                reaction_message = (
-                                    f"Không đọc được phản hồi Facebook cho {reaction}; "
-                                    "không thử lại; bỏ qua job này."
                                 )
                                 reaction_level = "error"
                                 action_failure_decision_logged = True
@@ -6523,6 +6944,16 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                                 ),
                                 attempts=reaction_attempts,
                             )
+                            if not action_succeeded:
+                                _runtime_log(
+                                    event_callback, reaction_level,
+                                    reaction_message,
+                                    terminal_printer=print_error,
+                                    visibility="user",
+                                    classification=reaction_evidence.get(
+                                        "classification", ""
+                                    ),
+                                )
                         else:
                             _runtime_log(
                                 event_callback, "info",
@@ -6549,30 +6980,39 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                             )
                             if not action_succeeded:
                                 action_failure_decision_logged = True
+                                _runtime_log(
+                                    event_callback, "error",
+                                    "Comment thất bại; bỏ qua job này.",
+                                    terminal_printer=print_error,
+                                    visibility="user",
+                                )
                             comment_evidence = getattr(do_job, "last_comment_evidence", None)
                             if not isinstance(comment_evidence, dict):
                                 comment_evidence = {}
                             if action_succeeded:
-                                if _is_comment_pending_approval(comment_evidence):
+                                if _is_comment_hidden_or_pending(comment_evidence):
                                     _runtime_log(
                                         event_callback, "warning",
-                                        "Acc yếu bị Facebook ẩn comment.",
+                                        "Comment bị ẩn hoặc chờ duyệt; không gửi claim TTC.",
                                         terminal_printer=print_warning,
-                                        comment_state="pending_approval",
+                                        visibility="user",
+                                        comment_state=COMMENT_HIDDEN_OR_PENDING,
                                     )
                                     if skip_hidden_comments:
                                         comment_disabled_for_this_turn = True
-                                        _runtime_log(
-                                            event_callback, "info",
-                                            "Bỏ qua TTC claim cho Comment này.",
-                                            reason="pending_approval",
-                                        )
-                                        _runtime_log(
-                                            event_callback, "info",
-                                            "Bỏ Comment trong lượt hiện tại, "
-                                            "chuyển sang Like tiếp tục làm.",
-                                            reason="pending_approval",
-                                        )
+                                        account_guard_state["comment_disabled"] = True
+                                    action_succeeded = False
+                                    action_failure_decision_logged = True
+                                    finalize_job_result(
+                                        event_callback, idx, total_jobs,
+                                        job_type_display, "skipped",
+                                        uid=uid, post_id=str(post_id),
+                                        job_id=original_job.get("job_id", ""),
+                                        balance=latest_balance,
+                                        reason=COMMENT_HIDDEN_OR_PENDING,
+                                        type_job_source=original_job.get("ttc_source"),
+                                    )
+                                    job_result_rendered = True
                         if not comment_disabled_for_this_turn:
                             settle_seconds = (
                                 5 if type_ == "like_poster" and action_succeeded else 3
@@ -6584,16 +7024,33 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                             f"Không lấy được Facebook ID cho "
                             f"{original_job.get('job_id', '')}",
                             terminal_printer=print_warning,
+                            visibility="user",
                             job_id=original_job.get("job_id", ""),
                         )
-                except FacebookInteractionBlocked:
-                    raise
+                except FacebookInteractionBlocked as exc:
+                    record_block_incident(exc)
+                    if exc.classification != COMMENT_ONLY_BLOCK:
+                        raise
+                    comment_disabled_for_this_turn = True
+                    account_guard_state["comment_disabled"] = True
+                    action_succeeded = False
+                    action_failure_decision_logged = True
+                    finalize_job_result(
+                        event_callback, idx, total_jobs,
+                        job_type_display, "skipped",
+                        uid=uid, post_id=str(post_id),
+                        job_id=original_job.get("job_id", ""),
+                        balance=latest_balance,
+                        reason=COMMENT_ONLY_BLOCK,
+                        type_job_source=original_job.get("ttc_source"),
+                    )
+                    job_result_rendered = True
                 except Exception as exc:
                     _runtime_log(
                         event_callback, "error",
                         f"[{idx}] Lỗi Facebook {type_}: {exc}",
                         terminal_printer=print_error,
-                        stage="facebook_action",
+                        stage="facebook_action", visibility="user",
                     )
                     _emit_runtime_event(
                         event_callback, "error",
@@ -6601,14 +7058,16 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                         if _runtime_debug_enabled() else "",
                         stage="facebook_action", uid=uid,
                     )
+                finally:
+                    if action_slot_acquired:
+                        safety_coordinator.release_action_slot(account_key)
 
-                if comment_disabled_for_this_turn:
+                if type_ == "like_poster" and comment_disabled_for_this_turn:
                     active_types.discard("like_poster")
                     job_queue[:] = [
                         queued_job for queued_job in job_queue
                         if queued_job.get("type") != "like_poster"
                     ]
-                    comment_disabled_for_this_turn = False
                     action_succeeded = False
                     action_failure_decision_logged = True
                 if action_succeeded:
@@ -6651,7 +7110,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                         latest_balance = _latest_known_ttc_balance(api, result)
                         if metrics is not None:
                             metrics["balance"] = latest_balance
-                        _runtime_job_result(
+                        finalize_job_result(
                             event_callback, idx, total_jobs,
                             job_type_display, "success",
                             earned_coin=earned,
@@ -6681,6 +7140,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                                 "TTC vẫn không xác nhận job sau 1 lần thử lại. "
                                 f"Lý do: {rejection}",
                                 terminal_printer=print_warning,
+                                visibility="user",
                                 claim_reason=result.get("reason", ""),
                                 retry_attempt=1,
                             )
@@ -6689,9 +7149,10 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                                 event_callback, "warning",
                                 f"TTC không xác nhận job. Lý do: {rejection}",
                                 terminal_printer=print_warning,
+                                visibility="user",
                                 claim_reason=result.get("reason", ""),
                             )
-                        _runtime_job_result(
+                        finalize_job_result(
                             event_callback, idx, total_jobs,
                             job_type_display, "failed",
                             uid=uid,
@@ -6701,8 +7162,8 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                             claim_reason=result.get("reason", ""),
                             type_job_source=original_job.get("ttc_source"),
                         )
-                elif not action_failure_decision_logged:
-                    _runtime_job_result(
+                elif not action_failure_decision_logged and not job_result_rendered:
+                    finalize_job_result(
                         event_callback, idx, total_jobs,
                         job_type_display, "failed",
                         uid=uid,
@@ -6715,10 +7176,11 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                         event_callback, "error",
                         f"{job_type_display} | Thao tác Facebook thất bại; bỏ qua job này.",
                         terminal_printer=print_error,
+                        visibility="user",
                         job_id=original_job.get("job_id", ""),
                     )
-                else:
-                    _runtime_job_result(
+                elif not job_result_rendered:
+                    finalize_job_result(
                         event_callback, idx, total_jobs,
                         job_type_display, "failed",
                         uid=uid,
@@ -6748,11 +7210,15 @@ class TTCAccountRuntime:
     def __init__(self, profile_id, auth_token, account, config, worker_id=None,
                  stop_event=None, event_callback=None, api_factory=None,
                  action_factory=None, transaction_sleep_fn=None,
-                 fetch_state=None):
+                 fetch_state=None, safety_coordinator=None):
         self.profile_id = str(profile_id or "").strip()
         self.auth_token = str(auth_token or "").strip()
         self.account = _normalize_account(dict(account or {}))
         self.account_key = facebook_account_key(self.account)
+        self.safety_coordinator = safety_coordinator or ProfileRunSafetyCoordinator(
+            [self.account_key]
+        )
+        self.account_guard_state = {}
         self.config = normalize_run_config(dict(config or {}))
         self.worker_id = str(worker_id or self.account_key or "account")
         self.stop_event = stop_event if stop_event is not None else threading.Event()
@@ -6774,6 +7240,7 @@ class TTCAccountRuntime:
 
     def request_stop(self):
         self.stop_event.set()
+        self.safety_coordinator.notify_waiters()
 
     def _handle_event(self, event):
         if event.get("type") == "identity":
@@ -6850,7 +7317,16 @@ class TTCAccountRuntime:
                     metrics=self.metrics,
                     action=self.facebook_action,
                     transaction_sleep_fn=self.transaction_sleep_fn,
+                    max_consecutive_failed_jobs=self.config[
+                        "max_consecutive_failed_jobs"
+                    ],
+                    account_guard_state=self.account_guard_state,
+                    account_key=self.account_key,
+                    safety_coordinator=self.safety_coordinator,
                 )
+                if (self.account_guard_state.get("comment_disabled")
+                        and set(self.config["job_types"]) == {"like_poster"}):
+                    break
                 if not self.config["continuous"]:
                     break
 
@@ -6868,13 +7344,32 @@ class TTCAccountRuntime:
             blocked_at = exc.blocked_at.isoformat()
             status = _interaction_blocked_status(exc.blocked_at)
             self.metrics["interaction_blocked_at"] = blocked_at
+            self.metrics["block_classification"] = exc.classification
             self._handle_event({
-                "type": INTERACTION_BLOCKED_EVENT,
-                "message": status,
+                "type": "status",
+                "message": "",
                 "status": status,
                 "classification": exc.classification,
                 "blocked_at": blocked_at,
-                "facebook_message": exc.response_message,
+                **self.metrics,
+            })
+            return dict(self.metrics)
+        except ConsecutiveJobFailureLimitReached as exc:
+            self.metrics["suspended_by_fail_guard"] = True
+            self.metrics["consecutive_failures"] = exc.count
+            self._handle_event({
+                "type": "status",
+                "message": "",
+                "status": "Suspended",
+                "reason": "consecutive_failures",
+                **self.metrics,
+            })
+            return dict(self.metrics)
+        except ProfileSafetyStopRequested:
+            self._handle_event({
+                "type": "status",
+                "message": "",
+                "status": "Stopped",
                 **self.metrics,
             })
             return dict(self.metrics)
@@ -6988,6 +7483,21 @@ def get_profile_jobs_preview(profile_id, account_key=None):
                     api.close()
 
 
+def _prompt_safety_pause_decision():
+    print("[1] Tiếp tục chạy")
+    print("[0] Dừng tool")
+    while True:
+        try:
+            choice = input("Chọn (0/1): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        if choice == "1":
+            return True
+        if choice == "0":
+            return False
+        print_warning("Lựa chọn không hợp lệ. Vui lòng chọn 0 hoặc 1.")
+
+
 def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_per_acc=30,
                      continuous=False, job_types=None, normal_delay_min=None,
                      normal_delay_max=None, failed_delay_min=None, failed_delay_max=None,
@@ -6997,7 +7507,8 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
                      like_delay_min=None, like_delay_max=None,
                      comment_delay_min=None, comment_delay_max=None,
                      account_delay_min=None, account_delay_max=None,
-                     profile_id=None, skip_hidden_comments=True):
+                     profile_id=None, skip_hidden_comments=True,
+                     max_consecutive_failed_jobs=5):
     enabled_types = normalize_job_types(job_types)
     like_batch_range, comment_batch_range = resolve_burst_ranges(
         like_batch_limit, comment_batch_limit,
@@ -7011,7 +7522,19 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
         account_delay_min, account_delay_max,
     )
     ttc_fetch_state = TTCFetchState()
-    blocked_accounts_this_session = set()
+    eligible_account_keys = [
+        facebook_account_key(account)
+        for account in fb_accounts
+        if str(account.get("token") or "").strip()
+        and facebook_account_key(account)
+    ]
+    safety_coordinator = ProfileRunSafetyCoordinator(eligible_account_keys)
+    if safety_coordinator.total_accounts == 0:
+        print_warning("Không có account đủ điều kiện để chạy.")
+        return
+    account_guard_states = {
+        key: {} for key in safety_coordinator.account_keys
+    }
     print_job_table_header()
     row_counter = {"value": 0}
     while True:
@@ -7021,7 +7544,12 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
                 print_warning(f"Tài khoản {idx+1} chưa có token, bỏ qua.")
                 continue
             account_key = facebook_account_key(acc)
-            if account_key in blocked_accounts_this_session:
+            if (account_key in safety_coordinator.blocked_accounts
+                    or account_key in safety_coordinator.suspended_accounts):
+                continue
+            guard_state = account_guard_states.setdefault(account_key, {})
+            if (guard_state.get("comment_disabled")
+                    and enabled_types == {"like_poster"}):
                 continue
             identity = str(acc.get('email') or '').strip() or f"Account {idx+1}"
             api = None
@@ -7047,10 +7575,21 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
                     skip_hidden_comments=skip_hidden_comments,
                     action=facebook_action,
                     row_counter=row_counter,
+                    max_consecutive_failed_jobs=max_consecutive_failed_jobs,
+                    account_guard_state=guard_state,
+                    account_key=account_key,
+                    safety_coordinator=safety_coordinator,
                 )
-            except FacebookInteractionBlocked as exc:
-                blocked_accounts_this_session.add(account_key)
-                print_warning(str(exc))
+            except FacebookInteractionBlocked:
+                if safety_coordinator.state == PAUSED_BY_SAFETY:
+                    should_continue = _prompt_safety_pause_decision()
+                    safety_coordinator.resolve_pause(should_continue)
+                    if not should_continue:
+                        return
+            except ConsecutiveJobFailureLimitReached:
+                pass
+            except ProfileSafetyStopRequested:
+                return
             except TTCAuthError as exc:
                 if not print_ttc_exception("Phiên TTC không còn hợp lệ.", exc):
                     print_error(_mask_sensitive_text(str(exc)))
@@ -7071,11 +7610,22 @@ def run_multi_tokens(auth_token, fb_accounts, delay_between_jobs=None, max_jobs_
                 account_delay = random.randint(*account_delay_range)
                 _cooperative_countdown(account_delay, "Chuyển account")
 
-        if blocked_accounts_this_session and not any(
+        if not any(
             str(acc.get('token') or '').strip()
-            and facebook_account_key(acc) not in blocked_accounts_this_session
+            and facebook_account_key(acc) not in safety_coordinator.blocked_accounts
+            and facebook_account_key(acc) not in safety_coordinator.suspended_accounts
+            and not (
+                account_guard_states.get(facebook_account_key(acc), {}).get(
+                    "comment_disabled"
+                )
+                and enabled_types == {"like_poster"}
+            )
             for acc in fb_accounts
         ):
+            print_warning(
+                "Kết thúc phiên: không còn account khả dụng "
+                "(block, fail guard hoặc Comment đã tắt)."
+            )
             break
         if not continuous:
             break
@@ -7118,6 +7668,9 @@ def run_active_profile(profile):
                 account_delay_max=config['account_delay_max'],
                 profile_id=profile['profile_id'],
                 skip_hidden_comments=config['skip_hidden_comments'],
+                max_consecutive_failed_jobs=config[
+                    'max_consecutive_failed_jobs'
+                ],
             )
     except RuntimeError as e:
         print_error(str(e))

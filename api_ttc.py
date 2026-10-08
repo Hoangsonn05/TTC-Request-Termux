@@ -6465,12 +6465,6 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
             f"[SAFETY PAUSE] Đã có {result['blocked']}/{result['total']} "
             f"tài khoản bị block | Thời điểm: {timestamp}"
         )
-        _runtime_log(
-            event_callback, "warning", message,
-            terminal_printer=print_warning, visibility="critical",
-            blocked=result["blocked"], total=result["total"],
-            threshold=result["threshold"], status=PAUSED_BY_SAFETY,
-        )
         _emit_runtime_event(
             event_callback, "safety_pause_required", message,
             status=PAUSED_BY_SAFETY, blocked=result["blocked"],
@@ -6481,18 +6475,16 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
         classification = exc.classification
         if classification not in logged_block_types:
             logged_block_types.add(classification)
-            label = {
-                COMMENT_ONLY_BLOCK: "COMMENT",
-                REACTION_BLOCK: "REACTION",
-                ACCOUNT_INTERACTION_BLOCKED: "ACCOUNT",
-            }[classification]
             timestamp = exc.blocked_at.strftime("%d/%m/%Y %H:%M:%S")
-            message = (
-                f"[BLOCK] UID: {uid} | Loại: {label} | Thời điểm: {timestamp}"
-            )
+            if classification == COMMENT_ONLY_BLOCK:
+                message = (
+                    f"[COMMENT BLOCK] UID {uid} bị chặn bình luận lúc {timestamp}"
+                )
+            else:
+                message = f"[BLOCK] UID {uid} bị chặn tương tác lúc {timestamp}"
             _runtime_log(
                 event_callback, "warning", message,
-                terminal_printer=print_warning, visibility="critical",
+                terminal_printer=print, visibility="critical",
                 uid=uid, classification=classification,
                 blocked_at=exc.blocked_at.isoformat(),
             )
@@ -6531,7 +6523,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                 event_callback, "warning",
                 f"[FAIL GUARD] UID: {uid} | Fail: {count}/{max_consecutive_failed_jobs} "
                 f"| Thời điểm: {timestamp}",
-                terminal_printer=print_warning, visibility="critical",
+                terminal_printer=print_warning, visibility="debug",
                 uid=uid, fail_count=count,
                 threshold=max_consecutive_failed_jobs,
             )
@@ -6767,11 +6759,12 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
             finalize_job_result(
                 event_callback, idx, total_jobs, type_ or "UNKNOWN", "failed",
                 uid=uid, post_id="-", job_id="-", balance=latest_balance,
+                reason="invalid_scheduler_wrapper",
             )
             _runtime_log(
                 event_callback, "error",
                 "TTC scheduler wrapper thiếu actual job; bỏ qua.",
-                stage="job_validation", visibility="user",
+                stage="job_validation", visibility="debug",
             )
             if not wait_after_actual_job(False, type_):
                 break
@@ -6787,13 +6780,14 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                     post_id="-",
                     job_id=original_job.get("job_id", ""),
                     balance=latest_balance,
+                    reason="missing_object_id",
                     type_job_source=original_job.get("ttc_source"),
                 )
                 _runtime_log(
                     event_callback, "warning",
                     "Job TTC thiếu object_id; bỏ qua.",
                     terminal_printer=print_warning,
-                    visibility="user",
+                    visibility="debug",
                     job_id=original_job.get("job_id", ""),
                 )
                 if not wait_after_actual_job(False, type_):
@@ -6809,12 +6803,13 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                             job_type_display, "failed", uid=uid, post_id="-",
                             job_id=original_job.get("job_id", ""),
                             balance=latest_balance,
+                            reason="missing_reaction_type",
                             type_job_source=original_job.get("ttc_source"),
                         )
                         _runtime_log(
                             event_callback, "error",
                             "Job TTC thiếu reaction_type; bỏ qua.",
-                            stage="job_validation", visibility="user",
+                            stage="job_validation", visibility="debug",
                         )
                         if not wait_after_actual_job(False, type_):
                             break
@@ -6827,12 +6822,13 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                             job_type_display, "failed", uid=uid, post_id="-",
                             job_id=original_job.get("job_id", ""),
                             balance=latest_balance,
+                            reason="missing_comment_text",
                             type_job_source=original_job.get("ttc_source"),
                         )
                         _runtime_log(
                             event_callback, "error",
                             "Job TTC thiếu comment_text; bỏ qua.",
-                            stage="job_validation", visibility="user",
+                            stage="job_validation", visibility="debug",
                         )
                         if not wait_after_actual_job(False, type_):
                             break
@@ -6949,7 +6945,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                                     event_callback, reaction_level,
                                     reaction_message,
                                     terminal_printer=print_error,
-                                    visibility="user",
+                                    visibility="debug",
                                     classification=reaction_evidence.get(
                                         "classification", ""
                                     ),
@@ -6984,7 +6980,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                                     event_callback, "error",
                                     "Comment thất bại; bỏ qua job này.",
                                     terminal_printer=print_error,
-                                    visibility="user",
+                                    visibility="debug",
                                 )
                             comment_evidence = getattr(do_job, "last_comment_evidence", None)
                             if not isinstance(comment_evidence, dict):
@@ -6995,7 +6991,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                                         event_callback, "warning",
                                         "Comment bị ẩn hoặc chờ duyệt; không gửi claim TTC.",
                                         terminal_printer=print_warning,
-                                        visibility="user",
+                                        visibility="debug",
                                         comment_state=COMMENT_HIDDEN_OR_PENDING,
                                     )
                                     if skip_hidden_comments:
@@ -7024,7 +7020,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                             f"Không lấy được Facebook ID cho "
                             f"{original_job.get('job_id', '')}",
                             terminal_printer=print_warning,
-                            visibility="user",
+                            visibility="debug",
                             job_id=original_job.get("job_id", ""),
                         )
                 except FacebookInteractionBlocked as exc:
@@ -7050,13 +7046,14 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                         event_callback, "error",
                         f"[{idx}] Lỗi Facebook {type_}: {exc}",
                         terminal_printer=print_error,
-                        stage="facebook_action", visibility="user",
+                        stage="facebook_action", visibility="debug",
                     )
                     _emit_runtime_event(
                         event_callback, "error",
                         f"Lỗi Facebook {type_}: {exc}"
                         if _runtime_debug_enabled() else "",
                         stage="facebook_action", uid=uid,
+                        reason=_mask_sensitive_text(str(exc)),
                     )
                 finally:
                     if action_slot_acquired:
@@ -7140,7 +7137,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                                 "TTC vẫn không xác nhận job sau 1 lần thử lại. "
                                 f"Lý do: {rejection}",
                                 terminal_printer=print_warning,
-                                visibility="user",
+                                visibility="debug",
                                 claim_reason=result.get("reason", ""),
                                 retry_attempt=1,
                             )
@@ -7149,7 +7146,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                                 event_callback, "warning",
                                 f"TTC không xác nhận job. Lý do: {rejection}",
                                 terminal_printer=print_warning,
-                                visibility="user",
+                                visibility="debug",
                                 claim_reason=result.get("reason", ""),
                             )
                         finalize_job_result(
@@ -7170,13 +7167,14 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                         post_id=str(post_id),
                         job_id=original_job.get("job_id", ""),
                         balance=latest_balance,
+                        reason="facebook_action_failed",
                         type_job_source=original_job.get("ttc_source"),
                     )
                     _runtime_log(
                         event_callback, "error",
                         f"{job_type_display} | Thao tác Facebook thất bại; bỏ qua job này.",
                         terminal_printer=print_error,
-                        visibility="user",
+                        visibility="debug",
                         job_id=original_job.get("job_id", ""),
                     )
                 elif not job_result_rendered:
@@ -7187,6 +7185,7 @@ def run_ttc_jobs(api, fb_token, max_jobs=30, job_types=None,
                         post_id=str(post_id),
                         job_id=original_job.get("job_id", ""),
                         balance=latest_balance,
+                        reason="facebook_action_failed",
                         type_job_source=original_job.get("ttc_source"),
                     )
 
